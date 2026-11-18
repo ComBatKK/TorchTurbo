@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -44,15 +45,6 @@ class ImageSpec:
     cann_version: str
     revision: int
     build_args: Mapping[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ImageLane:
-    name: str
-    target: str
-    capacity_slots: int
-    runner_variable: str
-    runner: str
 
 
 @dataclass(frozen=True)
@@ -102,6 +94,79 @@ class ImagePlan:
             "image_changed": self.image_changed,
             "action": self.action,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ImagePlan":
+        if not isinstance(value, Mapping):
+            raise ImageError("image plan must be a JSON object")
+        if value.get("schema_version") != IMAGE_SCHEMA_VERSION:
+            raise ImageError(
+                "unsupported image plan schema: "
+                f"{value.get('schema_version')!r}"
+            )
+        build_args = value.get("build_args", {})
+        if not isinstance(build_args, Mapping) or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in build_args.items()
+        ):
+            raise ImageError("image plan build_args must be a string mapping")
+        action = value.get("action")
+        if action not in POLICIES:
+            raise ImageError(f"image plan has unknown action {action!r}")
+        text_fields = (
+            "logical_image",
+            "target",
+            "hardware",
+            "repository",
+            "alias",
+            "cann_version",
+            "platform",
+            "dockerfile",
+            "context",
+            "content_hash",
+            "content_tag",
+            "head_hash",
+        )
+        for name in text_fields:
+            if not isinstance(value.get(name), str) or not value[name]:
+                raise ImageError(f"image plan field {name!r} must be a non-empty string")
+        revision = value.get("revision")
+        if not isinstance(revision, int):
+            raise ImageError("image plan field 'revision' must be an integer")
+        base_hash = value.get("base_hash")
+        if base_hash is not None and not isinstance(base_hash, str):
+            raise ImageError("image plan field 'base_hash' must be a string or null")
+        image_changed = value.get("image_changed")
+        if image_changed is not None and not isinstance(image_changed, bool):
+            raise ImageError("image plan field 'image_changed' must be a boolean or null")
+        return cls(
+            schema_version=IMAGE_SCHEMA_VERSION,
+            logical_image=value["logical_image"],
+            target=value["target"],
+            hardware=value["hardware"],
+            repository=value["repository"],
+            alias=value["alias"],
+            cann_version=value["cann_version"],
+            platform=value["platform"],
+            dockerfile=value["dockerfile"],
+            context=value["context"],
+            build_args=dict(build_args),
+            revision=revision,
+            content_hash=value["content_hash"],
+            content_tag=value["content_tag"],
+            head_hash=value["head_hash"],
+            base_hash=base_hash,
+            image_changed=image_changed,
+            action=action,
+        )
+
+
+def load_image_plan(path: Path) -> ImagePlan:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ImageError(f"cannot read image plan {path}: {exc}") from exc
+    return ImagePlan.from_dict(value)
 
 
 def split_reference(ref: str) -> tuple[str, str]:
@@ -356,31 +421,6 @@ def load_specs(root: Path, revision: str | None = None) -> list[ImageSpec]:
         _spec_from_documents(name, ci_document, source)
         for name in names
     ]
-
-
-def load_lanes(root: Path, revision: str | None = None) -> dict[str, ImageLane]:
-    """Load runner lanes used to select a smoke runner for each image target."""
-    ci_document, source = _ci_document(root, revision)
-    resources = _mapping(ci_document.get("resources"), f"{source}: resources")
-    lanes = _mapping(resources.get("lanes") or {}, f"{source}: resources.lanes")
-    result: dict[str, ImageLane] = {}
-    for name, value in lanes.items():
-        lane = _mapping(value, f"{source}: lanes.{name}")
-        result[str(name)] = ImageLane(
-            name=str(name),
-            target=_text(lane.get("target"), f"{source}: lanes.{name}.target"),
-            capacity_slots=_integer(
-                lane.get("capacity_slots"),
-                f"{source}: lanes.{name}.capacity_slots",
-                1,
-            ),
-            runner_variable=_text(
-                lane.get("runner_variable"),
-                f"{source}: lanes.{name}.runner_variable",
-            ),
-            runner=_text(lane.get("runner"), f"{source}: lanes.{name}.runner"),
-        )
-    return result
 
 
 def _base_spec(root: Path, sha: str, image_name: str) -> ImageSpec | None:

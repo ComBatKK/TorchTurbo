@@ -2,7 +2,7 @@ name: Ascend-Image-PR
 run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }}
 
 # Dockerfile PR validation. One Plan job does lint, change routing, image
-# selection and CPU test planning:
+# identity planning and CPU test planning:
 #   Plan -> CPU matrix -> per-image build -> NPU tests -> Gate
 #
 # A mixed Dockerfile + code PR runs the CPU matrix before any build. Different
@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   plan:
-    name: Ascend-Image-Plan
+    name: Ascend-Image-PR-Plan
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
@@ -34,7 +34,7 @@ jobs:
       cpu_needed: ${{ steps.plan.outputs.cpu_needed }}
       cpu_jobs: ${{ steps.plan.outputs.cpu_jobs }}
       cpu_job_count: ${{ steps.plan.outputs.cpu_job_count }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+      image_jobs: ${{ steps.plan.outputs.image_jobs }}
       image_count: ${{ steps.plan.outputs.image_count }}
       images: ${{ steps.plan.outputs.images }}
     steps:
@@ -93,7 +93,10 @@ jobs:
           python3 -m scripts.ci.image.selection \
             --root "$GITHUB_WORKSPACE" \
             --changed-files "$changed" \
+            --plan-policy build_if_missing \
+            --base-sha "$BASE_SHA" \
             --output "$matrix" \
+            --plans-output "$RUNNER_TEMP/ci-plan/image-plans.json" \
             --github-output "$GITHUB_OUTPUT"
 
           mkdir -p "$RUNNER_TEMP/ci-plan"
@@ -198,15 +201,14 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.image_jobs) }}
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
       image: ${{ matrix.image }}
-      image_mode: build_if_missing
+      image_mode: ${{ matrix.image_mode }}
+      image_plan: ${{ matrix.image_plan }}
+      content_tag: ${{ matrix.content_tag }}
       target: ${{ matrix.target }}
-      device: ${{ matrix.device }}
-      smoke_runner_variable: ${{ matrix.smoke_runner_variable }}
-      smoke_runner: ${{ matrix.smoke_runner }}
       checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
       max_jobs: auto
       use_cache: true

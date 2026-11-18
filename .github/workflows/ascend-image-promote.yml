@@ -3,7 +3,7 @@ run-name: Ascend-Image-Promote ${{ inputs.images || github.sha }}
 
 # Trusted post-merge image pipeline. Every affected logical image runs one
 # complete unit independently:
-#   resolve validated candidate -> smoke -> promote alias
+#   resolve validated candidate -> promote alias
 #
 # Dockerfile changes select images automatically. Manual dispatch can target
 # all images or a comma-separated list. A failure in one image does not cancel
@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     outputs:
-      matrix: ${{ steps.select.outputs.matrix }}
+      image_jobs: ${{ steps.select.outputs.image_jobs }}
       image_count: ${{ steps.select.outputs.image_count }}
       images: ${{ steps.select.outputs.images }}
     steps:
@@ -88,15 +88,12 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
-      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.discover.outputs.image_jobs) }}
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
       image: ${{ matrix.image }}
       image_mode: resolve_candidate
       target: ${{ matrix.target }}
-      device: ${{ matrix.device }}
-      smoke_runner_variable: ${{ matrix.smoke_runner_variable }}
-      smoke_runner: ${{ matrix.smoke_runner }}
       checkout_ref: ${{ github.sha }}
     secrets:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}

@@ -81,8 +81,9 @@ changed files 路由到两个域；`contracts/` 和 `config/` 是共享边界。
 | Gate | PlanArtifact + 全部 JobResult | `decision.json` | 不重新选测 |
 
 镜像发布链路只读取 `scripts/ci/config/ci.yml` 中 image 的 `ref`、`target` 和
-`build`；测试配置加载器保留 `build` 字段但不解释它。`ascend-image.yml` 的 `plan` job
-只计算镜像 identity，不生成测试 Plan；Image PR 在 smoke 后显式调用测试入口，复用既有
+`build`；测试配置加载器保留 `build` 字段但不解释它。Image PR 的外层 Plan 一次计算
+全部受影响镜像的 identity、action 和 content tag；`ascend-image.yml` 直接消费该
+`image_plan`，只有手动触发时才在内部计算 identity。测试入口继续复用既有
 Plan/JobResult/Gate 语义。
 
 Planner 按 CPU/NPU/GPU 输出 matrix。matrix 项只包含 `job_id`、`image_ref`、
@@ -97,11 +98,11 @@ runner 被外部杀死，Gate 仍能区分“缺结果”和“执行未完成�
 ```text
 Image PR
   changed Dockerfiles -> selection -> affected images
-  Dockerfile-only -> per image: build candidate -> smoke -> tests
-  Dockerfile+code -> CPU preflight once -> per image: build -> smoke -> tests
+  Dockerfile-only -> per image: build candidate -> tests
+  Dockerfile+code -> CPU preflight once -> per image: build -> tests
 
 Image Main
-  main merge -> selected images -> per image: resolve candidate -> smoke -> promote alias
+  main merge -> selected images -> per image: resolve candidate -> promote alias
 
 测试 CI（PR/nightly/manual）
   base/current SHA -> content ref -> Plan -> CPU/NPU -> Gate
@@ -110,7 +111,7 @@ Image Main
 普通代码 PR 不等待镜像构建，也不查询 registry。所有 Dockerfile PR 由
 `.github/workflows/ascend-image-pr.yml` 独占测试所有权；`selection.py` 根据
 `resources.images.<name>.build.dockerfile` 只选择被修改的逻辑镜像。每个镜像调用
-`ascend-image-pipeline.yml`，内部串行执行 build、smoke、candidate tests；不同镜像
+`ascend-image-pipeline.yml`，内部串行执行 build、candidate tests；不同镜像
 由 matrix 并行执行，没有全局阶段栅栏。Dockerfile-only PR 跳过 CPU，混合 PR 先执行
 一次 CPU preflight，失败时不构建 candidate。`Ascend-PR-CI` 检测到 Dockerfile 时只生成
 delegated Plan，不重复跑用例。同仓 PR 自动运行，fork PR 需要维护者添加
@@ -118,8 +119,8 @@ delegated Plan，不重复跑用例。同仓 PR 自动运行，fork PR 需要维
 
 main 合并后，`.github/workflows/ascend-image-promote.yml` 用同一套 selection 规则选择
 main 上修改的 Dockerfile 对应镜像，并调用同一个 `ascend-image-pipeline.yml`，只把
-`image_mode` 设为 `resolve_candidate`。每个单镜像单元只解析已测试 candidate，再次
-smoke 后才把 content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接
+`image_mode` 设为 `resolve_candidate`。每个单镜像单元只解析已测试 candidate，然后
+把 content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接
 失败，不创建未经 Image PR 测试的替代镜像。手动 dispatch 使用 `images=all` 或逗号
 分隔的逻辑镜像列表。
 
@@ -128,7 +129,6 @@ smoke 后才把 content tag promote 为 `cann9.0.0-a3-base`。candidate 不存�
 `scripts/ci/image/**`、`ci.yml` 的 image build recipe 和 image workflow 变更不会自动
 构建 candidate，避免 CI 维护 PR 占用数小时的镜像资源。这类变更必须在合并前手动执行
 candidate 验证，并确认目标 content tag 已存在；否则 main promotion 会 fail closed。
-smoke runner 从 image target 对应的 lane 中选择容量最小的一项，不把卡数写进镜像身份。
 
 镜像身份分为两层：
 

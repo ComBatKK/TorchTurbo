@@ -32,6 +32,16 @@ on:
         required: false
         default: false
         type: boolean
+      image_plan:
+        description: 'Optional compact ImagePlan JSON produced by an upstream Plan'
+        required: false
+        default: ''
+        type: string
+      content_tag:
+        description: 'Optional precomputed content tag used for build concurrency'
+        required: false
+        default: ''
+        type: string
       runner:
         description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
         required: false
@@ -57,7 +67,7 @@ on:
         description: 'Immutable registry@sha256 reference'
         value: ${{ jobs.image.outputs.ref }}
       digest:
-        description: 'Sha256 digest consumed by smoke and promotion'
+        description: 'Sha256 digest consumed by tests and promotion'
         value: ${{ jobs.image.outputs.digest }}
       content_tag:
         description: 'Content-addressed image tag'
@@ -103,57 +113,12 @@ permissions:
   contents: read
 
 jobs:
-  plan:
-    name: Ascend-Image-Plan
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 10
-    outputs:
-      action: ${{ steps.plan.outputs.image_mode }}
-      content_tag: ${{ steps.plan.outputs.content_tag }}
-      content_hash: ${{ steps.plan.outputs.content_hash }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.checkout_ref || github.sha }}
-          persist-credentials: false
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: install CI dependencies
-        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
-
-      - name: plan image identity
-        id: plan
-        env:
-          IMAGE: ${{ inputs.image || 'npu-default' }}
-          MODE: ${{ inputs.mode || 'resolve_only' }}
-          BASE_SHA: ${{ inputs.base_sha || '' }}
-          BLOCK_BUILD: ${{ inputs.block_build || false }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ci-image"
-          args=(--image "$IMAGE" --policy "$MODE"
-                --output "$RUNNER_TEMP/ci-image/image-plan.json")
-          if [ -n "$BASE_SHA" ]; then
-            args+=(--base-sha "$BASE_SHA")
-          fi
-          if [ "$BLOCK_BUILD" = true ]; then
-            args+=(--block-build)
-          fi
-          python3 -m scripts.ci.image plan "${args[@]}"
-
   image:
-    name: Ascend-Image-Result (${{ needs.plan.outputs.action }})
-    needs: plan
+    name: Ascend-Image (${{ inputs.image }})
     runs-on: ${{ inputs.runner || vars.CI_IMAGE_RUNNER || vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 350
-    # Only the same content tag serializes. Different candidate tags can build in
-    # parallel; normal resolve calls wait for at most the short registry lookup.
     concurrency:
-      group: image-${{ needs.plan.outputs.content_tag }}
+      group: image-${{ inputs.content_tag || inputs.image }}
       cancel-in-progress: false
     outputs:
       ref: ${{ steps.result.outputs.ref }}
@@ -174,12 +139,42 @@ jobs:
       - name: install CI dependencies
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
+      - name: plan image identity
+        id: plan
+        if: inputs.image_plan == ''
+        env:
+          IMAGE: ${{ inputs.image || 'npu-default' }}
+          MODE: ${{ inputs.mode || 'resolve_only' }}
+          BASE_SHA: ${{ inputs.base_sha || '' }}
+          BLOCK_BUILD: ${{ inputs.block_build || false }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-image"
+          args=(--image "$IMAGE" --policy "$MODE"
+                --output "$RUNNER_TEMP/ci-image/image-plan.json")
+          if [ -n "$BASE_SHA" ]; then
+            args+=(--base-sha "$BASE_SHA")
+          fi
+          if [ "$BLOCK_BUILD" = true ]; then
+            args+=(--block-build)
+          fi
+          python3 -m scripts.ci.image plan "${args[@]}"
+
+      - name: materialize upstream Plan
+        if: inputs.image_plan != ''
+        env:
+          IMAGE_PLAN: ${{ inputs.image_plan }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-image"
+          printf '%s' "$IMAGE_PLAN" > "$RUNNER_TEMP/ci-image/image-plan.json"
+
       - name: check build environment
-        if: needs.plan.outputs.action == 'build_if_missing'
+        if: inputs.image_plan != '' || steps.plan.outputs.image_mode == 'build_if_missing'
         run: python3 -m scripts.ci.image env
 
       - name: log in to SWR
-        if: needs.plan.outputs.action == 'build_if_missing'
+        if: inputs.image_plan != '' || steps.plan.outputs.image_mode == 'build_if_missing'
         env:
           SWR_USER: ${{ secrets.SWR_USERNAME }}
           SWR_PASS: ${{ secrets.SWR_PASSWORD }}
@@ -194,7 +189,7 @@ jobs:
 
       - name: create buildx builder
         id: builder
-        if: needs.plan.outputs.action == 'build_if_missing'
+        if: inputs.image_plan != '' || steps.plan.outputs.image_mode == 'build_if_missing'
         run: |
           set -euo pipefail
           name="imageci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -210,7 +205,9 @@ jobs:
         id: result
         env:
           IMAGE: ${{ inputs.image || 'npu-default' }}
-          ACTION: ${{ needs.plan.outputs.action }}
+          ACTION: ${{ inputs.image_plan != '' && inputs.mode || steps.plan.outputs.image_mode }}
+          HAS_PLAN: ${{ inputs.image_plan != '' }}
+          PLAN_FILE: ${{ runner.temp }}/ci-image/image-plan.json
           BUILDER: ${{ steps.builder.outputs.name }}
           MAX_JOBS: ${{ inputs.max_jobs || 'auto' }}
           USE_CACHE: ${{ inputs.use_cache }}
@@ -229,6 +226,7 @@ jobs:
               ;;
             build_if_missing)
               build=(python3 -m scripts.ci.image build "${common[@]}" --policy build_if_missing)
+              if [ "$HAS_PLAN" = true ]; then build+=(--plan-file "$PLAN_FILE"); fi
               if [ -n "${BUILDER:-}" ]; then build+=(--builder "$BUILDER"); fi
               if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
               if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
@@ -245,7 +243,7 @@ jobs:
           esac
 
       - name: upload build log
-        if: always() && needs.plan.outputs.action == 'build_if_missing'
+        if: always() && (inputs.image_plan != '' || steps.plan.outputs.image_mode == 'build_if_missing')
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -257,8 +255,8 @@ jobs:
       - name: summary
         if: always()
         env:
-          ACTION: ${{ needs.plan.outputs.action }}
-          CONTENT_TAG: ${{ steps.result.outputs.content_tag || needs.plan.outputs.content_tag }}
+          ACTION: ${{ inputs.image_plan != '' && inputs.mode || steps.plan.outputs.image_mode }}
+          CONTENT_TAG: ${{ steps.result.outputs.content_tag || steps.plan.outputs.content_tag }}
           DIGEST: ${{ steps.result.outputs.digest }}
           BUILT: ${{ steps.result.outputs.built }}
         run: |

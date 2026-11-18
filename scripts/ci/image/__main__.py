@@ -27,6 +27,7 @@ from .plan import (
     ImageError,
     POLICIES,
     container_image_names,
+    load_image_plan,
     plan_image,
 )
 from .registry import Registry, RegistryError
@@ -219,7 +220,14 @@ def cmd_resolve_candidate(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    plan = _prepare(args)
+    if args.plan_file:
+        plan = load_image_plan(Path(args.plan_file))
+        if args.image and plan.logical_image != args.image:
+            raise ImageError(
+                f"image plan is for {plan.logical_image!r}, not {args.image!r}"
+            )
+    else:
+        plan = _prepare(args)
     if plan.action == "blocked" and not args.no_push:
         raise ImageError("blocked image plan cannot push a candidate")
     if plan.action not in {"build_if_missing", "resolve", "blocked"}:
@@ -325,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-push", action="store_true")
     parser.add_argument("--block-build", action="store_true")
+    parser.add_argument("--plan-file", default="")
     parser.add_argument("--tag", default="")
     parser.add_argument("--digest", default="")
     return parser

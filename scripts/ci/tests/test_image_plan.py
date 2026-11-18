@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ci.image.__main__ import main
-from scripts.ci.image.plan import ImageError, plan_image, split_reference
+from scripts.ci.image.plan import ImageError, load_image_plan, plan_image, split_reference
 
 
 def test_image_plan_uses_cann_version_hardware_and_alias(repo_root: Path) -> None:
@@ -59,6 +60,18 @@ def test_split_reference_handles_registry_port() -> None:
         "registry.example:5000/team/image",
         "a3-base",
     )
+
+
+def test_image_plan_round_trips_through_the_plan_artifact(
+    repo_root: Path, tmp_path: Path
+) -> None:
+    expected = plan_image(repo_root, "npu-default", policy="build_if_missing")
+    path = tmp_path / "image-plan.json"
+    path.write_text(json.dumps(expected.to_dict()), encoding="utf-8")
+
+    loaded = load_image_plan(path)
+
+    assert loaded == expected
 
 
 def test_candidate_build_can_be_blocked(repo_root: Path) -> None:

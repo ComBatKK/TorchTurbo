@@ -9,8 +9,10 @@ import yaml
 from scripts.ci.image.selection import (
     SelectionError,
     changed_images,
+    main,
     matrix_payload,
     named_images,
+    planned_matrix,
 )
 
 
@@ -28,8 +30,6 @@ def test_changed_images_selects_only_modified_dockerfile(repo_root: Path) -> Non
             "device": "npu",
             "hardware": "a3",
             "dockerfile": "docker/npu/Dockerfile_aarch64",
-            "smoke_runner_variable": "CI_NPU_2_RUNNER",
-            "smoke_runner": "linux-aarch64-a3-800i-2",
         }]
     }
 
@@ -51,6 +51,42 @@ def test_named_images_can_select_all_or_explicit_names(repo_root: Path) -> None:
     ]
     with pytest.raises(SelectionError, match="unknown logical image"):
         named_images(repo_root, "missing")
+
+
+def test_planned_matrix_embeds_one_plan_per_image(repo_root: Path) -> None:
+    selections = changed_images(repo_root, ["docker/npu/Dockerfile_aarch64"])
+
+    matrix, artifact = planned_matrix(
+        repo_root,
+        selections,
+        policy="build_if_missing",
+    )
+
+    item = matrix["include"][0]
+    assert item["image"] == "npu-default"
+    assert item["image_mode"] == "build_if_missing"
+    assert item["content_tag"].startswith("cann9.0.0-a3-c")
+    assert '"logical_image":"npu-default"' in item["image_plan"]
+    assert artifact["images"][0]["logical_image"] == "npu-default"
+    assert artifact["images"][0]["content_tag"] == item["content_tag"]
+
+
+def test_cli_publishes_the_image_jobs_output(repo_root: Path, tmp_path: Path) -> None:
+    changed = tmp_path / "changed.txt"
+    changed.write_text("docker/npu/Dockerfile_aarch64\n", encoding="utf-8")
+    output = tmp_path / "github-output"
+
+    assert main([
+        "--root", str(repo_root),
+        "--changed-files", str(changed),
+        "--plan-policy", "build_if_missing",
+        "--output", str(tmp_path / "image-jobs.json"),
+        "--github-output", str(output),
+    ]) == 0
+
+    values = output.read_text(encoding="utf-8")
+    assert "image_jobs={\"include\":" in values
+    assert "image_count=1" in values
 
 
 def test_multiple_changed_dockerfiles_produce_only_the_affected_matrix(

@@ -24,8 +24,8 @@ lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate
   nightly scope.
 - `.github/workflows/ascend-image.yml` is the reusable image identity/build/resolve engine.
 - `.github/workflows/ascend-image-pr.yml` maps changed Dockerfiles to logical images and
-  runs one independent `build -> smoke -> tests` pipeline per affected image.
+  runs one independent `build -> tests` pipeline per affected image.
 - `.github/workflows/ascend-image-promote.yml` reuses the validated candidate per affected
-  image and promotes its alias after a second smoke test.
+  image and promotes its alias.
 - `.github/workflows/ascend-image-pipeline.yml` is the reusable single-image validation or
   promotion unit.
