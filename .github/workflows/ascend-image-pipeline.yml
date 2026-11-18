@@ -1,14 +1,9 @@
-name: Ascend-Image-Pipeline
-run-name: Ascend-Image-Pipeline ${{ inputs.image }} (${{ inputs.image_mode }})
+name: Ascend Candidate
+run-name: Candidate ${{ inputs.image }}
 
-# One logical image's complete pipeline. The parent workflow expands this as a
+# One logical image's candidate pipeline. The parent workflow expands this as a
 # matrix so different Dockerfiles run independently without global barriers.
-#
-#   build_if_missing  -> build candidate -> candidate tests
-#   resolve_candidate -> resolve candidate -> promote alias
-#
-# This workflow owns one image only. The image identity/build/resolve primitive
-# stays in ascend-image.yml, so other entry points can reuse it without tests.
+# Manual dispatch runs the same build path without the parent image PR workflow.
 
 on:
   workflow_call:
@@ -17,12 +12,8 @@ on:
         description: 'Logical image name from resources.images'
         required: true
         type: string
-      image_mode:
-        description: 'build_if_missing (validation) or resolve_candidate (promotion)'
-        required: true
-        type: string
       target:
-        description: 'Target slice used by candidate tests; optional for promotion'
+        description: 'Target slice used by candidate tests; required when run_tests is true'
         required: false
         default: ''
         type: string
@@ -51,11 +42,59 @@ on:
         required: false
         default: true
         type: boolean
+      runner:
+        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
+      run_tests:
+        description: 'Run candidate tests after building or reusing the image'
+        required: false
+        default: true
+        type: boolean
     secrets:
       SWR_USERNAME:
         required: false
       SWR_PASSWORD:
         required: false
+
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Logical image name'
+        required: true
+        default: 'npu-default'
+        type: string
+      target:
+        description: 'Target slice used by tests; required when run_tests is true'
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: 'Git ref to build; empty uses the dispatched SHA'
+        required: false
+        default: ''
+        type: string
+      max_jobs:
+        description: 'MAX_JOBS passed to the image builder'
+        required: false
+        default: 'auto'
+        type: string
+      use_cache:
+        description: 'Use the GitHub Actions build cache'
+        required: false
+        default: true
+        type: boolean
+      runner:
+        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
+      run_tests:
+        description: 'Run candidate tests after building or reusing the image'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -64,42 +103,21 @@ permissions:
 
 jobs:
   build:
-    name: Ascend-Image-Build (${{ inputs.image }})
-    uses: ./.github/workflows/ascend-image.yml
-    with:
-      image: ${{ inputs.image }}
-      mode: ${{ inputs.image_mode }}
-      image_plan: ${{ inputs.image_plan }}
-      content_tag: ${{ inputs.content_tag }}
-      checkout_ref: ${{ inputs.checkout_ref }}
-      max_jobs: ${{ inputs.max_jobs }}
-      use_cache: ${{ inputs.use_cache }}
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
-
-  tests:
-    name: Ascend-Image-Tests (${{ inputs.image }})
-    if: inputs.image_mode == 'build_if_missing'
-    needs: build
-    uses: ./.github/workflows/ascend-pr.yml
-    with:
-      mode: pr
-      scope: pull_request
-      targets: ${{ inputs.target }}
-      checkout_ref: ${{ inputs.checkout_ref }}
-      image_name: ${{ inputs.image }}
-      image_ref: ${{ needs.build.outputs.ref }}
-
-  promote:
-    name: Ascend-Image-Promote-Alias (${{ inputs.image }})
-    if: inputs.image_mode == 'resolve_candidate'
-    needs: build
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 30
+    name: Build
+    runs-on: ${{ inputs.runner || vars.CI_IMAGE_RUNNER || vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 350
+    concurrency:
+      group: image-${{ inputs.content_tag || inputs.image }}
+      cancel-in-progress: false
+    outputs:
+      ref: ${{ steps.result.outputs.ref }}
+      digest: ${{ steps.result.outputs.digest }}
+      content_tag: ${{ steps.result.outputs.content_tag }}
+      built: ${{ steps.result.outputs.built }}
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
 
@@ -110,7 +128,7 @@ jobs:
       - name: install CI dependencies
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
-      - name: check registry tooling
+      - name: check build environment
         run: python3 -m scripts.ci.image env
 
       - name: log in to SWR
@@ -120,39 +138,88 @@ jobs:
           REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
         run: |
           set -euo pipefail
-          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
-            echo "::error::SWR_USERNAME / SWR_PASSWORD are required to promote an image"
-            exit 1
-          fi
+          : "${SWR_USER:?SWR_USERNAME is required for image builds}"
+          : "${SWR_PASS:?SWR_PASSWORD is required for image builds}"
           printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
 
-      - name: promote validated digest
-        id: promote
-        env:
-          IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ needs.build.outputs.digest }}
+      - name: create buildx builder
+        id: builder
         run: |
           set -euo pipefail
-          python3 -m scripts.ci.image promote \
-            --image "$IMAGE" \
-            --digest "$DIGEST" \
-            --github-output "$GITHUB_OUTPUT"
+          name="imageci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if docker buildx create --name "$name" --driver docker-container --use; then
+            docker buildx inspect --bootstrap >/dev/null
+            echo "name=$name" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::docker-container builder failed; falling back to the default builder"
+            echo "name=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build image
+        id: result
+        env:
+          IMAGE: ${{ inputs.image }}
+          IMAGE_PLAN: ${{ inputs.image_plan }}
+          BUILDER: ${{ steps.builder.outputs.name }}
+          MAX_JOBS: ${{ inputs.max_jobs }}
+          USE_CACHE: ${{ inputs.use_cache }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/image-result.json"
+          common=(--image "$IMAGE" --output "$result")
+          build=(python3 -m scripts.ci.image build "${common[@]}" --policy build_if_missing)
+          if [ -n "$IMAGE_PLAN" ]; then
+            printf '%s' "$IMAGE_PLAN" > "$RUNNER_TEMP/image-plan.json"
+            build+=(--plan-file "$RUNNER_TEMP/image-plan.json")
+          fi
+          if [ -n "${BUILDER:-}" ]; then build+=(--builder "$BUILDER"); fi
+          if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
+          if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
+          "${build[@]}"
+
+      - name: upload build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-build-log-${{ inputs.image }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: summary
         if: always()
         env:
-          IMAGE: ${{ inputs.image }}
-          ALIAS: ${{ steps.promote.outputs.alias }}
-          CONTENT_TAG: ${{ steps.promote.outputs.content_tag }}
-          DIGEST: ${{ steps.promote.outputs.digest }}
+          CONTENT_TAG: ${{ steps.result.outputs.content_tag }}
+          DIGEST: ${{ steps.result.outputs.digest }}
+          BUILT: ${{ steps.result.outputs.built }}
         run: |
           {
-            echo '## Image promotion'
+            echo '## Image CI'
             echo ''
             echo '| field | value |'
             echo '|---|---|'
-            echo "| image | \`${IMAGE}\` |"
-            echo "| alias | \`${ALIAS:-missing}\` |"
             echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
             echo "| digest | \`${DIGEST:-missing}\` |"
+            echo "| built | \`${BUILT:-unknown}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: cleanup
+        if: always() && steps.builder.outputs.name != ''
+        continue-on-error: true
+        env:
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: docker buildx rm "$BUILDER"
+
+  tests:
+    name: Test
+    if: inputs.run_tests
+    needs: build
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: pr
+      scope: pull_request
+      targets: ${{ inputs.target }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      image_name: ${{ inputs.image }}
+      image_ref: ${{ needs.build.outputs.ref }}

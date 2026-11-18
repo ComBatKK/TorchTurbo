@@ -89,15 +89,73 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
       matrix: ${{ fromJSON(needs.discover.outputs.image_jobs) }}
-    uses: ./.github/workflows/ascend-image-pipeline.yml
-    with:
-      image: ${{ matrix.image }}
-      image_mode: resolve_candidate
-      target: ${{ matrix.target }}
-      checkout_ref: ${{ github.sha }}
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: check registry tooling
+        run: python3 -m scripts.ci.image env
+
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          : "${SWR_USER:?SWR_USERNAME is required for image promotion}"
+          : "${SWR_PASS:?SWR_PASSWORD is required for image promotion}"
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+
+      - name: resolve candidate
+        id: resolve
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          python3 -m scripts.ci.image resolve-candidate \
+            --image "$IMAGE" \
+            --policy resolve_candidate
+
+      - name: promote validated digest
+        id: promote
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+        run: |
+          python3 -m scripts.ci.image promote \
+            --image "$IMAGE" \
+            --digest "$DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE: ${{ matrix.image }}
+          ALIAS: ${{ steps.promote.outputs.alias }}
+          CONTENT_TAG: ${{ steps.promote.outputs.content_tag }}
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          {
+            echo '## Image promotion'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE}\` |"
+            echo "| alias | \`${ALIAS:-missing}\` |"
+            echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
+            echo "| digest | \`${DIGEST:-missing}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   gate:
     name: Ascend-Image-Promote-Gate

@@ -213,6 +213,7 @@ def _build_pytest_jobs(
                 selected_routes[fact.suite].add((fact.path, target.name))
 
     jobs: list[Job] = []
+    job_ids: set[str] = set()
     for key in sorted(groups):
         group = groups[key]
         job_timeout = config.pytest.job_timeout_minutes.get(group.device)
@@ -226,6 +227,14 @@ def _build_pytest_jobs(
         job_id = _slug(
             f"pytest-{group.suite}-{group.device}-{group.image.name}-{group.venv_name}"
         )
+        if job_id in job_ids:
+            issues.append(_issue(
+                job_id,
+                f"duplicate pytest job id {job_id!r}",
+                "duplicate-job-id",
+            ))
+            continue
+        job_ids.add(job_id)
         lane = config.lane_for(group.target, group.max_ranks)
         steps_by_key: dict[tuple[str, str], list[PytestFact]] = {}
         for entry in group.entries:
@@ -683,12 +692,33 @@ def matrix_outputs(plan: Plan, config: CiConfig) -> dict[str, list[dict[str, Any
         lane = config.lanes[job.runtime.lane]
         output[f"{job.runtime.device}_jobs"].append({
             "job_id": job.id,
+            "display_name": _matrix_display_name(job, config),
             "image_ref": job.runtime.image.ref,
             "runner_variable": lane.runner_variable,
             "runner": lane.runner,
             "timeout_minutes": job.timeout_minutes,
         })
     return output
+
+
+def _matrix_display_name(job: Job, config: CiConfig) -> str:
+    """Return a compact human-facing name without changing the job contract."""
+    if job.kind != "pytest":
+        return job.id
+    spec = next(
+        (step.spec for step in job.steps if isinstance(step.spec, PytestSpec)),
+        None,
+    )
+    if spec is None:
+        return job.id
+    target_images = [
+        image for image in config.images.values()
+        if image.target == job.runtime.target
+    ]
+    image_suffix = "" if len(target_images) == 1 else f"-{job.runtime.image.name}"
+    return _slug(
+        f"pytest-{spec.suite}-{job.runtime.target}{image_suffix}-{job.runtime.venv.name}"
+    )
 
 
 def _write_github_output(path: Path, key: str, value: str) -> None:

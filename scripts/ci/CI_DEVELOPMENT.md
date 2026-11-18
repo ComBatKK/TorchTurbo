@@ -82,7 +82,7 @@ changed files 路由到两个域；`contracts/` 和 `config/` 是共享边界。
 
 镜像发布链路只读取 `scripts/ci/config/ci.yml` 中 image 的 `ref`、`target` 和
 `build`；测试配置加载器保留 `build` 字段但不解释它。Image PR 的外层 Plan 一次计算
-全部受影响镜像的 identity、action 和 content tag；`ascend-image.yml` 直接消费该
+全部受影响镜像的 identity、action 和 content tag；`ascend-image-pipeline.yml` 直接消费该
 `image_plan`，只有手动触发时才在内部计算 identity。测试入口继续复用既有
 Plan/JobResult/Gate 语义。
 
@@ -118,11 +118,10 @@ delegated Plan，不重复跑用例。同仓 PR 自动运行，fork PR 需要维
 `image-ci/run` 标签。
 
 main 合并后，`.github/workflows/ascend-image-promote.yml` 用同一套 selection 规则选择
-main 上修改的 Dockerfile 对应镜像，并调用同一个 `ascend-image-pipeline.yml`，只把
-`image_mode` 设为 `resolve_candidate`。每个单镜像单元只解析已测试 candidate，然后
-把 content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接
-失败，不创建未经 Image PR 测试的替代镜像。手动 dispatch 使用 `images=all` 或逗号
-分隔的逻辑镜像列表。
+main 上修改的 Dockerfile 对应镜像，并在 promotion workflow 内完成
+`resolve candidate -> promote alias`。每个单镜像单元只解析已测试 candidate，然后把
+content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接失败，不创建
+未经 Image PR 测试的替代镜像。手动 dispatch 使用 `images=all` 或逗号分隔的逻辑镜像列表。
 
 其他 `docker/**` 文件不自动触发 Image PR，仍由普通 PR CI 看护。
 

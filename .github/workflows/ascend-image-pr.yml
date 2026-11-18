@@ -1,5 +1,5 @@
-name: Ascend-Image-PR
-run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }}
+name: Ascend Image PR
+run-name: Image PR ${{ format('#{0}', github.event.pull_request.number) }}
 
 # Dockerfile PR validation. One Plan job does lint, change routing, image
 # identity planning and CPU test planning:
@@ -26,36 +26,17 @@ concurrency:
 
 jobs:
   plan:
-    name: Ascend-Image-PR-Plan
+    name: Image plan
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
       change_route: ${{ steps.plan.outputs.change_route }}
-      cpu_needed: ${{ steps.plan.outputs.cpu_needed }}
       cpu_jobs: ${{ steps.plan.outputs.cpu_jobs }}
       cpu_job_count: ${{ steps.plan.outputs.cpu_job_count }}
       image_jobs: ${{ steps.plan.outputs.image_jobs }}
       image_count: ${{ steps.plan.outputs.image_count }}
       images: ${{ steps.plan.outputs.images }}
     steps:
-      - name: require approval label for fork PRs
-        env:
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          BASE_REPOSITORY: ${{ github.repository }}
-          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'image-ci/run') }}
-        run: |
-          set -euo pipefail
-          if [ "$HEAD_REPOSITORY" = "$BASE_REPOSITORY" ]; then
-            echo "same-repository PR; image candidate validation is allowed"
-            exit 0
-          fi
-          if [ "$HAS_LABEL" = true ]; then
-            echo "fork PR approved with image-ci/run"
-            exit 0
-          fi
-          echo "::error::fork image PR requires the 'image-ci/run' label after maintainer review"
-          exit 1
-
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/head
@@ -71,58 +52,67 @@ jobs:
       - name: lint
         run: python3 -m scripts.ci.tools.lint
 
-      - name: route changes and build Plan
+      - name: Fork PR approval
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'image-ci/run') }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REPOSITORY" = "$BASE_REPOSITORY" ]; then
+            echo "same-repository PR; approval not required"
+            exit 0
+          fi
+          if [ "$HAS_LABEL" = true ]; then
+            echo "fork PR approved by image-ci/run"
+            exit 0
+          fi
+          echo "::error::fork image PR requires maintainer approval via the 'image-ci/run' label"
+          exit 1
+
+      - name: Route and plan
         id: plan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
+
+          echo "Stage 1: collect changed files"
           changed="$RUNNER_TEMP/ci-changed-files.txt"
           git diff --name-only --no-renames "$BASE_SHA...HEAD" > "$changed"
-          route_output=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
-          change_route=${route_output#change_route=}
-          cpu_needed=false
-          if [ "$change_route" = mixed ]; then
-            cpu_needed=true
-          elif [ "$change_route" != image_only ]; then
-            echo "::error::expected image_only or mixed Dockerfile PR; got $route_output"
-            exit 1
-          fi
 
+          echo "Stage 2: route image-only vs mixed changes"
+          route=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
+          route=${route#change_route=}
+          case "$route" in
+            image_only|mixed) ;;
+            *) echo "::error::expected image_only or mixed; got $route"; exit 1 ;;
+          esac
+
+          echo "Stage 3: select affected images and build the image plan"
           matrix="$RUNNER_TEMP/image-matrix.json"
           python3 -m scripts.ci.image.selection \
-            --root "$GITHUB_WORKSPACE" \
-            --changed-files "$changed" \
-            --plan-policy build_if_missing \
-            --base-sha "$BASE_SHA" \
-            --output "$matrix" \
-            --plans-output "$RUNNER_TEMP/ci-plan/image-plans.json" \
+            --root "$GITHUB_WORKSPACE" --changed-files "$changed" \
+            --plan-policy build_if_missing --base-sha "$BASE_SHA" \
+            --output "$matrix" --plans-output "$RUNNER_TEMP/ci-plan/image-plans.json" \
             --github-output "$GITHUB_OUTPUT"
 
-          mkdir -p "$RUNNER_TEMP/ci-plan"
-          python3 -m scripts.ci.execution.producer.planner \
-            --scope pull_request \
-            --change-scope code \
-            --targets cpu \
-            --output "$RUNNER_TEMP/ci-plan/plan.json" \
-            --github-output "$GITHUB_OUTPUT"
+          echo "Stage 4: generate the CPU plan for mixed PRs only"
+          if [ "$route" = mixed ]; then
+            python3 -m scripts.ci.execution.producer.planner \
+              --scope pull_request --change-scope code --targets cpu \
+              --output "$RUNNER_TEMP/ci-plan/plan.json" --github-output "$GITHUB_OUTPUT"
+          else
+            printf 'cpu_jobs=[]\ncpu_job_count=0\n' >> "$GITHUB_OUTPUT"
+          fi
 
-          echo "change_route=$change_route" >> "$GITHUB_OUTPUT"
-          echo "cpu_needed=$cpu_needed" >> "$GITHUB_OUTPUT"
-          images=$(python3 -c \
-            'import json,sys; print(",".join(i["image"] for i in json.load(open(sys.argv[1]))["include"]))' \
-            "$matrix")
-          {
-            echo '## Image PR route'
-            echo ''
-            echo '| field | value |'
-            echo '|---|---|'
-            echo "| route | \`${change_route}\` |"
-            echo "| CPU preflight | \`${cpu_needed}\` |"
-            echo "| images | \`${images}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Stage 5: publish step outputs and summary"
+          printf 'change_route=%s\n' "$route" >> "$GITHUB_OUTPUT"
+          images=$(sed -n 's/^images=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          printf '## Image PR route\n\n| route | images |\n|---|---|\n| %s | %s |\n' \
+            "$route" "$images" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: upload CPU Plan
+      - name: Upload plan
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -131,12 +121,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  cpu:
-    name: Ascend-Image-CPU (${{ matrix.job_id }})
+  cpu-tests:
+    name: ${{ matrix.display_name }}
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
-      needs.plan.outputs.cpu_needed == 'true' &&
+      needs.plan.outputs.change_route == 'mixed' &&
       needs.plan.outputs.cpu_job_count != '0'
     strategy:
       fail-fast: false
@@ -191,34 +181,34 @@ jobs:
           retention-days: 7
 
   candidates:
-    name: Ascend-Image-Candidate (${{ matrix.image }})
-    needs: [plan, cpu]
+    name: Candidate image (${{ matrix.image }})
+    needs: [plan, cpu-tests]
     if: |
       always() &&
       needs.plan.result == 'success' &&
       needs.plan.outputs.image_count != '0' &&
-      (needs.cpu.result == 'success' || needs.cpu.result == 'skipped')
+      (needs.cpu-tests.result == 'success' || needs.cpu-tests.result == 'skipped')
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
+      max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '3') }}
       matrix: ${{ fromJSON(needs.plan.outputs.image_jobs) }}
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
       image: ${{ matrix.image }}
-      image_mode: ${{ matrix.image_mode }}
       image_plan: ${{ matrix.image_plan }}
       content_tag: ${{ matrix.content_tag }}
       target: ${{ matrix.target }}
       checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
       max_jobs: auto
       use_cache: true
+      run_tests: true
     secrets:
       SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
       SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
 
   gate:
-    name: Ascend-Image-PR-Gate
-    needs: [plan, cpu, candidates]
+    name: Image gate
+    needs: [plan, cpu-tests, candidates]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 5
@@ -235,9 +225,8 @@ jobs:
         env:
           PLAN_RESULT: ${{ needs.plan.result }}
           CHANGE_ROUTE: ${{ needs.plan.outputs.change_route }}
-          CPU_NEEDED: ${{ needs.plan.outputs.cpu_needed }}
           CPU_JOB_COUNT: ${{ needs.plan.outputs.cpu_job_count }}
-          CPU_RESULT: ${{ needs.cpu.result }}
+          CPU_RESULT: ${{ needs.cpu-tests.result }}
           CANDIDATE_RESULT: ${{ needs.candidates.result }}
           IMAGE_COUNT: ${{ needs.plan.outputs.image_count }}
           IMAGES: ${{ needs.plan.outputs.images }}
@@ -257,19 +246,19 @@ jobs:
             echo "::error::no affected image entered the candidate matrix"
             failed=1
           fi
-          if [ "$CPU_NEEDED" = true ]; then
+          if [ "$CHANGE_ROUTE" = mixed ]; then
             if [ "${CPU_JOB_COUNT:-0}" -lt 1 ]; then
               echo "::error::mixed PR has no CPU Plan jobs"
               failed=1
             fi
-            require_success cpu "$CPU_RESULT"
-          elif [ "$CPU_NEEDED" = false ]; then
+            require_success cpu-tests "$CPU_RESULT"
+          elif [ "$CHANGE_ROUTE" = image_only ]; then
             if [ "$CPU_RESULT" != skipped ]; then
-              echo "::error::CPU preflight must be skipped for Dockerfile-only PRs"
+              echo "::error::CPU tests must be skipped for Dockerfile-only PRs"
               failed=1
             fi
           else
-            echo "::error::Plan did not report cpu_needed"
+            echo "::error::Plan did not report image_only or mixed"
             failed=1
           fi
           require_success candidates "$CANDIDATE_RESULT"
@@ -279,7 +268,7 @@ jobs:
           echo "image PR pipeline passed for $CHANGE_ROUTE: $IMAGES" >> "$GITHUB_STEP_SUMMARY"
 
       - name: download CPU Plan
-        if: always() && needs.plan.outputs.cpu_needed == 'true'
+        if: always() && needs.plan.outputs.change_route == 'mixed'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -287,7 +276,7 @@ jobs:
           path: ${{ runner.temp }}/ci-plan
 
       - name: download CPU results
-        if: always() && needs.plan.outputs.cpu_needed == 'true'
+        if: always() && needs.plan.outputs.change_route == 'mixed'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -295,7 +284,7 @@ jobs:
           path: ${{ runner.temp }}/ci-results
 
       - name: judge CPU Plan results
-        if: always() && needs.plan.outputs.cpu_needed == 'true'
+        if: always() && needs.plan.outputs.change_route == 'mixed'
         env:
           PLAN: ${{ runner.temp }}/ci-plan/plan.json
           RESULTS: ${{ runner.temp }}/ci-results

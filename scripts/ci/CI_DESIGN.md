@@ -220,6 +220,10 @@ pytest-core-cpu-cpu-default-default
 pytest-core-npu-npu-default-default
 ```
 
+技术 Job ID 使用 `pytest-<suite>-<device>-<image>-<venv>`，用于 executor、artifact
+和 Gate 关联；展示名称使用 `pytest-<suite>-<target>-<venv>`。当同一 target 存在多个
+image 时，展示名称会在 target 后插入 image 名以避免冲突。
+
 nightly 的 12 个 Job 由 9 个 pytest Job 和 3 个 integration Job 组成。16 卡 case 不出现在 PR Plan 中。
 
 ### 2.4 Job 粒度
@@ -238,14 +242,13 @@ Job ID 由 suite、设备和 venv 等稳定字段生成，手动单点执行时�
 | `ascend-pr.yml` | `pull_request`、`workflow_dispatch`、`workflow_call` | 主入口，统一执行 PR 和 nightly scope |
 | `ascend-manual.yml` | `workflow_dispatch` | 复用主链路，单点执行一个 Plan Job |
 | `ascend-nightly.yml` | 手动 dispatch，cron 暂时关闭 | 以 nightly scope 调用主入口 |
-| `ascend-image.yml` | `workflow_call`、手动 dispatch | 可复用的镜像 build/resolve 引擎；可接收上游 Plan，不运行测试 |
 | `ascend-image-pr.yml` | `pull_request_target` 的 Dockerfile 变更 | 唯一的 Dockerfile PR 入口：选择受影响的逻辑镜像，可选 CPU 预检，再按镜像并行验证 |
 | `ascend-image-promote.yml` | `main` push 的 Dockerfile 变更、手动 dispatch | 选择 main 上受影响的镜像并按镜像并行发布 |
-| `ascend-image-pipeline.yml` | `workflow_call` | 单镜像完整链路：build/resolve、tests 或 promote |
+| `ascend-image-pipeline.yml` | `workflow_call`、手动 dispatch | 单镜像候选链路：build/resolve 和 tests；无上游 Plan 时在内部生成 identity |
 
 所有测试入口复用同一条 `Plan -> Executor -> Gate` 链路，没有第二套测试选择逻辑。
 Image PR 的 Plan 同时计算全部受影响镜像的 identity、action 和 content tag，并把它们
-直接写入 candidate matrix。`ascend-image.yml` 消费该 Plan 时不再二次计算镜像身份；
+直接写入 candidate matrix。`ascend-image-pipeline.yml` 消费该 Plan 时不再二次计算镜像身份；
 只有手动触发等没有上游 Plan 的入口才在内部生成 identity。测试仍复用通用的
 `Plan -> Executor -> Gate`，不引入第二套测试选择逻辑。
 
@@ -272,10 +275,10 @@ candidate 切片。`Ascend-PR-CI` 检测到 Dockerfile 变更时生成 0 Job 的
 `resources.images.<name>.build.dockerfile` 建立 Dockerfile 到逻辑镜像的映射。一次修改
 多个 Dockerfile 时，只把被修改且已映射的镜像放入 matrix；未映射的 Dockerfile 直接
 失败，不会静默跳过。Plan 为每个 matrix item 预先写入完整的 `image_plan`、`action` 和
-`content_tag`；`candidate -> tests` 统一消费该 Plan，不再次规划。main promotion 复用
-同一个 workflow，只把 `image_mode` 切换为 `resolve_candidate`，内部改为
-`resolve -> promote`。不同镜像之间并行，且不设置全局 build、test 阶段栅栏。
-`fail-fast: false`，一个镜像失败不会取消其他镜像，最终由各自的 Gate 汇总。
+`content_tag`；`candidate -> tests` 统一消费该 Plan，不再次规划。main promotion 在
+`ascend-image-promote.yml` 内独立执行 `resolve candidate -> promote alias`，不再复用
+候选流水线。不同镜像之间并行，且不设置全局 build、test 阶段栅栏。`fail-fast: false`，
+一个镜像失败不会取消其他镜像，最终由各自的 Gate 汇总。
 
 `scripts/ci/image/**`、`ci.yml` 的 image build recipe 以及 image workflow 自身的变更
 不会自动构建 candidate，避免普通 CI 维护 PR 触发数小时的镜像任务；这些变更需要在合并
@@ -325,11 +328,12 @@ Gate 的核心规则是 fail closed：
 - nightly 的 cron 暂时关闭，当前只做 Plan 验证。
 - 普通 PR 使用 base SHA 对应的 content tag，不接收 SWR 凭据，也不等待镜像构建。
 - Dockerfile PR 由 `Ascend-Image-PR` 独占测试所有权；混合 PR 的 CPU 预检只执行一次，
-  多个镜像随后并行验证。fork PR 需要 `image-ci/run` 标签。
+  多个镜像随后并行验证。fork PR 先执行无 secret 的 lint，再要求 `image-ci/run`
+  维护者批准后才能进入构建。
 - `Ascend-Image-Promote` 为每个受影响镜像解析同一个已测试 candidate 后 promote；
   任一 candidate 缺失时 fail closed，不临时构建替代镜像。
 - nightly/manual 只消费当前 SHA 对应的 content tag，不构建、不 promote 镜像。
-- Dockerfile PR 必须把 `Ascend-Image-PR-Gate` 作为测试必过项；普通 PR 的
+- Dockerfile PR 必须把 `Image gate` 作为测试必过项；普通 PR 的
   `Ascend-PR-Gate` 在 Dockerfile PR 上只是 delegated 占位，不能替代 Image Gate。
 - 模型 index 和全部 shard 的严格校验、下载超时/错误分类、`resolved_inputs.json` 的耗时和大小、ModelScope fallback 与 HF golden 一致性仍是非阻塞增强项。
 - 4 卡 lane 已声明但暂未纳入当前验收；16 卡 lane 已通过 manual 真机验证。
@@ -590,7 +594,7 @@ Planner 仍按以下维度聚合 pytest：
 - workflow：lint-plan 用 `refs` 解析全部 container content ref，matrix 已包含不可变
   `image_ref`；普通 PR 用 `targets` 做通用执行切片。
 - Image PR：changed Dockerfile 先映射为 affected images；混合 PR 只做一次 CPU 预检，
-  每个镜像再独立执行 build、tests，最终由 `Ascend-Image-PR-Gate` 统一裁决。
+  每个镜像再独立执行 build、tests，最终由 `Image gate` 统一裁决。
 - tests：已覆盖 target/image 解析优先级、A3/A5 路由、多 Dockerfile selection 和不静默回退。
 - 文档：`CI_DESIGN.md` 记录整体模型，`CI_DEVELOPMENT.md` 记录维护命令和契约。
 

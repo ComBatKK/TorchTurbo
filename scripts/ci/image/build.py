@@ -123,6 +123,29 @@ def _metadata_digest(path: str) -> str:
     return str(value.get("containerimage.digest", ""))
 
 
+def _run_build(
+    command: list[str], *, cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run docker buildx while streaming every line to the caller's log."""
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    if process.stdout is None:  # pragma: no cover - Popen requested a pipe
+        raise BuildError("failed to capture docker buildx output")
+    lines: list[str] = []
+    for line in process.stdout:
+        lines.append(line)
+        print(line, end="", flush=True)
+    return subprocess.CompletedProcess(
+        command, process.wait(), "".join(lines), ""
+    )
+
+
 def _inspect_digest(ref: str) -> str:
     process = subprocess.run(
         ["docker", "buildx", "imagetools", "inspect", ref,
@@ -186,7 +209,7 @@ def ensure_candidate(
     use_cache: bool = True,
     builder: str = "",
     jobs: int = 1,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run_build,
 ) -> ImageResult:
     existing = registry.manifest(plan.content_tag)
     if existing is not None:
@@ -197,7 +220,7 @@ def ensure_candidate(
     if not should_push:
         raise BuildError(
             f"candidate {plan.content_ref} is absent and pushing is disabled; "
-            "run Ascend-Image-CI with build_if_missing first"
+            "run the Ascend Candidate workflow with build_if_missing first"
         )
     metadata_file = "/tmp/build-meta.json"
     command = build_command(
@@ -209,13 +232,7 @@ def ensure_candidate(
         metadata_file=metadata_file,
     )
     started = time.monotonic()
-    process = run(
-        command,
-        cwd=root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    process = run(command, cwd=root)
     elapsed = int(time.monotonic() - started)
     log = process.stdout or ""
     Path("/tmp/build.log").write_text(log, encoding="utf-8")

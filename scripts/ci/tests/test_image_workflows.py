@@ -55,54 +55,63 @@ def test_image_pr_plans_builds_and_tests_the_candidate(repo_root: Path) -> None:
     assert triggers["pull_request_target"]["paths"] == ["docker/**/Dockerfile*"]
     assert "image-ci/run" in dumped
     assert "pull_request" not in triggers
-    assert set(jobs) == {"plan", "cpu", "candidates", "gate"}
+    assert set(jobs) == {"plan", "cpu-tests", "candidates", "gate"}
     assert "ascend-pr.yml" not in dumped
     assert "approval" not in jobs
     assert "discover" not in jobs
     plan = jobs["plan"]
-    assert plan["name"] == "Ascend-Image-PR-Plan"
+    assert plan["name"] == "Image plan"
     assert set(plan["outputs"]) == {
-        "change_route", "cpu_needed", "cpu_jobs", "cpu_job_count", "image_jobs",
+        "change_route", "cpu_jobs", "cpu_job_count", "image_jobs",
         "image_count", "images",
     }
     assert plan["outputs"]["image_jobs"].startswith("${{ steps.plan")
-    approval = next(step for step in plan["steps"] if step["name"] == "require approval label for fork PRs")
+    approval = next(
+        step for step in plan["steps"]
+        if step.get("name") == "Fork PR approval"
+    )
     assert "image-ci/run" in approval["run"]
+    step_names = [step.get("name", "") for step in plan["steps"]]
+    assert step_names.index("lint") < step_names.index("Fork PR approval")
+    assert step_names.index("Fork PR approval") < step_names.index("Route and plan")
     plan_step = next(step for step in plan["steps"] if step.get("id") == "plan")
     assert "scripts.ci.routing.change_router" in plan_step["run"]
     assert "scripts.ci.image.selection" in plan_step["run"]
     assert "--plan-policy build_if_missing" in plan_step["run"]
     assert "--plans-output" in plan_step["run"]
     assert "scripts.ci.execution.producer.planner" in plan_step["run"]
+    assert 'if [ "$route" = mixed ]' in plan_step["run"]
+    assert "printf 'cpu_jobs=[]\\ncpu_job_count=0\\n'" in plan_step["run"]
     assert "--targets cpu" in plan_step["run"]
-    assert "change_route=${route_output#change_route=}" in plan_step["run"]
-    assert "cpu_needed=true" in plan_step["run"]
+    assert "route=${route#change_route=}" in plan_step["run"]
+    assert "case \"$route\" in" in plan_step["run"]
+    assert "image_only|mixed" in plan_step["run"]
     assert "refs/pull/${{ github.event.pull_request.number }}/head" in yaml.safe_dump(
         plan
     )
-    assert jobs["cpu"]["needs"] == "plan"
-    assert jobs["cpu"]["strategy"]["matrix"]["include"] == (
+    assert jobs["cpu-tests"]["needs"] == "plan"
+    assert jobs["cpu-tests"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.plan.outputs.cpu_jobs) }}"
     )
-    assert jobs["cpu"]["strategy"]["max-parallel"] == 5
-    assert "scripts.ci.execution.consumer.executor" in yaml.safe_dump(jobs["cpu"])
-    assert "ci-plan" in yaml.safe_dump(jobs["cpu"])
-    assert set(jobs["candidates"]["needs"]) == {"plan", "cpu"}
-    assert "needs.cpu.result == 'skipped'" in jobs["candidates"]["if"]
+    assert jobs["cpu-tests"]["name"] == "${{ matrix.display_name }}"
+    assert jobs["cpu-tests"]["strategy"]["max-parallel"] == 5
+    assert "scripts.ci.execution.consumer.executor" in yaml.safe_dump(jobs["cpu-tests"])
+    assert "ci-plan" in yaml.safe_dump(jobs["cpu-tests"])
+    assert set(jobs["candidates"]["needs"]) == {"plan", "cpu-tests"}
+    assert "needs.cpu-tests.result == 'skipped'" in jobs["candidates"]["if"]
     assert jobs["candidates"]["uses"] == "./.github/workflows/ascend-image-pipeline.yml"
     assert jobs["candidates"]["strategy"]["fail-fast"] is False
     assert jobs["candidates"]["strategy"]["max-parallel"] == (
-        "${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}"
+        "${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '3') }}"
     )
     assert jobs["candidates"]["strategy"]["matrix"] == (
         "${{ fromJSON(needs.plan.outputs.image_jobs) }}"
     )
     assert jobs["candidates"]["with"]["image"] == "${{ matrix.image }}"
-    assert jobs["candidates"]["with"]["image_mode"] == "${{ matrix.image_mode }}"
     assert jobs["candidates"]["with"]["image_plan"] == "${{ matrix.image_plan }}"
     assert jobs["candidates"]["with"]["content_tag"] == "${{ matrix.content_tag }}"
-    assert set(jobs["gate"]["needs"]) == {"plan", "cpu", "candidates"}
-    assert jobs["gate"]["name"] == "Ascend-Image-PR-Gate"
+    assert set(jobs["gate"]["needs"]) == {"plan", "cpu-tests", "candidates"}
+    assert jobs["gate"]["name"] == "Image gate"
     assert "scripts.ci.execution.consumer.gate" in yaml.safe_dump(jobs["gate"])
     assert "promote" not in jobs
     assert {"candidate", "smoke", "tests"}.isdisjoint(jobs)
@@ -113,19 +122,25 @@ def test_image_pipeline_validation_is_serial_per_image(repo_root: Path) -> None:
     jobs = document["jobs"]
     dumped = yaml.safe_dump(document)
 
-    assert set(jobs) == {"build", "tests", "promote"}
-    assert jobs["build"]["uses"] == "./.github/workflows/ascend-image.yml"
-    assert jobs["build"]["with"]["mode"] == "${{ inputs.image_mode }}"
-    assert jobs["build"]["with"]["image_plan"] == "${{ inputs.image_plan }}"
-    assert jobs["tests"]["if"] == "inputs.image_mode == 'build_if_missing'"
+    assert set(jobs) == {"build", "tests"}
+    build = jobs["build"]
+    assert "uses" not in build
+    assert set(build["outputs"]) == {"ref", "digest", "content_tag", "built"}
+    assert build["concurrency"]["group"] == "image-${{ inputs.content_tag || inputs.image }}"
+    assert "scripts.ci.image build" in dumped
+    assert "scripts.ci.image resolve" not in dumped
+    assert "inputs.image_mode" not in dumped
+    assert "--plan-file" in dumped
+    assert "docker buildx" in dumped
+    assert "inputs.run_tests" in jobs["tests"]["if"]
     assert jobs["tests"]["needs"] == "build"
     assert jobs["tests"]["uses"] == "./.github/workflows/ascend-pr.yml"
     assert jobs["tests"]["with"]["image_name"] == "${{ inputs.image }}"
     assert jobs["tests"]["with"]["image_ref"] == "${{ needs.build.outputs.ref }}"
     assert jobs["tests"]["with"]["targets"] == "${{ inputs.target }}"
-    assert jobs["promote"]["if"] == "inputs.image_mode == 'resolve_candidate'"
     assert "smoke" not in dumped
     assert "scripts.ci.execution.consumer" not in dumped
+    assert "scripts.ci.image promote" not in dumped
 
 
 def test_image_promote_selects_affected_images_and_fans_out(repo_root: Path) -> None:
@@ -146,7 +161,8 @@ def test_image_promote_selects_affected_images_and_fans_out(repo_root: Path) -> 
     assert "github.event.before" in select["env"]["BEFORE_SHA"]
     assert "--images" in select["run"]
     assert promotions["needs"] == "discover"
-    assert promotions["uses"] == "./.github/workflows/ascend-image-pipeline.yml"
+    assert "uses" not in promotions
+    assert promotions["runs-on"].startswith("${{ vars.CI_CPU_RUNNER")
     assert promotions["strategy"]["fail-fast"] is False
     assert promotions["strategy"]["max-parallel"] == (
         "${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}"
@@ -154,41 +170,42 @@ def test_image_promote_selects_affected_images_and_fans_out(repo_root: Path) -> 
     assert promotions["strategy"]["matrix"] == (
         "${{ fromJSON(needs.discover.outputs.image_jobs) }}"
     )
-    assert promotions["with"]["image"] == "${{ matrix.image }}"
-    assert promotions["with"]["image_mode"] == "resolve_candidate"
-    assert promotions["with"]["checkout_ref"] == "${{ github.sha }}"
-    assert promotions["secrets"]["SWR_USERNAME"] == "${{ secrets.SWR_USERNAME }}"
+    assert "scripts.ci.image resolve-candidate" in yaml.safe_dump(promotions)
+    assert "scripts.ci.image promote" in yaml.safe_dump(promotions)
     assert set(gate["needs"]) == {"discover", "promotions"}
     assert "no affected image" in gate["steps"][0]["run"]
     assert "build_if_missing" not in yaml.safe_dump(document)
 
 
-def test_image_pipeline_promotion_is_serial_and_fail_closed(repo_root: Path) -> None:
-    document = _workflow(repo_root, "ascend-image-pipeline.yml")
-    jobs = document["jobs"]
+def test_image_promotion_resolves_then_promotes_the_same_digest(
+    repo_root: Path,
+) -> None:
+    document = _workflow(repo_root, "ascend-image-promote.yml")
+    steps = document["jobs"]["promotions"]["steps"]
+    resolve = next(step for step in steps if step.get("id") == "resolve")
+    promote = next(step for step in steps if step.get("id") == "promote")
 
-    assert jobs["build"]["uses"] == "./.github/workflows/ascend-image.yml"
-    assert jobs["build"]["with"]["mode"] == "${{ inputs.image_mode }}"
-    assert jobs["promote"]["if"] == "inputs.image_mode == 'resolve_candidate'"
-    assert jobs["promote"]["needs"] == "build"
-    promote = next(step for step in jobs["promote"]["steps"] if step.get("id") == "promote")
+    assert "scripts.ci.image resolve-candidate" in resolve["run"]
+    assert promote["env"]["DIGEST"] == "${{ steps.resolve.outputs.digest }}"
     assert "scripts.ci.image promote" in promote["run"]
     assert "--digest" in promote["run"]
 
 
-def test_reusable_image_workflow_accepts_explicit_checkout_ref(repo_root: Path) -> None:
-    document = _workflow(repo_root, "ascend-image.yml")
-    workflow_call = _triggers(document)["workflow_call"]
+def test_image_pipeline_accepts_manual_build_and_explicit_checkout_ref(
+    repo_root: Path,
+) -> None:
+    document = _workflow(repo_root, "ascend-image-pipeline.yml")
+    triggers = _triggers(document)
+    workflow_call = triggers["workflow_call"]
 
     assert workflow_call["inputs"]["checkout_ref"]["default"] == ""
-    assert set(document["jobs"]) == {"image"}
-    assert document["jobs"]["image"]["steps"][0]["with"]["ref"].startswith(
+    assert workflow_call["inputs"]["run_tests"]["default"] is True
+    assert document["jobs"]["build"]["steps"][0]["with"]["ref"].startswith(
         "${{ inputs.checkout_ref"
     )
-    assert workflow_call["inputs"]["image_plan"]["default"] == ""
-    assert "--plan-file" in yaml.safe_dump(document)
-    options = _triggers(document)["workflow_dispatch"]["inputs"]["mode"]["options"]
-    assert "resolve_candidate" in options
+    assert "--plan-file" in yaml.safe_dump(document["jobs"]["build"])
+    assert "image_mode" not in triggers["workflow_dispatch"]["inputs"]
+    assert triggers["workflow_dispatch"]["inputs"]["run_tests"]["default"] is False
 
 
 def test_pr_scope_is_sliced_by_target_for_image_pipeline(repo_root: Path) -> None:

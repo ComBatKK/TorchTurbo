@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts.ci.image.build import (
     BuildError,
+    _run_build,
     build_command,
     ensure_candidate,
     max_jobs,
@@ -154,3 +156,14 @@ def test_registry_promote_builds_retag_command() -> None:
         "registry.example/team/image:a3-base",
         "registry.example/team/image@sha256:abc",
     ]]
+
+
+def test_run_build_streams_and_captures_output(tmp_path: Path, capsys) -> None:
+    result = _run_build(
+        [sys.executable, "-c", "print('line one'); print('line two')"],
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == ["line one", "line two"]
+    assert capsys.readouterr().out.splitlines() == ["line one", "line two"]

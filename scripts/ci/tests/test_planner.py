@@ -135,6 +135,13 @@ def test_cpu_target_slice_runs_pr_cpu_jobs(
         "pytest-adapter-cpu-cpu-default-swift",
         "pytest-core-cpu-cpu-default-default",
     ]
+    assert [item["display_name"] for item in matrix_outputs(plan, config)["cpu_jobs"]] == [
+        "integration-base-suite-qwen3-5-moe-sft-2cpu",
+        "pytest-adapter-cpu-lf",
+        "pytest-adapter-cpu-qwen4-exp-swift",
+        "pytest-adapter-cpu-swift",
+        "pytest-core-cpu-default",
+    ]
     assert {job.runtime.device for job in plan.jobs} == {"cpu"}
     assert plan.inputs["targets"] == "cpu"
     assert validate_plan(plan, config, facts) == []
@@ -267,8 +274,11 @@ def test_target_cpu_and_npu_jobs_in_one_plan(
     assert artifact.plan is not None
     assert [job.id for job in artifact.plan.jobs] == [cpu, npu]
     assert artifact.plan.inputs["target_job"] == f"{cpu},{npu}"
-    assert matrix_outputs(artifact.plan, config)["cpu_jobs"][0]["job_id"] == cpu
-    assert matrix_outputs(artifact.plan, config)["npu_jobs"][0]["job_id"] == npu
+    matrices = matrix_outputs(artifact.plan, config)
+    assert matrices["cpu_jobs"][0]["job_id"] == cpu
+    assert matrices["npu_jobs"][0]["job_id"] == npu
+    assert matrices["cpu_jobs"][0]["display_name"] == "pytest-core-cpu-default"
+    assert matrices["npu_jobs"][0]["display_name"] == "pytest-core-npu-a3-default"
     assert validate_plan(artifact.plan, config, facts) == []
 
 
