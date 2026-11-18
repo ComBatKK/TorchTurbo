@@ -51,7 +51,7 @@ def test_image_pr_builds_smokes_and_tests_the_candidate(repo_root: Path) -> None
     dumped = yaml.safe_dump(document)
 
     assert "pull_request_target" in triggers
-    assert triggers["pull_request_target"]["branches"] == ["main"]
+    assert triggers["pull_request_target"]["branches"] == ["main", "ci/image-pr-base"]
     assert triggers["pull_request_target"]["paths"] == ["docker/**/Dockerfile*"]
     assert "image-ci/run" in dumped
     assert "pull_request" not in triggers
