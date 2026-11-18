@@ -250,3 +250,62 @@ def test_refs_cli_resolves_only_container_images(
     )
     expected = plan_image(repo_root, "npu-default").content_ref
     assert refs == {"npu-default": expected}
+
+
+def test_refs_cli_bootstraps_from_worktree_when_base_has_no_ci_config(
+    tmp_path: Path,
+) -> None:
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(tmp_path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "ci@example.invalid")
+    git("config", "user.name", "CI Test")
+    (tmp_path / "README.md").write_text("bootstrap\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "base without CI config")
+    base_sha = git("rev-parse", "HEAD")
+
+    config = tmp_path / "scripts/ci/config/ci.yml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "resources:\n"
+        "  targets:\n"
+        "    npu-a3: {device: npu, hardware: a3}\n"
+        "  images:\n"
+        "    npu-default:\n"
+        "      target: npu-a3\n"
+        "      kind: container\n"
+        "      ref: registry.example/team/image:cann9.0.0-a3-base\n"
+        "      build:\n"
+        "        dockerfile: docker/npu/Dockerfile_aarch64\n"
+        "        context: docker/npu\n"
+        "        platform: linux/arm64\n"
+        "        cann_version: '9.0.0'\n",
+        encoding="utf-8",
+    )
+    context = tmp_path / "docker/npu"
+    context.mkdir(parents=True)
+    (context / "Dockerfile_aarch64").write_text("FROM base:one\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "add CI config")
+
+    output = tmp_path / "image-refs"
+    assert main([
+        "refs",
+        "--root",
+        str(tmp_path),
+        "--revision",
+        base_sha,
+        "--output",
+        str(output),
+    ]) == 0
+
+    expected = plan_image(tmp_path, "npu-default").content_ref
+    assert output.read_text(encoding="utf-8") == f"npu-default={expected}\n"

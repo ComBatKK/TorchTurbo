@@ -22,7 +22,13 @@ from .build import (
     resolve_formal,
     verify_manifest,
 )
-from .plan import ImageError, POLICIES, container_image_names, plan_image
+from .plan import (
+    ImageConfigMissing,
+    ImageError,
+    POLICIES,
+    container_image_names,
+    plan_image,
+)
 from .registry import Registry, RegistryError
 
 
@@ -151,8 +157,16 @@ def cmd_identity(args: argparse.Namespace) -> int:
 def cmd_refs(args: argparse.Namespace) -> int:
     root = _root(args.root)
     revision = args.revision or None
+    try:
+        names = container_image_names(root, revision)
+    except ImageConfigMissing as exc:
+        if revision is None:
+            raise
+        print(f"::warning::{exc}; using the checked-out CI config", file=sys.stderr)
+        revision = None
+        names = container_image_names(root, revision)
     lines = []
-    for image_name in container_image_names(root, revision):
+    for image_name in names:
         plan = plan_image(
             root,
             image_name,

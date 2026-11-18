@@ -25,6 +25,10 @@ class ImageError(ValueError):
     """Raised when image metadata or build inputs are invalid."""
 
 
+class ImageConfigMissing(ImageError):
+    """Raised when a Git revision predates the CI image configuration."""
+
+
 @dataclass(frozen=True)
 class ImageSpec:
     name: str
@@ -222,6 +226,8 @@ def _load_yaml(root: Path, path: Path, label: str) -> dict[str, Any]:
 def _ci_document(root: Path, revision: str | None) -> tuple[dict[str, Any], str]:
     if revision is None:
         return _load_yaml(root, API_CONFIG, API_CONFIG.as_posix()), "worktree"
+    if not _git_names(root, revision, API_CONFIG.as_posix()):
+        raise ImageConfigMissing(f"{API_CONFIG} is absent at {revision}")
     try:
         document = yaml.safe_load(_git_file(root, revision, API_CONFIG.as_posix()))
     except (ImageError, ValueError, yaml.YAMLError) as exc:
