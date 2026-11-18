@@ -1,0 +1,221 @@
+name: Ascend-Image-Pipeline
+run-name: Ascend-Image-Pipeline ${{ inputs.image }} (${{ inputs.image_mode }})
+
+# One logical image's complete pipeline. The parent workflow expands this as a
+# matrix so different Dockerfiles run independently without global barriers.
+#
+#   build_if_missing  -> build candidate -> smoke -> candidate tests
+#   resolve_candidate -> resolve candidate -> smoke -> promote alias
+#
+# This workflow owns one image only. The image identity/build/resolve primitive
+# stays in ascend-image.yml, so other entry points can reuse it without tests.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: 'Logical image name from resources.images'
+        required: true
+        type: string
+      image_mode:
+        description: 'build_if_missing (validation) or resolve_candidate (promotion)'
+        required: true
+        type: string
+      target:
+        description: 'Target slice used by candidate tests; optional for promotion'
+        required: false
+        default: ''
+        type: string
+      device:
+        description: 'Device kind for smoke validation'
+        required: true
+        type: string
+      smoke_runner_variable:
+        description: 'Repository variable holding the smoke runner label'
+        required: false
+        default: ''
+        type: string
+      smoke_runner:
+        description: 'Literal smoke runner fallback'
+        required: true
+        type: string
+      checkout_ref:
+        description: 'Git ref under test; empty uses the calling workflow SHA'
+        required: false
+        default: ''
+        type: string
+      max_jobs:
+        description: 'MAX_JOBS passed to the image builder'
+        required: false
+        default: 'auto'
+        type: string
+      use_cache:
+        description: 'Use the GitHub Actions build cache'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SWR_USERNAME:
+        required: false
+      SWR_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  image:
+    name: Ascend-Image-Prepare (${{ inputs.image }})
+    uses: ./.github/workflows/ascend-image.yml
+    with:
+      image: ${{ inputs.image }}
+      mode: ${{ inputs.image_mode }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      max_jobs: ${{ inputs.max_jobs }}
+      use_cache: ${{ inputs.use_cache }}
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+
+  smoke:
+    name: Ascend-Image-Smoke (${{ inputs.image }})
+    needs: image
+    runs-on: ${{ vars[inputs.smoke_runner_variable] || inputs.smoke_runner }}
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.image.outputs.ref }}
+      options: --user root
+    steps:
+      - name: verify torch and device
+        env:
+          DEVICE: ${{ inputs.device }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import torch
+
+          device = os.environ["DEVICE"]
+          print(f"torch={torch.__version__}")
+          if device == "npu":
+              import torch_npu
+
+              print(f"torch_npu={torch_npu.__version__}")
+              if not torch.npu.is_available():
+                  raise SystemExit("torch.npu is not available in the candidate image")
+              value = torch.ones((64, 64), dtype=torch.float16, device="npu")
+              result = value @ value
+              torch.npu.synchronize()
+          elif device == "gpu":
+              if not torch.cuda.is_available():
+                  raise SystemExit("torch.cuda is not available in the candidate image")
+              value = torch.ones((64, 64), dtype=torch.float16, device="cuda")
+              result = value @ value
+              torch.cuda.synchronize()
+          else:
+              raise SystemExit(f"unsupported smoke device: {device}")
+          print(f"device_matmul_sum={result[0, 0].item()}")
+          PY
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE: ${{ inputs.image }}
+          MODE: ${{ inputs.image_mode }}
+          TARGET: ${{ inputs.target }}
+          IMAGE_REF: ${{ needs.image.outputs.ref }}
+          CONTENT_TAG: ${{ needs.image.outputs.content_tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          {
+            echo '## Image smoke'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE}\` |"
+            echo "| mode | \`${MODE}\` |"
+            echo "| target | \`${TARGET:-n/a}\` |"
+            echo "| ref | \`${IMAGE_REF}\` |"
+            echo "| content tag | \`${CONTENT_TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Ascend-Image-Tests (${{ inputs.image }})
+    if: inputs.image_mode == 'build_if_missing'
+    needs: [image, smoke]
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: pr
+      scope: pull_request
+      targets: ${{ inputs.target }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      image_name: ${{ inputs.image }}
+      image_ref: ${{ needs.image.outputs.ref }}
+
+  promote:
+    name: Ascend-Image-Promote-Alias (${{ inputs.image }})
+    if: inputs.image_mode == 'resolve_candidate'
+    needs: [image, smoke]
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: check registry tooling
+        run: python3 -m scripts.ci.image env
+
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are required to promote an image"
+            exit 1
+          fi
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+
+      - name: promote smoke-tested digest
+        id: promote
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 -m scripts.ci.image promote \
+            --image "$IMAGE" \
+            --digest "$DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE: ${{ inputs.image }}
+          ALIAS: ${{ steps.promote.outputs.alias }}
+          CONTENT_TAG: ${{ steps.promote.outputs.content_tag }}
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          {
+            echo '## Image promotion'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE}\` |"
+            echo "| alias | \`${ALIAS:-missing}\` |"
+            echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
+            echo "| digest | \`${DIGEST:-missing}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

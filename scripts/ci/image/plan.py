@@ -33,6 +33,7 @@ class ImageConfigMissing(ImageError):
 class ImageSpec:
     name: str
     target: str
+    device: str
     hardware: str
     ref: str
     repository: str
@@ -43,6 +44,15 @@ class ImageSpec:
     cann_version: str
     revision: int
     build_args: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ImageLane:
+    name: str
+    target: str
+    capacity_slots: int
+    runner_variable: str
+    runner: str
 
 
 @dataclass(frozen=True)
@@ -270,6 +280,7 @@ def _spec_from_documents(
         raise ImageError(f"image {image_name!r} is not a container image")
     target_name = _text(image.get("target"), f"{source}: images.{image_name}.target")
     target = _mapping(targets.get(target_name), f"{source}: target {target_name!r}")
+    device = _text(target.get("device"), f"{source}: targets.{target_name}.device")
     hardware = _text(target.get("hardware"), f"{source}: targets.{target_name}.hardware")
     ref = _text(image.get("ref"), f"{source}: images.{image_name}.ref")
     repository, alias = split_reference(ref)
@@ -301,6 +312,7 @@ def _spec_from_documents(
     return ImageSpec(
         name=image_name,
         target=target_name,
+        device=device,
         hardware=hardware,
         ref=ref,
         repository=repository,
@@ -328,6 +340,47 @@ def container_image_names(root: Path, revision: str | None = None) -> list[str]:
         for name, value in images.items()
         if isinstance(value, dict) and value.get("kind") == "container"
     )
+
+
+def load_specs(root: Path, revision: str | None = None) -> list[ImageSpec]:
+    """Load every container image declaration in stable name order."""
+    ci_document, source = _ci_document(root, revision)
+    resources = _mapping(ci_document.get("resources"), f"{source}: resources")
+    images = _mapping(resources.get("images"), f"{source}: resources.images")
+    names = sorted(
+        name
+        for name, value in images.items()
+        if isinstance(value, dict) and value.get("kind") == "container"
+    )
+    return [
+        _spec_from_documents(name, ci_document, source)
+        for name in names
+    ]
+
+
+def load_lanes(root: Path, revision: str | None = None) -> dict[str, ImageLane]:
+    """Load runner lanes used to select a smoke runner for each image target."""
+    ci_document, source = _ci_document(root, revision)
+    resources = _mapping(ci_document.get("resources"), f"{source}: resources")
+    lanes = _mapping(resources.get("lanes") or {}, f"{source}: resources.lanes")
+    result: dict[str, ImageLane] = {}
+    for name, value in lanes.items():
+        lane = _mapping(value, f"{source}: lanes.{name}")
+        result[str(name)] = ImageLane(
+            name=str(name),
+            target=_text(lane.get("target"), f"{source}: lanes.{name}.target"),
+            capacity_slots=_integer(
+                lane.get("capacity_slots"),
+                f"{source}: lanes.{name}.capacity_slots",
+                1,
+            ),
+            runner_variable=_text(
+                lane.get("runner_variable"),
+                f"{source}: lanes.{name}.runner_variable",
+            ),
+            runner=_text(lane.get("runner"), f"{source}: lanes.{name}.runner"),
+        )
+    return result
 
 
 def _base_spec(root: Path, sha: str, image_name: str) -> ImageSpec | None:
