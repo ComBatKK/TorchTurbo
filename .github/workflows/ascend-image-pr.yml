@@ -1,8 +1,8 @@
 name: Ascend-Image-PR
 run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }}
 
-# Dockerfile PR validation. The discover job maps changed Dockerfiles to
-# logical images, then each affected image runs one complete pipeline:
+# Dockerfile PR validation. The route job combines PR trust, change routing and
+# image selection, then each affected image runs one complete pipeline:
 #   build candidate -> smoke -> candidate tests
 #
 # Different images run in parallel. A global build/smoke/test stage barrier is
@@ -25,10 +25,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  approval:
-    name: Ascend-Image-Approval
+  route:
+    name: Ascend-Image-Route
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 5
+    timeout-minutes: 10
+    outputs:
+      change_route: ${{ steps.route.outputs.change_route }}
+      cpu_needed: ${{ steps.route.outputs.cpu_needed }}
+      matrix: ${{ steps.route.outputs.matrix }}
+      image_count: ${{ steps.route.outputs.image_count }}
+      images: ${{ steps.route.outputs.images }}
     steps:
       - name: require approval label for fork PRs
         env:
@@ -48,17 +54,6 @@ jobs:
           echo "::error::fork image PR requires the 'image-ci/run' label after maintainer review"
           exit 1
 
-  discover:
-    name: Ascend-Image-Discover
-    needs: approval
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 10
-    outputs:
-      cpu_needed: ${{ steps.discover.outputs.cpu_needed }}
-      matrix: ${{ steps.discover.outputs.matrix }}
-      image_count: ${{ steps.discover.outputs.image_count }}
-      images: ${{ steps.discover.outputs.images }}
-    steps:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/head
@@ -71,20 +66,21 @@ jobs:
       - name: install CI dependencies
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
-      - name: discover affected images
-        id: discover
+      - name: route changes and select affected images
+        id: route
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           changed="$RUNNER_TEMP/ci-changed-files.txt"
           git diff --name-only --no-renames "$BASE_SHA...HEAD" > "$changed"
-          route=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
+          route_output=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
+          change_route=${route_output#change_route=}
           cpu_needed=false
-          if [ "$route" = 'change_route=mixed' ]; then
+          if [ "$change_route" = mixed ]; then
             cpu_needed=true
-          elif [ "$route" != 'change_route=image_only' ]; then
-            echo "::error::expected image_only or mixed Dockerfile PR; got $route"
+          elif [ "$change_route" != image_only ]; then
+            echo "::error::expected image_only or mixed Dockerfile PR; got $route_output"
             exit 1
           fi
           matrix="$RUNNER_TEMP/image-matrix.json"
@@ -93,24 +89,27 @@ jobs:
             --changed-files "$changed" \
             --output "$matrix" \
             --github-output "$GITHUB_OUTPUT"
+          echo "change_route=$change_route" >> "$GITHUB_OUTPUT"
           echo "cpu_needed=$cpu_needed" >> "$GITHUB_OUTPUT"
           images=$(python3 -c \
             'import json,sys; print(",".join(i["image"] for i in json.load(open(sys.argv[1]))["include"]))' \
             "$matrix")
           {
-            echo '## Affected images'
+            echo '## Image PR route'
             echo ''
-            echo "- ${images}"
-            echo "- CPU preflight: \`${cpu_needed}\`"
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| route | \`${change_route}\` |"
+            echo "| CPU preflight | \`${cpu_needed}\` |"
+            echo "| images | \`${images}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   cpu:
     name: Ascend-Image-CPU-Preflight
-    needs: [approval, discover]
+    needs: route
     if: |
-      needs.approval.result == 'success' &&
-      needs.discover.result == 'success' &&
-      needs.discover.outputs.cpu_needed == 'true'
+      needs.route.result == 'success' &&
+      needs.route.outputs.cpu_needed == 'true'
     uses: ./.github/workflows/ascend-pr.yml
     with:
       mode: pr
@@ -120,17 +119,16 @@ jobs:
 
   candidates:
     name: Ascend-Image-Candidate (${{ matrix.image }})
-    needs: [approval, discover, cpu]
+    needs: [route, cpu]
     if: |
       always() &&
-      needs.approval.result == 'success' &&
-      needs.discover.result == 'success' &&
-      needs.discover.outputs.image_count != '0' &&
+      needs.route.result == 'success' &&
+      needs.route.outputs.image_count != '0' &&
       (needs.cpu.result == 'success' || needs.cpu.result == 'skipped')
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
-      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.route.outputs.matrix) }}
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
       image: ${{ matrix.image }}
@@ -148,20 +146,20 @@ jobs:
 
   gate:
     name: Ascend-Image-PR-Gate
-    needs: [approval, discover, cpu, candidates]
+    needs: [route, cpu, candidates]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 5
     steps:
       - name: evaluate image PR pipeline
         env:
-          APPROVAL_RESULT: ${{ needs.approval.result }}
-          DISCOVER_RESULT: ${{ needs.discover.result }}
-          CPU_NEEDED: ${{ needs.discover.outputs.cpu_needed }}
+          ROUTE_RESULT: ${{ needs.route.result }}
+          CHANGE_ROUTE: ${{ needs.route.outputs.change_route }}
+          CPU_NEEDED: ${{ needs.route.outputs.cpu_needed }}
           CPU_RESULT: ${{ needs.cpu.result }}
           CANDIDATE_RESULT: ${{ needs.candidates.result }}
-          IMAGE_COUNT: ${{ needs.discover.outputs.image_count }}
-          IMAGES: ${{ needs.discover.outputs.images }}
+          IMAGE_COUNT: ${{ needs.route.outputs.image_count }}
+          IMAGES: ${{ needs.route.outputs.images }}
         run: |
           set -euo pipefail
           failed=0
@@ -173,8 +171,7 @@ jobs:
               failed=1
             fi
           }
-          require_success approval "$APPROVAL_RESULT"
-          require_success discover "$DISCOVER_RESULT"
+          require_success route "$ROUTE_RESULT"
           if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
             echo "::error::no affected image entered the candidate matrix"
             failed=1
@@ -187,11 +184,11 @@ jobs:
               failed=1
             fi
           else
-            echo "::error::discover did not report cpu_needed"
+            echo "::error::route did not report cpu_needed"
             failed=1
           fi
           require_success candidates "$CANDIDATE_RESULT"
           if [ "$failed" -ne 0 ]; then
             exit 1
           fi
-          echo "image PR pipeline passed for: $IMAGES" >> "$GITHUB_STEP_SUMMARY"
+          echo "image PR pipeline passed for $CHANGE_ROUTE: $IMAGES" >> "$GITHUB_STEP_SUMMARY"
