@@ -17,6 +17,7 @@ from typing import Mapping, Protocol
 CPU_TORCH_VERSION = os.environ.get("CI_CPU_TORCH_VERSION", "2.10.0")
 READY_FILE = ".tt-ready.json"
 INSTALL_SCHEMA = "2"
+RUNTIME_DIR = Path("scripts/ci/execution/consumer/runtime")
 
 
 class VenvDefinition(Protocol):
@@ -103,8 +104,8 @@ class VenvManager:
         # dependency changes.
         for relative in (
             Path("pyproject.toml"),
-            Path("scripts/ci/consumer/runtime/venv.py"),
-            Path("scripts/ci/consumer/runtime/env.py"),
+            RUNTIME_DIR / "venv.py",
+            RUNTIME_DIR / "env.py",
         ):
             path = self.root / relative
             digest.update(f"file={relative.as_posix()}\n".encode())
@@ -145,7 +146,7 @@ class VenvManager:
         if self.device == "cpu":
             self._pip(venv, ["install", f"torch=={CPU_TORCH_VERSION}"])
         self._run(
-            [str(venv.python), str(self.root / "scripts/ci/consumer/runtime/env.py"),
+            [str(venv.python), str(self.root / RUNTIME_DIR / "env.py"),
              "probe", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,
@@ -163,7 +164,7 @@ class VenvManager:
         self._pip(venv, ["install", "--no-build-isolation", "--no-deps",
                          "-e", str(self.root)])
         self._run(
-            [str(venv.python), str(self.root / "scripts/ci/consumer/runtime/env.py"),
+            [str(venv.python), str(self.root / RUNTIME_DIR / "env.py"),
              "check", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,

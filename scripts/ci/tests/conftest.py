@@ -10,9 +10,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.ci.contracts.artifacts import Source  # noqa: E402
-from scripts.ci.producer.ci_config import CiConfig, Scope, load as load_config  # noqa: E402
-from scripts.ci.producer.facts import TestFacts, load as load_facts  # noqa: E402
-from scripts.ci.producer.planner import build, source_for  # noqa: E402
+from scripts.ci.execution.producer.ci_config import (  # noqa: E402
+    CiConfig,
+    Scope,
+    load as load_config,
+)
+from scripts.ci.execution.producer.facts import (  # noqa: E402
+    TestFacts,
+    load as load_facts,
+)
+from scripts.ci.execution.producer.planner import build, source_for  # noqa: E402
 
 
 @pytest.fixture(scope="session")

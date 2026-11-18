@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.consumer import executor
+from scripts.ci.execution.consumer import executor
 from scripts.ci.contracts.artifacts import (
     IntegrationSpec,
     PytestSpec,
@@ -14,7 +14,7 @@ from scripts.ci.contracts.artifacts import (
     load_job_result,
     write_json,
 )
-from scripts.ci.consumer.runtime.venv import Venv
+from scripts.ci.execution.consumer.runtime.venv import Venv
 
 
 def _fake_venv(tmp_path: Path, job) -> Venv:

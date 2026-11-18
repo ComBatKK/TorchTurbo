@@ -1,190 +1,281 @@
 name: Ascend-Image-CI
-run-name: Ascend-Image-CI ${{ inputs.runner || 'ubuntu-22.04-arm' }}
+run-name: Ascend-Image-CI ${{ inputs.image || 'npu-default' }} ${{ inputs.mode || 'resolve_only' }}
 
-# Build the L1 base image and publish it to SWR.
-# Manual dispatch only: one build can take 4-5 hours and many GB of bandwidth.
-# Image tags are content-addressed: base-<year-week>-c<content-hash>.
-# All logic lives in scripts/ci/tools/image.py so it can run locally.
+# Reusable image build/resolve engine for resources.images.*.build.
+# PR/main entry points call this workflow and consume one immutable digest.
+# It does not select or execute tests, and it is never called by ascend-pr.yml.
 
 on:
-  # Disabled for now. Uncomment to restore the nightly build.
-  # schedule:
-  #   - cron: '0 13 * * *'
+  workflow_call:
+    inputs:
+      image:
+        description: 'Logical image name from resources.images'
+        required: false
+        default: 'npu-default'
+        type: string
+      mode:
+        description: 'auto, resolve_only, resolve_candidate or build_if_missing'
+        required: true
+        type: string
+      checkout_ref:
+        description: 'Optional Git ref to build; empty uses the caller SHA'
+        required: false
+        default: ''
+        type: string
+      base_sha:
+        description: 'Base commit used to detect image input changes'
+        required: false
+        default: ''
+        type: string
+      block_build:
+        description: 'Fail closed when a candidate build would be required'
+        required: false
+        default: false
+        type: boolean
+      runner:
+        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
+      max_jobs:
+        description: 'MAX_JOBS passed to the image builder'
+        required: false
+        default: 'auto'
+        type: string
+      use_cache:
+        description: 'Use the GitHub Actions build cache'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SWR_USERNAME:
+        required: false
+      SWR_PASSWORD:
+        required: false
+    outputs:
+      ref:
+        description: 'Immutable registry@sha256 reference'
+        value: ${{ jobs.image.outputs.ref }}
+      digest:
+        description: 'Sha256 digest consumed by smoke and promotion'
+        value: ${{ jobs.image.outputs.digest }}
+      content_tag:
+        description: 'Content-addressed image tag'
+        value: ${{ jobs.image.outputs.content_tag }}
+      built:
+        description: 'Whether this run built the image'
+        value: ${{ jobs.image.outputs.built }}
 
   workflow_dispatch:
     inputs:
-      force_rebuild:
-        description: 'Rebuild even when the content tag already exists'
+      image:
+        description: 'Logical image name'
         required: true
-        default: false
-        type: boolean
-      should_push:
-        description: 'false = validate the build without publishing'
+        default: 'npu-default'
+        type: string
+      mode:
+        description: 'resolve_candidate = require content tag; build_if_missing = build once per content tag'
         required: true
-        default: true
-        type: boolean
-      runner:
-        description: 'Runner for the image build'
-        required: true
-        default: 'ubuntu-22.04-arm'
+        default: 'resolve_only'
         type: choice
         options:
-          - ubuntu-22.04-arm
-          - linux-aarch64-cpu-24
-          - linux-aarch64-cpu-4
+          - auto
+          - resolve_only
+          - resolve_candidate
+          - build_if_missing
+      runner:
+        description: 'Runner for the image job; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
       max_jobs:
         description: 'MAX_JOBS; auto = min(nproc, memory-GB / 3)'
         required: true
         default: 'auto'
+        type: string
       use_cache:
         description: 'Enable the GitHub Actions build cache'
         required: true
         default: true
         type: boolean
 
-# Do not run two image builds concurrently.
-concurrency:
-  group: image-ci-base
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
-env:
-  REGISTRY: swr.cn-north-12.myhuaweicloud.com
-  REPOSITORY: ascend/torchturbo_npu
-  DOCKERFILE: docker/npu/Dockerfile_aarch64
-  PLATFORM: linux/arm64
-  MOVING_TAG: base-latest
-
 jobs:
-  build-base:
-    name: Ascend-Image-Build (${{ inputs.runner || 'ubuntu-22.04-arm' }})
-    runs-on: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-    # Hosted runners stop at 6 hours; leave time for cleanup and summary.
-    timeout-minutes: 350
+  plan:
+    name: Ascend-Image-Plan
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
     outputs:
-      image: ${{ steps.tag.outputs.ref || steps.tag.outputs.full_tag }}
-      digest: ${{ steps.build.outputs.digest }}
-      built: ${{ steps.tag.outputs.build }}
-
+      action: ${{ steps.plan.outputs.image_mode }}
+      content_tag: ${{ steps.plan.outputs.content_tag }}
+      content_hash: ${{ steps.plan.outputs.content_hash }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
 
-      - name: Check runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: plan image identity
+        id: plan
         env:
-          RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-        run: python3 -m scripts.ci.tools.image env
+          IMAGE: ${{ inputs.image || 'npu-default' }}
+          MODE: ${{ inputs.mode || 'resolve_only' }}
+          BASE_SHA: ${{ inputs.base_sha || '' }}
+          BLOCK_BUILD: ${{ inputs.block_build || false }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-image"
+          args=(--image "$IMAGE" --policy "$MODE"
+                --output "$RUNNER_TEMP/ci-image/image-plan.json")
+          if [ -n "$BASE_SHA" ]; then
+            args+=(--base-sha "$BASE_SHA")
+          fi
+          if [ "$BLOCK_BUILD" = true ]; then
+            args+=(--block-build)
+          fi
+          python3 -m scripts.ci.image plan "${args[@]}"
 
-      - name: Resolve content tag
-        id: tag
-        env:
-          FORCE: ${{ inputs.force_rebuild }}
-          SHOULD_PUSH: ${{ inputs.should_push }}
-        run: python3 -m scripts.ci.tools.image tag
+  image:
+    name: Ascend-Image-Result (${{ needs.plan.outputs.action }})
+    needs: plan
+    runs-on: ${{ inputs.runner || vars.CI_IMAGE_RUNNER || vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 350
+    # Only the same content tag serializes. Different candidate tags can build in
+    # parallel; normal resolve calls wait for at most the short registry lookup.
+    concurrency:
+      group: image-${{ needs.plan.outputs.content_tag }}
+      cancel-in-progress: false
+    outputs:
+      ref: ${{ steps.result.outputs.ref }}
+      digest: ${{ steps.result.outputs.digest }}
+      content_tag: ${{ steps.result.outputs.content_tag }}
+      built: ${{ steps.result.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
 
-      - name: Log in to SWR
-        if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: check build environment
+        if: needs.plan.outputs.action == 'build_if_missing'
+        run: python3 -m scripts.ci.image env
+
+      - name: log in to SWR
+        if: needs.plan.outputs.action == 'build_if_missing'
         env:
           SWR_USER: ${{ secrets.SWR_USERNAME }}
           SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
-            echo "::error::SWR_USERNAME / SWR_PASSWORD are not configured"
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are required for image builds"
             exit 1
           fi
-          if ! printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" \
-                 --password-stdin >/tmp/login.log 2>&1; then
-            echo "::error::docker login failed"
-            tail -10 /tmp/login.log || true
-            exit 1
-          fi
-          echo "::notice::docker login succeeded (${REGISTRY})"
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
 
-      - name: Create buildx builder
+      - name: create buildx builder
         id: builder
-        if: steps.tag.outputs.build == 'true'
+        if: needs.plan.outputs.action == 'build_if_missing'
         run: |
-          set -uo pipefail
-          NAME="imageci-$$"
-          # The default docker driver cannot export GHA build cache.
-          if docker buildx create --name "$NAME" --driver docker-container --use \
-                 >/dev/null 2>&1; then
-            docker buildx inspect --bootstrap >/dev/null 2>&1 || true
-            echo "name=$NAME" >> "$GITHUB_OUTPUT"
-            echo "builder ready: $NAME (docker-container)"
+          set -euo pipefail
+          name="imageci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if docker buildx create --name "$name" --driver docker-container --use; then
+            docker buildx inspect --bootstrap >/dev/null
+            echo "name=$name" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::docker-container builder failed; GHA build cache disabled"
+            echo "::warning::docker-container builder failed; falling back to the default builder"
             echo "name=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push
-        id: build
-        if: steps.tag.outputs.build == 'true'
-        # Fail earlier than the job timeout when a network-bound layer hangs.
-        timeout-minutes: 320
+      - name: resolve or build image
+        id: result
         env:
-          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          IMAGE: ${{ inputs.image || 'npu-default' }}
+          ACTION: ${{ needs.plan.outputs.action }}
+          BUILDER: ${{ steps.builder.outputs.name }}
           MAX_JOBS: ${{ inputs.max_jobs || 'auto' }}
-          SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
           USE_CACHE: ${{ inputs.use_cache }}
-          BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 -m scripts.ci.tools.image build
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-image-result"
+          result="$RUNNER_TEMP/ci-image-result/image-result.json"
+          common=(--image "$IMAGE" --output "$result")
+          case "$ACTION" in
+            resolve)
+              python3 -m scripts.ci.image resolve "${common[@]}" --policy resolve_only
+              ;;
+            resolve_candidate)
+              python3 -m scripts.ci.image resolve-candidate "${common[@]}" \
+                --policy resolve_candidate
+              ;;
+            build_if_missing)
+              build=(python3 -m scripts.ci.image build "${common[@]}" --policy build_if_missing)
+              if [ -n "${BUILDER:-}" ]; then build+=(--builder "$BUILDER"); fi
+              if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
+              if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
+              "${build[@]}"
+              ;;
+            blocked)
+              python3 -m scripts.ci.image build "${common[@]}" \
+                --policy blocked --no-push
+              ;;
+            *)
+              echo "::error::image action $ACTION is not executable"
+              exit 2
+              ;;
+          esac
 
-      - name: Upload build log
-        if: always() && steps.tag.outputs.build == 'true'
+      - name: upload build log
+        if: always() && needs.plan.outputs.action == 'build_if_missing'
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ github.run_number }}
+          name: image-build-log-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/build.log
-          retention-days: 7
           if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Verify image
-        id: verify
-        if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
-        env:
-          TAG_IMM: ${{ steps.tag.outputs.immutable }}
-        run: python3 -m scripts.ci.tools.image verify
-
-      # Publish the current image reference for PR jobs.
-      - name: Publish image reference
-        if: always() && steps.tag.outputs.should_push == 'true'
-        env:
-          TAG_IMM: ${{ steps.tag.outputs.immutable }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: python3 -m scripts.ci.tools.image publish
-
-      - name: Upload image reference
-        if: always() && steps.tag.outputs.should_push == 'true'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          # Keep this name stable; consumers select the latest artifact.
-          name: base-image-ref
-          path: /tmp/image-ref/image-ref.txt
-          # Keep long enough to cover holidays; PR falls back to base-latest.
-          retention-days: 90
-          overwrite: true
-
-      - name: Summary
+      - name: summary
         if: always()
         env:
-          TAG_IMM: ${{ steps.tag.outputs.immutable }}
-          RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-          BUILT: ${{ steps.tag.outputs.build }}
-          SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
-          USE_CACHE: ${{ inputs.use_cache }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          MEDIA_TYPE: ${{ steps.verify.outputs.media_type }}
-          ELAPSED: ${{ steps.build.outputs.elapsed }}
-        run: python3 -m scripts.ci.tools.image summary
+          ACTION: ${{ needs.plan.outputs.action }}
+          CONTENT_TAG: ${{ steps.result.outputs.content_tag || needs.plan.outputs.content_tag }}
+          DIGEST: ${{ steps.result.outputs.digest }}
+          BUILT: ${{ steps.result.outputs.built }}
+        run: |
+          {
+            echo '## Image CI'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| action | \`${ACTION}\` |"
+            echo "| content tag | \`${CONTENT_TAG}\` |"
+            echo "| digest | \`${DIGEST:-missing}\` |"
+            echo "| built | \`${BUILT:-unknown}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Cleanup
-        if: always()
+      - name: cleanup
+        if: always() && steps.builder.outputs.name != ''
         continue-on-error: true
         env:
           BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 -m scripts.ci.tools.image cleanup
+        run: docker buildx rm "$BUILDER"

@@ -60,7 +60,10 @@ def timing() -> int:
 def main(argv: list[str]) -> int:
     if argv == ["timing"]:
         return timing()
-    print("usage: python -m scripts.ci.tools.report timing", file=sys.stderr)
+    print(
+        "usage: python -m scripts.ci.execution.consumer.report timing",
+        file=sys.stderr,
+    )
     return 2
 
 

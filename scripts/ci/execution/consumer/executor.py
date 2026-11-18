@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..contracts.artifacts import (
+from ... import repository_root
+from ...contracts.artifacts import (
     ContractError,
     IntegrationEvidence,
     IntegrationSpec,
@@ -45,6 +46,7 @@ class ExecutorError(ValueError):
 PROBE_TIMEOUT_SECONDS = 300
 CLEANUP_TIMEOUT_SECONDS = 60
 TRANSIENT_INTEGRATION_DIRS = ("training", "initial_checkpoint", "tensorboard")
+RUNTIME_DIR = Path("scripts/ci/execution/consumer/runtime")
 
 
 def _now() -> str:
@@ -146,7 +148,7 @@ def _probe_environment(
     return _run_stream(
         [
             str(venv.python),
-            str(root / "scripts/ci/consumer/runtime/env.py"),
+            str(root / RUNTIME_DIR / "env.py"),
             "probe",
             "--device",
             job.runtime.device,
@@ -166,7 +168,7 @@ def _cleanup_environment(venv: Venv, root: Path, log_path: Path) -> None:
         result = subprocess.run(
             [
                 str(venv.python),
-                str(root / "scripts/ci/consumer/runtime/env.py"),
+                str(root / RUNTIME_DIR / "env.py"),
                 "cleanup",
             ],
             cwd=root,
@@ -558,7 +560,7 @@ def execute(
 ) -> JobResult:
     """Execute one Job from a ready Plan without reading CiConfig or TestFacts."""
     job = _job(plan, job_id)
-    root = root or Path(__file__).resolve().parents[3]
+    root = root or repository_root()
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "turbo-ci.log"
     merged_junit = output_dir / "pytest.xml"
@@ -714,7 +716,7 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--skip-message", default="")
     args = parser.parse_args(argv)
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[3]
+    root = Path(args.root).resolve() if args.root else repository_root()
     try:
         plan = _load_ready_plan(Path(args.plan))
         output_dir = (

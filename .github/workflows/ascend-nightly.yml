@@ -1,7 +1,8 @@
 name: Ascend-Nightly-CI
 run-name: Ascend-Nightly-CI ${{ github.ref_name }}
 
-# Full pytest + integration run. Reuses the main CI graph in ascend-pr.yml.
+# Full pytest + integration run on the current content-tag image. Reuses the
+# main CI graph in ascend-pr.yml and never builds or promotes an image.
 # Automatic scheduling is intentionally disabled for now.
 on:
   # schedule:
@@ -19,4 +20,3 @@ jobs:
     uses: ./.github/workflows/ascend-pr.yml
     with:
       mode: full
-    secrets: inherit

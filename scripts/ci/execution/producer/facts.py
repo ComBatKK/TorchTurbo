@@ -11,9 +11,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ... import repository_root
 from . import scan as test_scan
 from .ci_config import CiConfig
-from ..contracts.artifacts import (
+from ...contracts.artifacts import (
     DEVICES,
     SUITES,
     Issue,
@@ -396,7 +397,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", default="")
     parser.add_argument("--name", default="")
     args = parser.parse_args(argv)
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[3]
+    root = Path(args.root).resolve() if args.root else repository_root()
     from .ci_config import CiConfigError, load as load_config
 
     try:

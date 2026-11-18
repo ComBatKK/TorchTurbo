@@ -229,7 +229,8 @@ def check_ruff() -> list[Problem]:
 def check_shellcheck() -> list[Problem]:
     """Shellcheck every shell script and bin wrapper under scripts/ci."""
     scripts = {str(path) for path in CI.rglob("*.sh")}
-    scripts.update(str(path) for path in (CI / "consumer" / "runtime" / "bin").glob("*") if path.is_file())
+    runtime_bin = CI / "execution" / "consumer" / "runtime" / "bin"
+    scripts.update(str(path) for path in runtime_bin.glob("*") if path.is_file())
     scripts = sorted(scripts)
     if not scripts:
         return []
@@ -346,7 +347,7 @@ def check_contract() -> list[Problem]:
         rel = relative(path)
         jobs = {str(name): job for name, job in (doc.get("jobs") or {}).items()}
         plan_jobs = [name for name, job in jobs.items()
-                     if "scripts.ci.producer.planner" in _job_run_text(job)]
+                     if "scripts.ci.execution.producer.planner" in _job_run_text(job)]
         if plan_jobs:
             problems.extend(_check_planner_v2(rel, jobs, yaml.safe_dump(doc, allow_unicode=True)))
             continue
@@ -357,7 +358,7 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     """Validate the Planner -> Executor -> Gate topology."""
     problems: list[Problem] = []
     planners = [name for name, job in jobs.items()
-                if "scripts.ci.producer.planner" in _job_run_text(job)]
+                if "scripts.ci.execution.producer.planner" in _job_run_text(job)]
     if len(planners) != 1:
         return [Problem(rel, f"expected one Planner job; found {sorted(planners)}")]
     planner_name = planners[0]
@@ -386,7 +387,7 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
         problems.append(Problem(rel, "Planner must feed at least one Executor lane"))
     for name in lanes:
         body = _job_run_text(jobs[name])
-        if "scripts.ci.consumer.executor" not in body:
+        if "scripts.ci.execution.consumer.executor" not in body:
             problems.append(Problem(rel, f"lane {name!r} does not invoke the executor"))
     if len(terminals) != 1:
         problems.append(Problem(
@@ -395,7 +396,7 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
         return problems
     terminal = terminals[0]
     terminal_body = _job_run_text(jobs[terminal])
-    if "scripts.ci.consumer.gate" not in terminal_body:
+    if "scripts.ci.execution.consumer.gate" not in terminal_body:
         problems.append(Problem(rel, f"terminal job {terminal!r} does not invoke the gate"))
     if "download-artifact" not in yaml.safe_dump(jobs[terminal], allow_unicode=True):
         problems.append(Problem(rel, f"terminal job {terminal!r} does not download results"))
@@ -408,8 +409,8 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
 
 def check_config() -> list[Problem]:
     """Validate ci.yml and every test fact derived from the repository."""
-    from ..producer.ci_config import CiConfigError, load
-    from ..producer.facts import FactsError, load as load_facts
+    from ..execution.producer.ci_config import CiConfigError, load
+    from ..execution.producer.facts import FactsError, load as load_facts
 
     try:
         config = load(ROOT)
@@ -460,7 +461,7 @@ def check_markers() -> list[Problem]:
         if ":" in line:
             configured.add(line.split(":", 1)[0].strip())
 
-    from ..producer.scan import REQUIRED_MARKERS
+    from ..execution.producer.scan import REQUIRED_MARKERS
 
     markers = _test_marker_names()
     for name in sorted(markers - configured):

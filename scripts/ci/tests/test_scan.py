@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.producer.scan import scan_tests
+from scripts.ci.execution.producer.scan import scan_tests
 
 
 def _scan(tmp_path: Path, source: str):

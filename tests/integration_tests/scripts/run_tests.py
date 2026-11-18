@@ -26,7 +26,7 @@ from gen_init_checkpoint import REPO_ROOT, asset_path, generate_checkpoint
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.ci.consumer.runtime.model_dataset import (  # noqa: E402
+from scripts.ci.execution.consumer.runtime.model_dataset import (  # noqa: E402
     allow_download_from_env,
     resolve_model_dataset_args,
 )

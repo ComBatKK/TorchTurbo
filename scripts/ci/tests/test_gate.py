@@ -16,9 +16,9 @@ from scripts.ci.contracts.artifacts import (
     read_json,
     write_json,
 )
-from scripts.ci.consumer import gate
-from scripts.ci.consumer.gate import decide, decide_artifact
-from scripts.ci.producer.planner import build
+from scripts.ci.execution.consumer import gate
+from scripts.ci.execution.consumer.gate import decide, decide_artifact
+from scripts.ci.execution.producer.planner import build
 
 
 def _result_for(plan, job, status: str = "passed") -> JobResult:

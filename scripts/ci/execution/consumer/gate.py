@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..contracts.artifacts import (
+from ...contracts.artifacts import (
     ContractError,
     Decision,
     IntegrationEvidence,

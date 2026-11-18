@@ -31,6 +31,11 @@ on:
         required: true
         default: 'pytest-core-cpu-cpu-default-default'
         type: string
+      image_ref:
+        description: 'optional explicit image ref; empty derives the SHA content ref'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ci-manual-${{ github.ref }}
@@ -48,4 +53,4 @@ jobs:
     with:
       mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}
       target_job: ${{ inputs.target_job }}
-    secrets: inherit
+      image_ref: ${{ inputs.image_ref }}

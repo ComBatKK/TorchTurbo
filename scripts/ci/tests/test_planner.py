@@ -15,15 +15,15 @@ from scripts.ci.contracts.artifacts import (
     plan_digest,
     write_json,
 )
-from scripts.ci.producer.ci_config import (
+from scripts.ci.execution.producer.ci_config import (
     CiConfig,
     CiImage,
     CiLane,
     CiTarget,
     ScopeSuite,
 )
-from scripts.ci.producer.facts import TestFacts
-from scripts.ci.producer.planner import (
+from scripts.ci.execution.producer.facts import TestFacts
+from scripts.ci.execution.producer.planner import (
     PlanError,
     artifact_for,
     build,
@@ -116,6 +116,62 @@ def test_nightly_scope(config: CiConfig, facts: TestFacts, nightly_plan: Plan) -
         "qwen3_5_moe/sft_2npu",
     ]
     assert validate_plan(nightly_plan, config, facts) == []
+
+
+def test_cpu_target_slice_runs_pr_cpu_jobs(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    artifact = artifact_for(
+        config, facts, "pull_request", source, (), targets="cpu"
+    )
+
+    assert artifact.status == "ready"
+    assert artifact.plan is not None
+    plan = artifact.plan
+    assert [job.id for job in plan.jobs] == [
+        "integration-base-suite-qwen3-5-moe-sft-2cpu",
+        "pytest-adapter-cpu-cpu-default-lf",
+        "pytest-adapter-cpu-cpu-default-qwen4-exp-swift",
+        "pytest-adapter-cpu-cpu-default-swift",
+        "pytest-core-cpu-cpu-default-default",
+    ]
+    assert {job.runtime.device for job in plan.jobs} == {"cpu"}
+    assert plan.inputs["targets"] == "cpu"
+    assert validate_plan(plan, config, facts) == []
+
+
+def test_npu_target_slice_runs_pr_npu_jobs(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    artifact = artifact_for(
+        config, facts, "pull_request", source, (), targets="npu-a3"
+    )
+
+    assert artifact.status == "ready"
+    assert artifact.plan is not None
+    plan = artifact.plan
+    assert [job.id for job in plan.jobs] == [
+        "integration-base-suite-qwen3-5-moe-sft-2npu",
+        "pytest-core-npu-npu-default-default",
+    ]
+    assert {job.runtime.device for job in plan.jobs} == {"npu"}
+    assert plan.coverage["integration"]["base_suite"] == {
+        "mode": "explicit",
+        "cases": ["qwen3_5_moe/sft_2npu"],
+    }
+    assert plan.inputs["targets"] == "npu-a3"
+    assert validate_plan(plan, config, facts) == []
+
+
+def test_delegated_change_scope_has_no_jobs(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    plan = build(config, facts, "pull_request", source, change_scope="delegated")
+
+    assert plan.jobs == ()
+    assert plan.inputs["change_scope"] == "delegated"
+    assert plan.coverage["jobs"] == 0
+    assert validate_plan(plan, config, facts) == []
 
 
 def test_integration_case_target_routes_to_a5(

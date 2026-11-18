@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.consumer.runtime import model_dataset
-from scripts.ci.consumer.runtime.model_dataset import (
+from scripts.ci.execution.consumer.runtime import model_dataset
+from scripts.ci.execution.consumer.runtime.model_dataset import (
     ModelDatasetError,
     allow_download_from_env,
     resolve_model_dataset_args,

@@ -1,0 +1,131 @@
+name: Ascend-Image-Promote
+run-name: Ascend-Image-Promote ${{ inputs.image || 'npu-default' }}
+
+# Trusted post-merge image pipeline. It only resolves the content-addressed
+# candidate that the image PR built and tested; main never creates an
+# unvalidated replacement image. Promotion is chained after a second NPU smoke
+# test and never participates in Ascend-PR-CI.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docker/**
+      - scripts/ci/image/**
+      - scripts/ci/config/ci.yml
+      - .github/workflows/ascend-image.yml
+      - .github/workflows/ascend-image-promote.yml
+      - .github/workflows/ascend-image-pr.yml
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Logical image name to resolve, validate and promote'
+        required: true
+        default: 'npu-default'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-promote-${{ inputs.image || 'npu-default' }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Ascend-Image-Resolve
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ascend-image.yml
+    with:
+      image: ${{ inputs.image || 'npu-default' }}
+      mode: resolve_candidate
+
+  smoke:
+    name: Ascend-Image-Smoke-NPU
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_IMAGE_SMOKE_RUNNER || vars.CI_NPU_2_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.image.outputs.ref }}
+      options: --user root
+    steps:
+      - name: verify torch and NPU device
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import torch
+          import torch_npu
+
+          print(f"torch={torch.__version__}")
+          print(f"torch_npu={torch_npu.__version__}")
+          if not torch.npu.is_available():
+              raise SystemExit("torch.npu is not available in the candidate image")
+          value = torch.ones((64, 64), dtype=torch.float16, device="npu")
+          result = value @ value
+          torch.npu.synchronize()
+          print(f"npu_matmul_sum={result[0, 0].item()}")
+          PY
+
+  promote:
+    name: Ascend-Image-Promote
+    needs: [image, smoke]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: check registry tooling
+        run: python3 -m scripts.ci.image env
+
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are required to promote an image"
+            exit 1
+          fi
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+
+      - name: promote smoke-tested digest
+        id: promote
+        env:
+          IMAGE: ${{ inputs.image || 'npu-default' }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 -m scripts.ci.image promote \
+            --image "$IMAGE" \
+            --digest "$DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        env:
+          ALIAS: ${{ steps.promote.outputs.alias }}
+          CONTENT_TAG: ${{ steps.promote.outputs.content_tag }}
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          {
+            echo '## Image promotion'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| alias | \`${ALIAS:-missing}\` |"
+            echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
+            echo "| digest | \`${DIGEST:-missing}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

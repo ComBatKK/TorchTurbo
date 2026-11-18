@@ -5,14 +5,14 @@ from dataclasses import replace
 
 import pytest
 
-from scripts.ci.producer.ci_config import (
+from scripts.ci.execution.producer.ci_config import (
     CiConfig,
     CiConfigError,
     CiImage,
     CiLane,
     CiTarget,
 )
-from scripts.ci.producer.facts import TestFacts, counts
+from scripts.ci.execution.producer.facts import TestFacts, counts
 
 
 def test_config_resources(config: CiConfig) -> None:

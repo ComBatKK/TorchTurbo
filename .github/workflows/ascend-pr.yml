@@ -1,18 +1,19 @@
 name: Ascend-PR-CI
 run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || github.ref_name }}
 
-# One entry point for both PR and nightly scope.
+# One entry point for PR, nightly and manual scope selection.
 #
-#   lint -> Planner -> PlanArtifact -> Executor matrix -> JobResult -> Gate
+#   lint -> Planner -> PlanArtifact -> Executor -> Gate
 #
-# PR runs every core pytest plus two lightweight integration cases. Nightly runs
-# every pytest suite and every integration case. The workflow only moves
-# artifacts; selection lives in scripts/ci/config/ci.yml and execution lives in
-# the consumer package.
+# The Plan carries an immutable content-tag image reference. Image builds and
+# alias promotion are a separate release pipeline; they are not a job in this
+# graph and cannot change the test topology.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - 'docker/**/Dockerfile*'
   workflow_call:
     inputs:
       mode:
@@ -20,6 +21,26 @@ on:
         default: 'pr'
         type: string
       target_job:
+        required: false
+        default: ''
+        type: string
+      scope:
+        description: 'Optional ci.yml scope override'
+        required: false
+        default: ''
+        type: string
+      targets:
+        description: 'Optional target slice, for example cpu or npu-a3'
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: 'Optional Git ref under test; empty uses the event checkout'
+        required: false
+        default: ''
+        type: string
+      image_ref:
+        description: 'Optional immutable image ref for npu-default; empty derives the content ref'
         required: false
         default: ''
         type: string
@@ -38,9 +59,19 @@ on:
         required: false
         default: ''
         type: string
+      image_ref:
+        description: 'optional explicit image ref for npu-default; empty derives the SHA content ref'
+        required: false
+        default: ''
+        type: string
+      targets:
+        description: 'optional target slice, for example cpu or npu-a3'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -52,6 +83,10 @@ env:
   # run_tests.sh treats MODE as cpu/npu, so keep this variable name distinct.
   CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
   CI_TARGET_JOB: ${{ inputs.target_job || '' }}
+  CI_TARGETS: ${{ inputs.targets || '' }}
+  CI_SCOPE: ${{ inputs.scope || '' }}
+  CI_CHECKOUT_REF: ${{ inputs.checkout_ref || '' }}
+  CI_IMAGE_REF: ${{ inputs.image_ref || '' }}
 
 jobs:
   plan:
@@ -67,6 +102,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: classify changes
         id: changes
@@ -80,17 +116,22 @@ jobs:
           if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ]; then
             changed="$RUNNER_TEMP/ci-changed-files.txt"
             if git diff --name-only --no-renames "$BASE_SHA...HEAD" > "$changed"; then
-              if output=$(python3 -m scripts.ci.producer.change_scope --changed-files "$changed"); then
-                scope=${output#change_scope=}
+              if output=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed"); then
+                route=${output#change_route=}
+                case "$route" in
+                  docs_only) scope=docs_only ;;
+                  code) scope=code ;;
+                  image_only|mixed) scope=delegated ;;
+                esac
               else
-                echo "::warning::change scope classification failed; running code scope"
+                echo "::warning::change routing failed; running code scope"
               fi
             else
               echo "::warning::cannot compute changed files; running code scope"
             fi
           fi
           case "$scope" in
-            code|docs_only) ;;
+            code|docs_only|delegated) ;;
             *) scope=code ;;
           esac
           echo "change_scope=$scope" >> "$GITHUB_OUTPUT"
@@ -105,74 +146,107 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check \
             -r requirements-lint.txt
 
+      - name: resolve runtime image
+        id: runtime_image
+        if: |
+          steps.changes.outputs.change_scope != 'docs_only' &&
+          steps.changes.outputs.change_scope != 'delegated'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          refs="$RUNNER_TEMP/ci-image-refs"
+          if [ -n "$CI_IMAGE_REF" ]; then
+            printf 'npu-default=%s\n' "$CI_IMAGE_REF" > "$refs"
+            echo "using caller image: $CI_IMAGE_REF"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$PR_BASE_SHA" ]; then
+            revision="$PR_BASE_SHA"
+          else
+            revision=$(git rev-parse HEAD)
+          fi
+          python3 -m scripts.ci.image refs \
+            --revision "$revision" \
+            --output "$refs"
+          test -s "$refs"
+          cat "$refs"
+
       - name: lint
         id: lint
-        if: steps.changes.outputs.change_scope != 'docs_only'
+        if: |
+          steps.changes.outputs.change_scope != 'docs_only' &&
+          steps.changes.outputs.change_scope != 'delegated'
         env:
           PYTHONUNBUFFERED: '1'
         run: |
           set -uo pipefail
           python3 -m scripts.ci.tools.lint
 
-      - name: resolve image
-        id: image
-        if: always() && steps.changes.outputs.change_scope != 'docs_only'
-        env:
-          OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          REF=$(python3 -m scripts.ci.tools.image resolve --override "$OVERRIDE" \
-            --repo "$GITHUB_REPOSITORY" \
-            --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
-          test -n "$REF"
-          echo "image=$REF" >> "$GITHUB_OUTPUT"
-          echo "image: $REF"
-
-      # Always publish a PlanArtifact, including lint/image failures. Gate is a
-      # consumer of contracts, not of shell exit codes.
+      # Always publish a PlanArtifact, including lint failures. Gate consumes
+      # contracts rather than raw shell exit codes.
       - name: plan
         id: publish
         if: always()
         env:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
-          IMAGE_OUTCOME: ${{ steps.image.outcome }}
-          IMAGE_REF: ${{ steps.image.outputs.image }}
+          IMAGE_OUTCOME: ${{ steps.runtime_image.outcome }}
+          IMAGE_REFS_FILE: ${{ runner.temp }}/ci-image-refs
           CHANGE_SCOPE: ${{ steps.changes.outputs.change_scope || 'code' }}
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-plan"
-          SCOPE=pull_request
-          if [ "$CI_MODE" = full ]; then SCOPE=nightly; fi
+          if [ -n "$CI_SCOPE" ]; then
+            SCOPE="$CI_SCOPE"
+          elif [ "$CI_MODE" = full ]; then
+            SCOPE=nightly
+          else
+            SCOPE=pull_request
+          fi
+          SOURCE_SHA=$(git rev-parse HEAD)
+          SOURCE_REF=${CI_CHECKOUT_REF:-$GITHUB_REF}
           COMMON=(
             --root "$GITHUB_WORKSPACE"
             --scope "$SCOPE"
             --output "$RUNNER_TEMP/ci-plan/plan.json"
             --source-repository "$GITHUB_REPOSITORY"
-            --source-ref "$GITHUB_REF"
-            --source-sha "$GITHUB_SHA"
+            --source-ref "$SOURCE_REF"
+            --source-sha "$SOURCE_SHA"
             --change-scope "$CHANGE_SCOPE"
           )
           if [ -n "$CI_TARGET_JOB" ]; then
             COMMON+=(--target-job "$CI_TARGET_JOB")
           fi
-          if [ "$CHANGE_SCOPE" != docs_only ]; then
-            if [ "$LINT_OUTCOME" != success ]; then
-              python3 -m scripts.ci.producer.planner "${COMMON[@]}" \
-                --fail-code lint --fail-path scripts/ci/tools/lint.py \
-                --fail-message "lint failed"
-              exit 1
-            fi
-            if [ "$IMAGE_OUTCOME" != success ]; then
-              python3 -m scripts.ci.producer.planner "${COMMON[@]}" \
-                --fail-code image-resolve --fail-path scripts/ci/tools/image.py \
-                --fail-message "image resolution failed"
-              exit 1
-            fi
-            COMMON+=(--image-ref "npu-default=$IMAGE_REF")
+          if [ -n "$CI_TARGETS" ]; then
+            COMMON+=(--targets "$CI_TARGETS")
+          fi
+          if [ "$CHANGE_SCOPE" = delegated ]; then
+            echo "Dockerfile PR is delegated to Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
+            [ "$IMAGE_OUTCOME" != success ]; then
+            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
+              --fail-code image-identity --fail-path scripts/ci/image \
+              --fail-message "cannot resolve runtime image"
+            exit 1
+          fi
+          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
+            [ "$LINT_OUTCOME" != success ]; then
+            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
+              --fail-code lint --fail-path scripts/ci/tools/lint.py \
+              --fail-message "lint failed"
+            exit 1
+          fi
+          if [ -f "$IMAGE_REFS_FILE" ]; then
+            while IFS= read -r image_ref; do
+              if [ -n "$image_ref" ]; then
+                COMMON+=(--image-ref "$image_ref")
+              fi
+            done < "$IMAGE_REFS_FILE"
           fi
           MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
-          if ! python3 -m scripts.ci.producer.planner "${COMMON[@]}" \
+          if ! python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
             --github-output "$MATRIX_OUTPUT"; then
             exit 1
           fi
@@ -207,6 +281,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -230,7 +306,7 @@ jobs:
           set +e
           result_root="$RUNNER_TEMP/ci-result"
           mkdir -p "$result_root"
-          python3 -m scripts.ci.consumer.executor \
+          python3 -m scripts.ci.execution.consumer.executor \
             --plan "$RUNNER_TEMP/ci-plan/plan.json" \
             --job-id "${{ matrix.job_id }}" \
             --output "$result_root/job-result.json" \
@@ -309,6 +385,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -323,7 +401,7 @@ jobs:
           set +e
           result_root="$RUNNER_TEMP/ci-result"
           mkdir -p "$result_root"
-          python3 -m scripts.ci.consumer.executor \
+          python3 -m scripts.ci.execution.consumer.executor \
             --plan "$RUNNER_TEMP/ci-plan/plan.json" \
             --job-id "${{ matrix.job_id }}" \
             --output "$result_root/job-result.json" \
@@ -409,7 +487,7 @@ jobs:
       - name: timing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 -m scripts.ci.tools.report timing
+        run: python3 -m scripts.ci.execution.consumer.report timing
 
       - name: judge
         env:
@@ -425,7 +503,7 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
             exit 2
           fi
-          python3 -m scripts.ci.consumer.gate \
+          python3 -m scripts.ci.execution.consumer.gate \
             --plan "$PLAN" \
             --results "$RESULTS" \
             --output "$DECISION" \

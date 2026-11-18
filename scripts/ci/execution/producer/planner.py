@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ... import repository_root
 from .ci_config import (
     CiConfig,
     CiConfigError,
@@ -29,7 +30,7 @@ from .facts import (
     TestFacts,
     load as load_facts,
 )
-from ..contracts.artifacts import (
+from ...contracts.artifacts import (
     SCHEMA_VERSION,
     SUITES,
     CommandSpec,
@@ -481,13 +482,13 @@ def build(
     change_scope: str = "code",
 ) -> Plan:
     """Build a ready plan or raise PlanError with structured issues."""
-    if change_scope not in {"code", "docs_only"}:
+    if change_scope not in {"code", "docs_only", "delegated"}:
         raise ValueError(f"unknown change scope {change_scope!r}")
     try:
         scope = config.scope(scope_name)
     except CiConfigError as exc:
         raise PlanError(exc.issues) from exc
-    if change_scope == "docs_only":
+    if change_scope in {"docs_only", "delegated"}:
         return build_plan(
             scope=scope.name,
             source=source,
@@ -522,30 +523,63 @@ def build(
     )
 
 
-def _target_plan(plan: Plan, target_jobs: str) -> Plan:
-    """Reduce a validated Plan to explicit jobs for one manual run."""
-    targets = tuple(dict.fromkeys(
-        part for part in re.split(r"[,\s]+", target_jobs.strip()) if part
+def _selection_values(value: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        part for part in re.split(r"[,\s]+", value.strip()) if part
     ))
-    if not targets:
+
+
+def _selected_plan(
+    plan: Plan,
+    *,
+    target_jobs: str = "",
+    targets: str = "",
+) -> Plan:
+    """Reduce a validated Plan to a job or target slice for one execution."""
+    job_values = _selection_values(target_jobs)
+    target_values = _selection_values(targets)
+    if job_values and target_values:
         raise PlanError([_issue(
-            "target_job",
-            "target job list is empty",
-            "unknown-job",
+            "selection",
+            "target_job and targets cannot be combined",
+            "invalid-selection",
         )])
-    known = {job.id for job in plan.jobs}
-    unknown = [target for target in targets if target not in known]
-    if unknown:
-        raise PlanError([
-            _issue(
-                target,
-                f"target job {target!r} is not in the full plan",
-                "unknown-job",
-            )
-            for target in unknown
-        ])
-    selected = set(targets)
-    jobs = tuple(job for job in plan.jobs if job.id in selected)
+    if job_values:
+        known = {job.id for job in plan.jobs}
+        unknown = [value for value in job_values if value not in known]
+        if unknown:
+            raise PlanError([
+                _issue(
+                    value,
+                    f"target job {value!r} is not in the full plan",
+                    "unknown-job",
+                )
+                for value in unknown
+            ])
+        selected_jobs = set(job_values)
+        jobs = tuple(job for job in plan.jobs if job.id in selected_jobs)
+        selection_input = {"target_job": ",".join(job_values)}
+    elif target_values:
+        known = {job.runtime.target for job in plan.jobs}
+        unknown = [value for value in target_values if value not in known]
+        if unknown:
+            raise PlanError([
+                _issue(
+                    value,
+                    f"target {value!r} has no jobs in the full plan",
+                    "unknown-target",
+                )
+                for value in unknown
+            ])
+        selected_jobs = set(target_values)
+        jobs = tuple(job for job in plan.jobs if job.runtime.target in selected_jobs)
+        selection_input = {"targets": ",".join(target_values)}
+    else:
+        raise PlanError([_issue(
+            "selection",
+            "target_job or targets is required",
+            "invalid-selection",
+        )])
     pytest_files = {suite: set() for suite in plan.coverage.get("pytest", {})}
     pytest_routes = {suite: 0 for suite in pytest_files}
     integration_cases = {
@@ -561,7 +595,7 @@ def _target_plan(plan: Plan, target_jobs: str) -> Plan:
     return build_plan(
         scope=plan.scope,
         source=plan.source,
-        inputs={**plan.inputs, "target_job": ",".join(targets)},
+        inputs={**plan.inputs, **selection_input},
         coverage={
             "pytest": {
                 suite: {
@@ -600,7 +634,9 @@ def validate_plan(plan: Plan, config: CiConfig, facts: TestFacts) -> list[Issue]
     try:
         expected = build(config, facts, plan.scope, plan.source, change_scope=scope)
         if target := plan.inputs.get("target_job"):
-            expected = _target_plan(expected, target)
+            expected = _selected_plan(expected, target_jobs=target)
+        if targets := plan.inputs.get("targets"):
+            expected = _selected_plan(expected, targets=targets)
     except PlanError as exc:
         return issues + list(exc.issues)
     if plan.to_dict() != expected.to_dict():
@@ -619,6 +655,7 @@ def artifact_for(
     source: Source,
     issues: Iterable[Issue],
     target_job: str = "",
+    targets: str = "",
     change_scope: str = "code",
 ) -> PlanArtifact:
     values = tuple(issues)
@@ -632,8 +669,8 @@ def artifact_for(
         return build_plan_artifact(scope=scope_name, source=source, errors=values)
     try:
         plan = build(config, facts, scope_name, source, change_scope=change_scope)
-        if target_job:
-            plan = _target_plan(plan, target_job)
+        if target_job or targets:
+            plan = _selected_plan(plan, target_jobs=target_job, targets=targets)
     except PlanError as exc:
         return build_plan_artifact(scope=scope_name, source=source, errors=exc.issues)
     return build_plan_artifact(scope=scope_name, source=source, plan=plan)
@@ -687,20 +724,31 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--fail-code", default="planner-precondition")
     parser.add_argument("--fail-path", default="planner")
     parser.add_argument("--fail-message", default="")
-    parser.add_argument("--change-scope", choices=("code", "docs_only"), default="code")
+    parser.add_argument(
+        "--change-scope",
+        choices=("code", "docs_only", "delegated"),
+        default="code",
+    )
     parser.add_argument(
         "--target-job",
         default="",
         help="exact Plan job id(s), separated by commas or whitespace",
     )
+    parser.add_argument(
+        "--targets",
+        default="",
+        help="target name(s), separated by commas or whitespace",
+    )
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
-    if args.verify and args.target_job:
-        parser.error("--target-job cannot be combined with --verify")
-    if args.target_job and args.change_scope == "docs_only":
-        parser.error("--target-job cannot be combined with a docs-only plan")
+    if args.verify and (args.target_job or args.targets):
+        parser.error("--target-job/--targets cannot be combined with --verify")
+    if args.target_job and args.targets:
+        parser.error("--target-job cannot be combined with --targets")
+    if (args.target_job or args.targets) and args.change_scope != "code":
+        parser.error("job/target selection requires a code plan")
 
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[3]
+    root = Path(args.root).resolve() if args.root else repository_root()
     source = source_for(
         root,
         repository=args.source_repository,
@@ -741,10 +789,15 @@ def main(argv: list[str]) -> int:
             try:
                 plan = build(config, facts, name, source)
                 docs = build(config, facts, name, source, change_scope="docs_only")
+                delegated = build(
+                    config, facts, name, source, change_scope="delegated"
+                )
                 failures.extend(validate_plan(plan, config, facts))
                 failures.extend(validate_plan(docs, config, facts))
+                failures.extend(validate_plan(delegated, config, facts))
                 print(f"{name}: {len(plan.jobs)} jobs / {len(facts.pytest)} tests")
                 print(f"{name} docs-only: {len(docs.jobs)} jobs")
+                print(f"{name} delegated: {len(delegated.jobs)} jobs")
             except PlanError as exc:
                 failures.extend(exc.issues)
         if failures:
@@ -763,6 +816,7 @@ def main(argv: list[str]) -> int:
         source,
         (),
         target_job=args.target_job,
+        targets=args.targets,
         change_scope=args.change_scope,
     )
     if args.output:

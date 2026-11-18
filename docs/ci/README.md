@@ -14,7 +14,7 @@ lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate
 
 - `scripts/ci/config/ci.yml` is the only CI configuration. It declares targets,
   images, lanes, workload mappings, and pull-request/nightly scopes.
-- `scripts/ci/producer/facts.py` derives pytest facts from `tests/unit_tests` and
+- `scripts/ci/execution/producer/facts.py` derives pytest facts from `tests/unit_tests` and
   integration cases from the suite runner manifest.
 - Pull requests run all core pytest plus the two lightweight CPU/NPU integration
   cases; nightly runs all pytest suites and all integration cases.

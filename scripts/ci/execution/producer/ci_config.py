@@ -11,7 +11,8 @@ from typing import Any, Iterable
 
 import yaml
 
-from ..contracts.artifacts import (
+from ... import repository_root
+from ...contracts.artifacts import (
     DEVICES,
     SUITES,
     ImageRef,
@@ -427,7 +428,8 @@ def _load_images(
     images: dict[str, CiImage] = {}
     for name, value in rows.items():
         where = f"resources.images.{name}"
-        row = _row(value, where, {"target", "kind", "ref", "default"}, issues)
+        # `build` belongs to scripts/ci/image and is intentionally opaque here.
+        row = _row(value, where, {"target", "kind", "ref", "default", "build"}, issues)
         target = str(row.get("target") or "")
         kind = str(row.get("kind") or "")
         ref = str(image_refs.get(name) or row.get("ref") or "")
@@ -1024,7 +1026,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", default="")
     parser.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
     args = parser.parse_args(argv)
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[3]
+    root = Path(args.root).resolve() if args.root else repository_root()
     image_refs: dict[str, str] = {}
     for value in args.image_ref:
         name, separator, ref = value.partition("=")

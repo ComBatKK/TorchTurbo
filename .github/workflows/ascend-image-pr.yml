@@ -1,0 +1,224 @@
+name: Ascend-Image-PR
+run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }}
+
+# Dockerfile PR validation. This is separate from Ascend-PR-CI:
+# it builds one candidate, runs smoke, then reuses the normal Planner/Executor/
+# Gate pipeline against that immutable candidate. It never moves an alias.
+#
+# Only Dockerfile changes start this expensive workflow automatically. Image
+# engine and build-recipe maintenance is validated through a manual candidate
+# run before merge.
+#
+# Same-repository PRs run automatically. Fork PRs require the maintainer label
+# `image-ci/run`; until then the required check fails closed. Registry write
+# credentials are only available to this trusted image path.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main]
+    paths:
+      - 'docker/**/Dockerfile*'
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: image-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  approval:
+    name: Ascend-Image-Approval
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 5
+    steps:
+      - name: require approval label for fork PRs
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'image-ci/run') }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REPOSITORY" = "$BASE_REPOSITORY" ]; then
+            echo "same-repository PR; image candidate validation is allowed"
+            exit 0
+          fi
+          if [ "$HAS_LABEL" = true ]; then
+            echo "fork PR approved with image-ci/run"
+            exit 0
+          fi
+          echo "::error::fork image PR requires the 'image-ci/run' label after maintainer review"
+          exit 1
+
+  classify:
+    name: Ascend-Image-Classify
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    outputs:
+      cpu_needed: ${{ steps.classify.outputs.cpu_needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: classify non-Dockerfile changes
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/head"
+          head_sha=$(git rev-parse FETCH_HEAD)
+          changed="$RUNNER_TEMP/ci-changed-files.txt"
+          git diff --name-only --no-renames "$BASE_SHA" "$head_sha" > "$changed"
+          cpu_needed=false
+          route=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
+          if [ "$route" = 'change_route=mixed' ]; then
+            cpu_needed=true
+          fi
+          echo "cpu_needed=$cpu_needed" >> "$GITHUB_OUTPUT"
+          echo "CPU preflight required: $cpu_needed" >> "$GITHUB_STEP_SUMMARY"
+
+  cpu:
+    name: Ascend-Image-CPU-Preflight
+    needs: [approval, classify]
+    if: |
+      needs.approval.result == 'success' &&
+      needs.classify.result == 'success' &&
+      needs.classify.outputs.cpu_needed == 'true'
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: pr
+      scope: pull_request
+      targets: cpu
+      checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
+
+  candidate:
+    name: Ascend-Image-Candidate
+    needs: [approval, classify, cpu]
+    if: |
+      always() &&
+      needs.approval.result == 'success' &&
+      needs.classify.result == 'success' &&
+      (needs.cpu.result == 'success' || needs.cpu.result == 'skipped')
+    uses: ./.github/workflows/ascend-image.yml
+    with:
+      image: npu-default
+      mode: build_if_missing
+      checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
+      max_jobs: auto
+      use_cache: true
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+
+  smoke:
+    name: Ascend-Image-Smoke-NPU
+    needs: candidate
+    runs-on: ${{ vars.CI_IMAGE_SMOKE_RUNNER || vars.CI_NPU_2_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.candidate.outputs.ref }}
+      options: --user root
+    steps:
+      - name: verify torch and NPU device
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import torch
+          import torch_npu
+
+          print(f"torch={torch.__version__}")
+          print(f"torch_npu={torch_npu.__version__}")
+          if not torch.npu.is_available():
+              raise SystemExit("torch.npu is not available in the candidate image")
+          value = torch.ones((64, 64), dtype=torch.float16, device="npu")
+          result = value @ value
+          torch.npu.synchronize()
+          print(f"npu_matmul_sum={result[0, 0].item()}")
+          PY
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE_REF: ${{ needs.candidate.outputs.ref }}
+          CONTENT_TAG: ${{ needs.candidate.outputs.content_tag }}
+          DIGEST: ${{ needs.candidate.outputs.digest }}
+        run: |
+          {
+            echo '## Image candidate smoke'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| ref | \`${IMAGE_REF}\` |"
+            echo "| content tag | \`${CONTENT_TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Ascend-Image-Tests
+    needs: [candidate, smoke]
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: pr
+      scope: pull_request
+      targets: npu-a3
+      checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
+      image_ref: ${{ needs.candidate.outputs.ref }}
+
+  gate:
+    name: Ascend-Image-PR-Gate
+    needs: [approval, classify, cpu, candidate, smoke, tests]
+    if: always()
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 5
+    steps:
+      - name: evaluate image PR pipeline
+        env:
+          APPROVAL_RESULT: ${{ needs.approval.result }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          CPU_NEEDED: ${{ needs.classify.outputs.cpu_needed }}
+          CPU_RESULT: ${{ needs.cpu.result }}
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          require_success() {
+            name=$1
+            result=$2
+            if [ "$result" != success ]; then
+              echo "::error::${name} result is ${result}"
+              failed=1
+            fi
+          }
+          require_success approval "$APPROVAL_RESULT"
+          require_success classify "$CLASSIFY_RESULT"
+          require_success candidate "$CANDIDATE_RESULT"
+          require_success smoke "$SMOKE_RESULT"
+          require_success tests "$TESTS_RESULT"
+          if [ "$CPU_NEEDED" = true ]; then
+            require_success cpu "$CPU_RESULT"
+          elif [ "$CPU_NEEDED" = false ]; then
+            if [ "$CPU_RESULT" != skipped ]; then
+              echo "::error::cpu preflight must be skipped for Dockerfile-only PRs"
+              failed=1
+            fi
+          else
+            echo "::error::classify did not report cpu_needed"
+            failed=1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "image PR pipeline passed" >> "$GITHUB_STEP_SUMMARY"
