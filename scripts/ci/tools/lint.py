@@ -379,15 +379,19 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
 
     needed = {dependency for job in jobs.values() for dependency in _job_needs(job)}
     terminals = sorted(set(jobs) - needed)
-    lanes = sorted({
+    direct_children = sorted({
         name for name, job in jobs.items()
         if planner_name in _job_needs(job)
     } - set(terminals))
+    lanes = sorted(
+        name for name in direct_children
+        if "scripts.ci.execution.consumer.executor" in _job_run_text(jobs[name])
+    )
     if not lanes:
         problems.append(Problem(rel, "Planner must feed at least one Executor lane"))
-    for name in lanes:
-        body = _job_run_text(jobs[name])
-        if "scripts.ci.execution.consumer.executor" not in body:
+    for name in sorted(set(direct_children) - set(lanes)):
+        consumed = yaml.safe_dump(jobs[name], allow_unicode=True)
+        if re.search(rf"needs\.{re.escape(planner_name)}\.outputs\.(?:cpu|npu|gpu)_jobs", consumed):
             problems.append(Problem(rel, f"lane {name!r} does not invoke the executor"))
     if len(terminals) != 1:
         problems.append(Problem(

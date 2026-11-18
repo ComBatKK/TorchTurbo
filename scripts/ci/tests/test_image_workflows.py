@@ -51,41 +51,41 @@ def test_image_pr_builds_smokes_and_tests_the_candidate(repo_root: Path) -> None
     dumped = yaml.safe_dump(document)
 
     assert "pull_request_target" in triggers
-    assert triggers["pull_request_target"]["branches"] == ["main", "ci/image-pr-base"]
+    assert triggers["pull_request_target"]["branches"] == ["main"]
     assert triggers["pull_request_target"]["paths"] == ["docker/**/Dockerfile*"]
     assert "image-ci/run" in dumped
     assert "pull_request" not in triggers
+    assert set(jobs) == {"plan", "cpu", "candidates", "gate"}
+    assert "ascend-pr.yml" not in dumped
     assert "approval" not in jobs
     assert "discover" not in jobs
-    route = jobs["route"]
-    assert route["name"] == "Ascend-Image-Route"
-    assert set(route["outputs"]) == {
-        "change_route",
-        "cpu_needed",
-        "matrix",
-        "image_count",
-        "images",
+    plan = jobs["plan"]
+    assert plan["name"] == "Ascend-Image-Plan"
+    assert set(plan["outputs"]) == {
+        "change_route", "cpu_needed", "cpu_jobs", "cpu_job_count", "matrix",
+        "image_count", "images",
     }
-    assert route["outputs"]["matrix"].startswith("${{ steps.route")
-    approval = next(step for step in route["steps"] if step["name"] == "require approval label for fork PRs")
+    assert plan["outputs"]["matrix"].startswith("${{ steps.plan")
+    approval = next(step for step in plan["steps"] if step["name"] == "require approval label for fork PRs")
     assert "image-ci/run" in approval["run"]
-    route_step = next(step for step in route["steps"] if step.get("id") == "route")
-    assert "scripts.ci.routing.change_router" in route_step["run"]
-    assert "scripts.ci.image.selection" in route_step["run"]
-    assert "change_route=${route_output#change_route=}" in route_step["run"]
-    assert "cpu_needed=true" in route_step["run"]
+    plan_step = next(step for step in plan["steps"] if step.get("id") == "plan")
+    assert "scripts.ci.routing.change_router" in plan_step["run"]
+    assert "scripts.ci.image.selection" in plan_step["run"]
+    assert "scripts.ci.execution.producer.planner" in plan_step["run"]
+    assert "--targets cpu" in plan_step["run"]
+    assert "change_route=${route_output#change_route=}" in plan_step["run"]
+    assert "cpu_needed=true" in plan_step["run"]
     assert "refs/pull/${{ github.event.pull_request.number }}/head" in yaml.safe_dump(
-        route
+        plan
     )
-    assert jobs["cpu"]["uses"] == "./.github/workflows/ascend-pr.yml"
-    assert jobs["cpu"]["needs"] == "route"
-    assert jobs["cpu"]["with"] == {
-        "mode": "pr",
-        "scope": "pull_request",
-        "targets": "cpu",
-        "checkout_ref": "refs/pull/${{ github.event.pull_request.number }}/head",
-    }
-    assert set(jobs["candidates"]["needs"]) == {"route", "cpu"}
+    assert jobs["cpu"]["needs"] == "plan"
+    assert jobs["cpu"]["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.plan.outputs.cpu_jobs) }}"
+    )
+    assert jobs["cpu"]["strategy"]["max-parallel"] == 5
+    assert "scripts.ci.execution.consumer.executor" in yaml.safe_dump(jobs["cpu"])
+    assert "ci-plan" in yaml.safe_dump(jobs["cpu"])
+    assert set(jobs["candidates"]["needs"]) == {"plan", "cpu"}
     assert "needs.cpu.result == 'skipped'" in jobs["candidates"]["if"]
     assert jobs["candidates"]["uses"] == "./.github/workflows/ascend-image-pipeline.yml"
     assert jobs["candidates"]["strategy"]["fail-fast"] is False
@@ -93,15 +93,14 @@ def test_image_pr_builds_smokes_and_tests_the_candidate(repo_root: Path) -> None
         "${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}"
     )
     assert jobs["candidates"]["strategy"]["matrix"] == (
-        "${{ fromJSON(needs.route.outputs.matrix) }}"
+        "${{ fromJSON(needs.plan.outputs.matrix) }}"
     )
     assert jobs["candidates"]["with"]["image"] == "${{ matrix.image }}"
     assert jobs["candidates"]["with"]["image_mode"] == "build_if_missing"
-    assert jobs["candidates"]["with"]["target"] == "${{ matrix.target }}"
-    assert set(jobs["gate"]["needs"]) == {"route", "cpu", "candidates"}
+    assert set(jobs["gate"]["needs"]) == {"plan", "cpu", "candidates"}
     assert jobs["gate"]["name"] == "Ascend-Image-PR-Gate"
+    assert "scripts.ci.execution.consumer.gate" in yaml.safe_dump(jobs["gate"])
     assert "promote" not in jobs
-    assert "scripts.ci.execution.consumer" not in dumped
     assert {"candidate", "smoke", "tests"}.isdisjoint(jobs)
 
 
