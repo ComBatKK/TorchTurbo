@@ -364,7 +364,10 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     planner_name = planners[0]
     planner = jobs[planner_name]
     planner_body = _job_run_text(planner)
-    if "scripts/ci/tools/lint.py" not in planner_body:
+    if not any(
+        marker in planner_body
+        for marker in ("scripts/ci/tools/lint.py", "scripts.ci.tools.lint")
+    ):
         problems.append(Problem(rel, "Planner job must also run scripts/ci/tools/lint.py"))
     declared = set((planner.get("outputs") or {}).keys())
     output_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.([A-Za-z0-9_-]+)"

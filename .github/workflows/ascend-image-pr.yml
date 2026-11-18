@@ -69,7 +69,7 @@ jobs:
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
       - name: lint
-        run: python3 scripts/ci/tools/lint.py
+        run: python3 -m scripts.ci.tools.lint
 
       - name: route changes and build Plan
         id: plan
