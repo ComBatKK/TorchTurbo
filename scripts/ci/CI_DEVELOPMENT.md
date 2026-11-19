@@ -20,10 +20,13 @@ ChangeScope 执行范围：code / docs_only / delegated
 变更路由与执行计划是两个层次：
 
 ```text
-changed files -> routing.change_router -> image | execution
+changed files -> routing.ci_router -> image | execution
                                          │
                                          └─ Planner -> Executor -> Gate
 ```
+
+`ci_router.py` 输入换行分隔的仓库相对路径，输出 `code`、`docs_only`、`image_only`
+或 `mixed` 之一，读取失败时非零退出。调用方只对新增或修改的路径做分类。
 
 `image_only` / `mixed` 由 Image PR 编排独占；普通 PR 只发布 0 Job 的 delegated
 Plan 作为检查占位，不构建、不解析 candidate，也不接收 registry 凭据。
@@ -63,10 +66,11 @@ scripts/ci/
         venv.py       内容寻址 venv
         model_dataset.py 模型/数据集的本地解析、缓存与下载
   routing/            跨域变更路由，不执行测试
-    change_router.py  changed files -> docs/code/image/mixed
+    ci_router.py      changed files -> docs/code/image/mixed
   contracts/
     artifacts.py      schema v4 artifact 编解码与校验
   tools/
+    repo_paths.py     路由与镜像共享的路径判定
     lint.py           通用 linter + CI 契约检查
   tests/              config / facts / contracts / planner / executor / gate
 ```

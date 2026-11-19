@@ -55,18 +55,20 @@ def test_normal_pr_workflow_resolves_runtime_images_once(repo_root: Path) -> Non
 
     plan_steps = jobs["plan"]["steps"]
     step_names = [step.get("name", "") for step in plan_steps]
-    assert step_names.index("classify changes") > next(
+    assert step_names.index("route changes") > next(
         index for index, step in enumerate(plan_steps)
         if str(step.get("uses", "")).startswith("actions/setup-python")
     )
     assert step_names.index("install CI dependencies") > step_names.index(
-        "classify changes"
+        "route changes"
     )
     assert step_names.index("lint") > step_names.index("install CI dependencies")
     assert step_names.index("resolve runtime image") > step_names.index("lint")
     assert "resolve runtime digest" not in step_names
     assert step_names.index("plan") > step_names.index("resolve runtime image")
     classify = next(step for step in plan_steps if step.get("id") == "changes")
+    assert "scripts.ci.routing.ci_router" in classify["run"]
+    assert "--diff-filter=AM" in classify["run"]
     assert "scope=delegated" in classify["run"]
     identity = next(step for step in plan_steps if step.get("id") == "runtime_image")
     assert "steps.lint.outcome == 'success'" in identity["if"]
@@ -116,8 +118,9 @@ def test_image_pr_plans_builds_and_tests_the_candidate(repo_root: Path) -> None:
     assert step_names.index("lint") < step_names.index("Fork PR approval")
     assert step_names.index("Fork PR approval") < step_names.index("Route and plan")
     plan_step = next(step for step in plan["steps"] if step.get("id") == "plan")
-    assert "scripts.ci.routing.change_router" in plan_step["run"]
+    assert "scripts.ci.routing.ci_router" in plan_step["run"]
     assert "scripts.ci.image plan" in plan_step["run"]
+    assert "--diff-filter=AM" in plan_step["run"]
     assert "--base-revision" not in plan_step["run"]
     assert "--plan-policy" not in plan_step["run"]
     assert "--plans-output" not in plan_step["run"]
@@ -125,9 +128,8 @@ def test_image_pr_plans_builds_and_tests_the_candidate(repo_root: Path) -> None:
     assert 'if [ "$route" = mixed ]' in plan_step["run"]
     assert "printf 'cpu_jobs=[]\\ncpu_job_count=0\\n'" in plan_step["run"]
     assert "--targets cpu" in plan_step["run"]
-    assert "route=${route#change_route=}" in plan_step["run"]
     assert "case \"$route\" in" in plan_step["run"]
-    assert "code|image_only|mixed" in plan_step["run"]
+    assert "image_only|mixed" in plan_step["run"]
     assert "effective_route=no_image" in plan_step["run"]
     assert "refs/pull/${{ github.event.pull_request.number }}/head" in yaml.safe_dump(
         plan

@@ -121,7 +121,7 @@ ci.yml + TestFacts
 代码域也与数据流同构：
 
 ```text
-routing/change_router.py
+routing/ci_router.py
         │
         ├── image/       candidate identity、build、promotion
         └── execution/   producer -> consumer -> gate

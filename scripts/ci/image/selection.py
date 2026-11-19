@@ -11,6 +11,7 @@ from .recipe import (
     ImageSpec,
     load_specs,
 )
+from ..tools.repo_paths import is_dockerfile_path, normalize_repo_path
 
 
 class SelectionError(ImageError):
@@ -37,16 +38,6 @@ def select_named(specs: Sequence[ImageSpec], names: str) -> list[ImageSpec]:
     return _selected(by_name[name] for name in requested)
 
 
-def _normalized(path: str) -> str:
-    value = path.strip().replace("\\", "/")
-    return value[2:] if value.startswith("./") else value
-
-
-def _is_dockerfile(path: str) -> bool:
-    parsed = Path(path)
-    return parsed.parts[:1] == ("docker",) and parsed.name.startswith("Dockerfile")
-
-
 def _changed(
     specs: Sequence[ImageSpec],
     paths: Iterable[str],
@@ -57,13 +48,13 @@ def _changed(
     matched: dict[str, ImageSpec] = {}
     unmatched: list[str] = []
     for value in paths:
-        path = _normalized(value)
+        path = normalize_repo_path(value)
         if not path:
             continue
         selected = by_dockerfile.get(path, [])
         if selected:
             matched.update({spec.name: spec for spec in selected})
-        elif _is_dockerfile(path):
+        elif is_dockerfile_path(path):
             unmatched.append(path)
     if unmatched:
         raise SelectionError(

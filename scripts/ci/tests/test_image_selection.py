@@ -11,7 +11,7 @@ from scripts.ci.image.selection import (
     select_images,
 )
 from scripts.ci.image.cli import main
-from scripts.ci.routing.change_router import ChangeRoute, route_changes
+from scripts.ci.routing.ci_router import ChangeRoute, route_changes
 
 
 def _write_two_image_repo(root: Path) -> None:
