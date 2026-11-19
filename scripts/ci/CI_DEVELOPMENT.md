@@ -220,8 +220,10 @@ runner 的默认网络。远端 revision 必须固定到 commit；ModelScope 使
 不能复用 Hugging Face revision。
 
 integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tensorboard/` 等临时
-大目录，只保留 `actual.json`、`resolved_inputs.json`、`training.log` 和配置快照。Job 的
-真实退出状态由最后的 `enforce result` 步骤判定，确保失败结果先上传再由 Gate 消费。
+大目录，只保留 `actual.json`、`resolved_inputs.json`、`training.log` 和配置快照。
+`execute` 步骤直接返回 executor 的真实退出码，因此失败用例会立即显示为 failed；
+`verify result`、`upload result` 和 `enforce result` 使用 `always()`，仍会在失败后上传
+结果并由 Gate 做最终 fail-closed 判定。
 
 ## 扩展点
 

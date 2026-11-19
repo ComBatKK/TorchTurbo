@@ -316,9 +316,9 @@ jobs:
           rc=$?
           printf '%s\n' "$rc" > "$result_root/executor.exit_code"
           if [ "$rc" -ne 0 ]; then
-            echo "::warning::executor exited with code $rc; uploading result before failing the job"
+            echo "::warning::executor exited with code $rc; result upload will still run"
           fi
-          exit 0
+          exit "$rc"
 
       - name: verify result
         if: always()
@@ -411,9 +411,9 @@ jobs:
           rc=$?
           printf '%s\n' "$rc" > "$result_root/executor.exit_code"
           if [ "$rc" -ne 0 ]; then
-            echo "::warning::executor exited with code $rc; uploading result before failing the job"
+            echo "::warning::executor exited with code $rc; result upload will still run"
           fi
-          exit 0
+          exit "$rc"
 
       - name: verify result
         if: always()
