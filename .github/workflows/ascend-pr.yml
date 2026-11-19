@@ -5,7 +5,7 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 #
 #   lint -> Planner -> PlanArtifact -> Executor -> Gate
 #
-# The Plan carries an immutable content-tag image reference. Image builds and
+# The Plan carries an immutable digest image reference. Image builds and
 # alias promotion are a separate release pipeline; they are not a job in this
 # graph and cannot change the test topology.
 
@@ -115,6 +115,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.checkout_ref || github.sha }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: classify changes
         id: changes
         env:
@@ -148,41 +152,10 @@ jobs:
           echo "change_scope=$scope" >> "$GITHUB_OUTPUT"
           echo "change scope: $scope" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: install CI dependencies
         run: |
           python3 -m pip install --quiet --disable-pip-version-check \
             -r requirements-lint.txt
-
-      - name: resolve runtime image
-        id: runtime_image
-        if: |
-          steps.changes.outputs.change_scope != 'docs_only' &&
-          steps.changes.outputs.change_scope != 'delegated'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-        run: |
-          set -euo pipefail
-          refs="$RUNNER_TEMP/ci-image-refs"
-          if [ -n "$CI_IMAGE_REF" ]; then
-            printf '%s=%s\n' "$CI_IMAGE_NAME" "$CI_IMAGE_REF" > "$refs"
-            echo "using caller image: $CI_IMAGE_REF"
-            exit 0
-          fi
-          if [ "$EVENT_NAME" = pull_request ] && [ -n "$PR_BASE_SHA" ]; then
-            revision="$PR_BASE_SHA"
-          else
-            revision=$(git rev-parse HEAD)
-          fi
-          python3 -m scripts.ci.image refs \
-            --revision "$revision" \
-            --output "$refs"
-          test -s "$refs"
-          cat "$refs"
 
       - name: lint
         id: lint
@@ -194,6 +167,32 @@ jobs:
         run: |
           set -uo pipefail
           python3 -m scripts.ci.tools.lint
+
+      - name: resolve runtime image
+        id: runtime_image
+        if: |
+          steps.lint.outcome == 'success' &&
+          steps.changes.outputs.change_scope != 'docs_only' &&
+          steps.changes.outputs.change_scope != 'delegated'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$PR_BASE_SHA" ]; then
+            revision="$PR_BASE_SHA"
+          else
+            revision=$(git rev-parse HEAD)
+          fi
+          refs="$RUNNER_TEMP/ci-image-refs"
+          common=(--revision "$revision" --output "$refs")
+          if [ -n "$CI_IMAGE_REF" ]; then
+            common+=(--image-ref "$CI_IMAGE_NAME=$CI_IMAGE_REF")
+            echo "using caller image: $CI_IMAGE_REF"
+          fi
+          python3 -m scripts.ci.image resolve "${common[@]}"
+          test -s "$refs"
+          cat "$refs"
 
       # Always publish a PlanArtifact, including lint failures. Gate consumes
       # contracts rather than raw shell exit codes.
@@ -236,17 +235,17 @@ jobs:
             echo "Dockerfile PR is delegated to Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
-            [ "$IMAGE_OUTCOME" != success ]; then
-            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
-              --fail-code image-identity --fail-path scripts/ci/image \
-              --fail-message "cannot resolve runtime image"
-            exit 1
-          fi
-          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
             [ "$LINT_OUTCOME" != success ]; then
             python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
               --fail-code lint --fail-path scripts/ci/tools/lint.py \
               --fail-message "lint failed"
+            exit 1
+          fi
+          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
+            [ "$IMAGE_OUTCOME" != success ]; then
+            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
+              --fail-code image-identity --fail-path scripts/ci/image \
+              --fail-message "cannot resolve runtime image digest"
             exit 1
           fi
           if [ -f "$IMAGE_REFS_FILE" ]; then

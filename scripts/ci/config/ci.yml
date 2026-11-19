@@ -17,15 +17,15 @@ resources:
     npu-default:
       target: npu-a3
       kind: container
-      ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-a3-base
       default: true
-      build:
+      recipe:
+        ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-a3-base
         dockerfile: docker/npu/Dockerfile_aarch64
         context: docker/npu
         platform: linux/arm64
         cann_version: "9.0.0"
         revision: 1
-        args:
+        build_args:
           GIT_HTTP_USER_AGENT: git/2.56.1
 
   venvs:

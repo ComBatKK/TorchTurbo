@@ -1,5 +1,26 @@
-"""Platform image planning, registry access, build, and promotion."""
+"""Platform image resolution, build, and promotion."""
 
-from .plan import ImageError, ImagePlan, ImageSpec, load_image_plan, plan_image
+from .recipe import ImageError
+from .registry import RegistryError
+from .release import (
+    BuildError,
+    ImageResult,
+    check_envs,
+    ensure_image,
+    promote_image,
+    resolve_images,
+)
+from .selection import SelectionError, select_images
 
-__all__ = ["ImageError", "ImagePlan", "ImageSpec", "load_image_plan", "plan_image"]
+__all__ = [
+    "BuildError",
+    "ImageError",
+    "ImageResult",
+    "RegistryError",
+    "SelectionError",
+    "check_envs",
+    "ensure_image",
+    "promote_image",
+    "resolve_images",
+    "select_images",
+]

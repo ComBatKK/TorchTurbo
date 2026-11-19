@@ -3,9 +3,9 @@ run-name: Ascend-Image-Promote ${{ inputs.images || github.sha }}
 
 # Trusted post-merge image pipeline. Every affected logical image runs one
 # complete unit independently:
-#   resolve validated candidate -> promote alias
+#   promote (resolve candidate + move alias)
 #
-# Dockerfile changes select images automatically. Manual dispatch can target
+# Image input changes select images automatically. Manual dispatch can target
 # all images or a comma-separated list. A failure in one image does not cancel
 # other images; the final gate fails if any selected image fails.
 
@@ -71,11 +71,11 @@ jobs:
           set -euo pipefail
           common=(--root "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT")
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            python3 -m scripts.ci.image.selection --images "$IMAGES" "${common[@]}"
+            python3 -m scripts.ci.image plan --images "$IMAGES" "${common[@]}"
           else
             changed="$RUNNER_TEMP/ci-changed-files.txt"
             git diff --name-only --no-renames "$BEFORE_SHA...HEAD" > "$changed"
-            python3 -m scripts.ci.image.selection \
+            python3 -m scripts.ci.image plan \
               --changed-files "$changed" "${common[@]}"
           fi
 
@@ -105,7 +105,7 @@ jobs:
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
       - name: check registry tooling
-        run: python3 -m scripts.ci.image env
+        run: python3 -m scripts.ci.image check-envs
 
       - name: log in to SWR
         env:
@@ -118,24 +118,13 @@ jobs:
           : "${SWR_PASS:?SWR_PASSWORD is required for image promotion}"
           printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
 
-      - name: resolve candidate
-        id: resolve
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: |
-          python3 -m scripts.ci.image resolve-candidate \
-            --image "$IMAGE" \
-            --policy resolve_candidate
-
-      - name: promote validated digest
+      - name: promote validated candidate
         id: promote
         env:
           IMAGE: ${{ matrix.image }}
-          DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
           python3 -m scripts.ci.image promote \
             --image "$IMAGE" \
-            --digest "$DIGEST" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: summary
@@ -143,7 +132,6 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
           ALIAS: ${{ steps.promote.outputs.alias }}
-          CONTENT_TAG: ${{ steps.promote.outputs.content_tag }}
           DIGEST: ${{ steps.promote.outputs.digest }}
         run: |
           {
@@ -153,7 +141,6 @@ jobs:
             echo '|---|---|'
             echo "| image | \`${IMAGE}\` |"
             echo "| alias | \`${ALIAS:-missing}\` |"
-            echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
             echo "| digest | \`${DIGEST:-missing}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -177,15 +164,15 @@ jobs:
             echo "::error::discover result is ${DISCOVER_RESULT}"
             failed=1
           fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
           if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
-            echo "::error::no affected image entered the promotion matrix"
-            failed=1
+            echo "no Dockerfile changed; promotion is a no-op" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           if [ "$PROMOTION_RESULT" != success ]; then
             echo "::error::image promotion result is ${PROMOTION_RESULT}"
-            failed=1
-          fi
-          if [ "$failed" -ne 0 ]; then
             exit 1
           fi
           echo "image promotion passed for: $IMAGES" >> "$GITHUB_STEP_SUMMARY"

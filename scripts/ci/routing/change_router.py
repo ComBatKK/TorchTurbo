@@ -12,6 +12,7 @@ from typing import Iterable
 DOC_DIRS = frozenset({"docs"})
 DOC_NAMES = frozenset({"LICENSE", "NOTICE"})
 DOC_SUFFIXES = frozenset({".adoc", ".md", ".rst"})
+IMAGE_ROOT = "docker"
 
 
 class ChangeRoute(str, Enum):
@@ -42,14 +43,14 @@ def is_docs_path(path: str) -> bool:
 
 
 def is_dockerfile_path(path: str) -> bool:
-    """Return whether one path matches the image Dockerfile input set."""
+    """Return whether one path is a Dockerfile that triggers an image build."""
     normalized = _normalized(path)
     if not normalized:
         return False
     parsed = PurePosixPath(normalized)
     return bool(
         parsed.parts
-        and parsed.parts[0] == "docker"
+        and parsed.parts[0] == IMAGE_ROOT
         and parsed.name.startswith("Dockerfile")
     )
 

@@ -151,7 +151,8 @@ scopes      pull_request / nightly 选择哪些 suite 和 integration case
 
 Job 与 Step 的超时统一使用分钟；Executor 只在设置进程计时器和 deadline 时转换为秒。
 
-镜像构建配置也放在同一个文件的 `resources.images.<name>.build`：
+CI 只有一个 YAML 配置文件：`scripts/ci/config/ci.yml`。测试域只读逻辑镜像字段，
+`recipe` 对测试域不透明：
 
 ```yaml
 resources:
@@ -159,30 +160,33 @@ resources:
     npu-default:
       target: npu-a3
       kind: container
-      ref: swr.../torchturbo_npu:cann9.0.0-a3-base
-      build:
+      default: true
+      recipe:
+        ref: swr.../torchturbo_npu:cann9.0.0-a3-base
         dockerfile: docker/npu/Dockerfile_aarch64
         context: docker/npu
         platform: linux/arm64
         cann_version: "9.0.0"
         revision: 1
-        args: {}
+        build_args: {}
 ```
 
-测试配置加载器允许 `build` 字段但不解释它；只有 `scripts/ci/image` 读取构建语义。
-`ci_config.py`、Planner、Executor 和 Gate 都不解析 Dockerfile 或 digest。workflow 在
-lint-plan 阶段把逻辑 image 解析成不可变 content ref，再通过 Planner 的参数覆盖写入
-Plan，因此仍然保持镜像构建域和测试域解耦。
+只有 image 域解释 `recipe`；`ci_config.py`、Planner、Executor 和 Gate 不读取其中的
+Dockerfile、content tag 或 digest。workflow 只调用一次 `scripts.ci.image resolve` 获取
+不可变 digest ref，再通过 Planner 的 `--image-ref` 写入 Plan。
 
 镜像身份有两层，不能混用：
 
 ```text
-content tag  cann9.0.0-a3-c<hash>   CI 实际运行的不可变身份
+content tag  cann9.0.0-a3-c<hash>   recipe + build context 身份
+digest       sha256:<digest>         测试实际运行的不可变镜像
 alias        cann9.0.0-a3-base      人类可读的发布别名，只用于回滚和发布
 ```
 
-普通 PR 使用 `base.sha` 对应的 content tag；nightly/manual 使用当前 SHA 对应的
-content tag；Image PR 使用 candidate digest。任何测试入口都不依赖 alias 是否已经
+content hash 覆盖 recipe、Dockerfile、build context 内全部文件、platform、build args
+和 manual revision。COPY/ADD 天然纳入 identity，不需要额外维护输入清单。alias 和
+registry repository 不进入 hash。普通 PR 使用 `base.sha` 解析 digest；nightly/manual
+使用当前 SHA；Image PR 使用 candidate digest。任何测试入口都不依赖 alias 是否已经
 promote。
 
 当前资源规模：
@@ -196,8 +200,8 @@ promote。
 
 Planner 先按 device 与 scope 选择 target，再选择逻辑 image，最后按 rank 选择满足容量
 且最小的 lane。资源不存在时记录 unsupported route；target、image 或 lane 缺失时直接
-失败。Planner 把 workflow 传入的不可变 content ref 写入 Job runtime，自己不查询
-registry；没有 override 时只使用逻辑 image 的默认 ref。
+失败。Planner 把 workflow 传入的不可变 digest ref 写入 Job runtime，自己不查询
+registry。container image 的物理 ref 由 image 域解析，测试配置不保存可移动 tag。
 
 ### 2.3 运行范围
 
@@ -242,54 +246,52 @@ Job ID 由 suite、设备和 venv 等稳定字段生成，手动单点执行时�
 | `ascend-pr.yml` | `pull_request`、`workflow_dispatch`、`workflow_call` | 主入口，统一执行 PR 和 nightly scope |
 | `ascend-manual.yml` | `workflow_dispatch` | 复用主链路，单点执行一个 Plan Job |
 | `ascend-nightly.yml` | 手动 dispatch，cron 暂时关闭 | 以 nightly scope 调用主入口 |
-| `ascend-image-pr.yml` | `pull_request_target` 的 Dockerfile 变更 | 唯一的 Dockerfile PR 入口：选择受影响的逻辑镜像，可选 CPU 预检，再按镜像并行验证 |
+| `ascend-image-pr.yml` | `pull_request_target` 的 Dockerfile 变更 | 唯一的 image PR 入口：选择受影响的逻辑镜像，可选 CPU 预检，再按镜像并行验证 |
 | `ascend-image-promote.yml` | `main` push 的 Dockerfile 变更、手动 dispatch | 选择 main 上受影响的镜像并按镜像并行发布 |
-| `ascend-image-pipeline.yml` | `workflow_call`、手动 dispatch | 单镜像候选链路：build/resolve 和 tests；无上游 Plan 时在内部生成 identity |
+| `ascend-image-pipeline.yml` | `workflow_call`、手动 dispatch | 单镜像候选链路：build 和 candidate tests |
 
 所有测试入口复用同一条 `Plan -> Executor -> Gate` 链路，没有第二套测试选择逻辑。
-Image PR 的 Plan 同时计算全部受影响镜像的 identity、action 和 content tag，并把它们
-直接写入 candidate matrix。`ascend-image-pipeline.yml` 消费该 Plan 时不再二次计算镜像身份；
-只有手动触发等没有上游 Plan 的入口才在内部生成 identity。测试仍复用通用的
-`Plan -> Executor -> Gate`，不引入第二套测试选择逻辑。
+Image PR 的 `plan` 只输出逻辑 image、target 和 device/hardware matrix；identity 在单镜像
+`build` 内部计算。测试仍复用通用的 `Plan -> Executor -> Gate`。
 
 镜像 PR 与普通 PR 是两条独立链路：
 
 ```text
-changed Dockerfiles       -> selection -> affected logical images
-Dockerfile-only PR        -> per image: build -> candidate tests
-Dockerfile + 代码 PR      -> one CPU preflight -> per image: build -> candidate tests
-普通代码 PR               -> base SHA content ref -> CPU/NPU 测试，不构建镜像
-main 合并                 -> per image: resolve same candidate -> promote alias
-nightly                   -> 当前 SHA content ref -> 全量 pytest + 全部 integration
+changed Dockerfiles       -> plan -> affected logical images
+image-only PR             -> per image: build -> candidate tests
+image + 代码 PR           -> one CPU preflight -> per image: build -> candidate tests
+普通代码 PR               -> base SHA resolve -> digest ref -> CPU/NPU，不构建镜像
+main 合并                 -> per image: promote
+nightly                   -> 当前 SHA resolve -> digest ref -> 全量 pytest + 全部 integration
 ```
 
 同仓镜像 PR 自动运行；fork 镜像 PR 必须由维护者添加 `image-ci/run` 标签，未审批时
-approval gate 失败。普通 PR 永远不接收 SWR 凭据。
+approval gate 失败。普通 PR 只读解析 digest，不接收 SWR 写凭据。
 
-Image PR 的自动触发路径只有 `docker/**/Dockerfile*`。只修改 Dockerfile 的 PR 跳过
-CPU 预检；Dockerfile + 代码的混合 PR 先执行 CPU 切片，再构建 candidate，最后执行 NPU
-candidate 切片。`Ascend-PR-CI` 检测到 Dockerfile 变更时生成 0 Job 的 delegated Plan，
-只承担分支检查占位，不再重复执行任何用例。
+Image PR 的唯一自动触发条件是新增或修改 `docker/**/Dockerfile*`。`scripts/ci/config/ci.yml`
+和 Dockerfile 之外的 `docker/**` 文件都按普通 PR 处理，不触发镜像构建。只修改 Dockerfile
+的 PR 跳过 CPU 预检；Dockerfile + 代码的混合 PR 先执行 CPU 切片，再构建 candidate，最后
+执行 NPU candidate 切片。`Ascend-PR-CI` 检测到 Dockerfile 变更时生成 0 Job 的 delegated
+Plan，只承担分支检查占位，不再重复执行任何用例。
 
-`scripts/ci/image/selection.py` 从
-`resources.images.<name>.build.dockerfile` 建立 Dockerfile 到逻辑镜像的映射。一次修改
-多个 Dockerfile 时，只把被修改且已映射的镜像放入 matrix；未映射的 Dockerfile 直接
-失败，不会静默跳过。Plan 为每个 matrix item 预先写入完整的 `image_plan`、`action` 和
-`content_tag`；`candidate -> tests` 统一消费该 Plan，不再次规划。main promotion 在
-`ascend-image-promote.yml` 内独立执行 `resolve candidate -> promote alias`，不再复用
-候选流水线。不同镜像之间并行，且不设置全局 build、test 阶段栅栏。`fail-fast: false`，
-一个镜像失败不会取消其他镜像，最终由各自的 Gate 汇总。
+`scripts/ci/image/recipe.py` 加载 image recipe，`selection.py` 从 `ci.yml` 的
+`recipe.dockerfile` 建立路径到逻辑镜像的映射。一次修改多个 Dockerfile 时，只把已映射的
+镜像放入 matrix；未映射的 Dockerfile 直接失败，不会静默跳过。Dockerfile 和 context
+必须位于 `docker/**`。修改 context 文件自身不会触发构建，但 context 内容仍计入下一次
+Dockerfile 构建的 identity。matrix 不暴露 content tag、Dockerfile 或内部 plan；单镜像
+`build` 负责复用或创建 candidate。main promotion 对每个镜像调用一次 `promote`，
+内部完成 candidate 解析和 alias 移动。不同镜像之间并行，且不设置全局 build、test
+阶段栅栏。`fail-fast: false`，一个镜像失败不会取消其他镜像，最终由各自的 Gate 汇总。
 
-`scripts/ci/image/**`、`ci.yml` 的 image build recipe 以及 image workflow 自身的变更
-不会自动构建 candidate，避免普通 CI 维护 PR 触发数小时的镜像任务；这些变更需要在合并
-前手动执行 candidate 验证，并确认目标 content tag 已存在。否则 main promotion 会按
-fail-closed 策略直接失败，不会发布未经验证的镜像。2/4/8/16 卡只是 runner 容量，
+`scripts/ci/image/**` 的代码和 workflow 不参与镜像 identity。`ci.yml` 中的 recipe、
+Dockerfile 和 build context 是 identity 输入；只有 Dockerfile 变化会触发 candidate
+构建和 main promotion。2/4/8/16 卡只是 runner 容量，
 不进入镜像身份；NPU candidate 切片只跑真正使用 candidate 镜像的 NPU 用例。
 
 ### 2.6 执行与环境
 
 - Executor 在执行前写入 `infra_error/executor-incomplete` 占位结果，结束时原子覆盖，runner 被杀死时 Gate 能区分“缺结果”和“执行失败”。
-- CPU Job 使用宿主 runner；NPU Job 使用 Plan 中不可变的 content ref。
+- CPU Job 使用宿主 runner；NPU Job 使用 Plan 中不可变的 digest ref。
 - 每个 Job 在局部 venv 中安装依赖，并在 pytest 前后做 torch/设备 probe，防止环境被静默替换。
 - NPU Job 结束或失败后执行清理，删除训练临时目录和残留进程。
 - pytest 结果同时写 JUnit 和结构化 JobResult；integration 结果保留 `actual.json`、`resolved_inputs.json`、`training.log` 和配置快照。
@@ -311,7 +313,7 @@ Gate 的核心规则是 fail closed：
 |---|---|
 | 新增硬件代际 | `resources.targets`，并提供 target 的默认 image 和 lane |
 | 新增逻辑镜像 | `resources.images`，再由 scope/workload/test 覆盖选择 |
-| 新增镜像构建版本 | `resources.images.<name>.build`；只影响 Image CI |
+| 新增镜像构建版本 | 同一 `resources.images.<name>.recipe`；测试域不感知 recipe 内容 |
 | 新增 runner/rank lane | `resources.lanes`，lane 只绑定 target，不绑定 image |
 | 新增 venv | `resources.venvs`，可用 `extends` 复用依赖 |
 | 新增 pytest | 补 marker 和依赖事实；必要时补 `framework_venvs` / override |
@@ -322,17 +324,17 @@ Gate 的核心规则是 fail closed：
 ### 2.9 当前限制和后续增强
 
 - PR 不跑 model pytest；adapter 全量在 PR 与 nightly 执行。
-- Dockerfile-only PR 跳过 CPU；Dockerfile + 代码的混合 PR 先执行一次 CPU 预检，失败时
+- image-only PR 跳过 CPU；image + 代码的混合 PR 先执行一次 CPU 预检，失败时
   不会开始任何镜像构建。每个受影响镜像独立执行 `candidate -> tests`。
 - NPU 2 卡资源池目前只有一个在线 runner 时，NPU pytest 和 NPU integration 会串行，`max-parallel: 2` 只表示允许并发，不创造 runner 容量。
 - nightly 的 cron 暂时关闭，当前只做 Plan 验证。
-- 普通 PR 使用 base SHA 对应的 content tag，不接收 SWR 凭据，也不等待镜像构建。
+- 普通 PR 使用 base SHA 只读解析 digest；不接收 SWR 写凭据，也不等待镜像构建。
 - Dockerfile PR 由 `Ascend-Image-PR` 独占测试所有权；混合 PR 的 CPU 预检只执行一次，
   多个镜像随后并行验证。fork PR 先执行无 secret 的 lint，再要求 `image-ci/run`
   维护者批准后才能进入构建。
 - `Ascend-Image-Promote` 为每个受影响镜像解析同一个已测试 candidate 后 promote；
   任一 candidate 缺失时 fail closed，不临时构建替代镜像。
-- nightly/manual 只消费当前 SHA 对应的 content tag，不构建、不 promote 镜像。
+- nightly/manual 只消费当前 SHA 对应的 digest ref，不构建、不 promote 镜像。
 - Dockerfile PR 必须把 `Image gate` 作为测试必过项；普通 PR 的
   `Ascend-PR-Gate` 在 Dockerfile PR 上只是 delegated 占位，不能替代 Image Gate。
 - 模型 index 和全部 shard 的严格校验、下载超时/错误分类、`resolved_inputs.json` 的耗时和大小、ModelScope fallback 与 HF golden 一致性仍是非阻塞增强项。
@@ -482,46 +484,46 @@ workloads:
 - image 的 target 必须与 Job 的 target 一致。
 - 每个 target 默认只能有一个 `default: true` 镜像。
 - 显式选择的镜像不存在或不兼容时 Planner 失败，不静默回退。
-- Planner 只使用 image 的 target/ref/default，不解释 `build`，也不查询 registry。
+- Planner 只使用 image 的 target/kind/default，不读取 image recipe，也不查询 registry。
 
-Planner 不查询 registry，也不解析 digest。normal PR/nightly/manual 由 lint-plan 先调用
-`scripts.ci.image refs`，从 Git revision 计算全部 container image 的 content ref，再通过
-`--image-ref` 覆盖逻辑 image；Image PR 则直接传入 candidate 的 digest ref。最终 Job
-runtime 只保存不可变 ref。测试 job graph 始终是：
+Planner 不查询 registry，也不解析 digest。normal PR/nightly/manual 由 lint-plan 调用一次
+`scripts.ci.image resolve`；Image PR 则传入 candidate 的 digest ref。最终 Job runtime
+只保存 digest ref。测试 job graph 始终是：
 
 ```text
 lint -> Plan -> CPU/NPU -> Gate
 ```
 
-镜像构建和 alias 发布走独立链路。Dockerfile PR 是唯一入口。`selection.py` 先把
-changed Dockerfiles 映射为 affected logical images；每个镜像内部串行，镜像之间并行：
+镜像构建和 alias 发布走独立链路。Dockerfile PR 是唯一入口。`plan` 先把 changed
+Dockerfiles 映射为 affected logical images；每个镜像内部串行，镜像之间并行：
 
 ```text
-Dockerfile-only
+image-only
   for each affected image, in parallel:
-    content tag -> build candidate -> candidate tests
+    content tag -> build -> candidate tests
 
-Dockerfile + code
+image + code
   CPU tests once
     -> for each affected image, in parallel:
-         content tag -> build candidate -> candidate tests
+         content tag -> build -> candidate tests
 
 main merge
   for each affected image, in parallel:
-    resolve same content tag -> promote alias
+    promote (internally resolves candidate and moves alias)
 ```
 
-- Normal PR 使用 `base.sha` 的 content tag；nightly/manual 使用当前 SHA 的 content tag。
-- 测试 CI 不增加 image job，不接收 SWR 凭据，也不因镜像构建耗时改变执行拓扑。
-- Image PR 使用内容 tag 构建 candidate；同内容已存在时直接复用。
-- Dockerfile-only PR 跳过 CPU 预检；混合 PR 先跑 CPU 切片，失败时不构建 candidate。
-- 多 Dockerfile PR 只选择实际修改的镜像；未映射的 Dockerfile 使 Image PR fail closed。
+- Normal PR 使用 `base.sha` 解析 digest；nightly/manual 使用当前 SHA。
+- 测试 CI 不增加 image job，不接收 SWR 写凭据，也不因镜像构建耗时改变执行拓扑。
+- Image PR 使用 content tag 构建 candidate；同内容已存在时直接复用。
+- image-only PR 跳过 CPU 预检；混合 PR 先跑 CPU 切片，失败时不构建 candidate。
+- 多 Dockerfile PR 只选择实际受影响的镜像；未映射的 Dockerfile 使 Image PR fail closed。
 - Image PR 构建后用该 image target 执行 PR 切片，candidate 只能作为不可变 ref 传入。
 - Image Main 按同一映射选择 main 上修改的 Dockerfile 对应镜像；只解析 PR candidate，
   缺失时直接失败；只 promote 已经在 Image PR 中验证过的 candidate。
 - 手动 dispatch 可用 `images=all` 或逗号分隔的逻辑镜像列表指定发布范围。
 - Dockerfile PR 的测试由 Image PR 独占；普通 PR workflow 只生成 delegated Plan。
-- image engine / build recipe 变更走手动 candidate 验证，不自动触发昂贵的 Image PR。
+- image engine、`ci.yml` 和 Dockerfile 之外的 `docker/**` 变更由普通 PR CI 验证。
+- 新增或修改 Dockerfile 自动触发 Image PR，并只选择映射到这些 Dockerfile 的镜像。
 - nightly 只运行当前 content tag 上的全量测试，不构建、不 promote 镜像。
 - alias 必须使用 `cann<cann_version>-<hardware>-...` 前缀，使多个 CANN 版本可以并存。
 - 禁止使用 `base-latest` 等无版本 alias。alias 是发布和回滚入口；CI 正确性只依赖
@@ -577,8 +579,8 @@ Planner 仍按以下维度聚合 pytest：
 4. `Runtime` 增加 `target`；artifact schema 升级到 4，版本只保留在顶层 artifact。
 5. 生产配置保留 `cpu` / `npu-a3`，PR 为 7 Job、nightly 为 12 Job。
 6. A5 通过临时配置单测覆盖；生产配置不声明不存在的 A5 runner。
-7. 测试入口使用 `cann9.0.0-a3-c<hash>` content tag；`cann9.0.0-a3-base` 只做发布别名。
-8. Image PR 把 changed Dockerfile 映射为 affected images，并按镜像并行执行完整链路；
+7. 测试入口使用不可变 digest；content tag 和 `cann9.0.0-a3-base` alias 都由 image 域内部管理。
+8. Image PR 把 changed Dockerfiles 映射为 affected images，并按镜像并行执行完整链路；
    main 为每个受影响镜像只解析 candidate，不再重建镜像。
 
 后续增强：
@@ -591,11 +593,11 @@ Planner 仍按以下维度聚合 pytest：
 - `ci_config.py`：已实现 target/image/lane 模型、scope/workload image 覆盖和交叉校验。
 - `planner.py`：已实现 target 展开、统一 image 解析、`lane_for(target, ranks)` 和 runtime target。
 - `contracts/artifacts.py`：Job runtime 已增加 target 字段；artifact schema 为 4，嵌套 Plan 不重复携带版本。
-- workflow：lint-plan 用 `refs` 解析全部 container content ref，matrix 已包含不可变
-  `image_ref`；普通 PR 用 `targets` 做通用执行切片。
-- Image PR：changed Dockerfile 先映射为 affected images；混合 PR 只做一次 CPU 预检，
+- workflow：lint-plan 用 `scripts.ci.image resolve` 生成不可变 `image_ref`；普通 PR 用
+  `targets` 做通用执行切片。
+- Image PR：changed Dockerfiles 先映射为 affected images；混合 PR 只做一次 CPU 预检，
   每个镜像再独立执行 build、tests，最终由 `Image gate` 统一裁决。
-- tests：已覆盖 target/image 解析优先级、A3/A5 路由、多 Dockerfile selection 和不静默回退。
+- tests：已覆盖 target/image 解析优先级、A3/A5 路由、Dockerfile selection 和不静默回退。
 - 文档：`CI_DESIGN.md` 记录整体模型，`CI_DEVELOPMENT.md` 记录维护命令和契约。
 
 长期方案的最终约束是：**镜像版本是环境维度，硬件代际是 target 维度，runner 容量是 lane 维度，三者不能互相编码。**

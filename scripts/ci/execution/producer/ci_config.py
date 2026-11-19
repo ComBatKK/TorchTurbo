@@ -428,8 +428,7 @@ def _load_images(
     images: dict[str, CiImage] = {}
     for name, value in rows.items():
         where = f"resources.images.{name}"
-        # `build` belongs to scripts/ci/image and is intentionally opaque here.
-        row = _row(value, where, {"target", "kind", "ref", "default", "build"}, issues)
+        row = _row(value, where, {"target", "kind", "ref", "default", "recipe"}, issues)
         target = str(row.get("target") or "")
         kind = str(row.get("kind") or "")
         ref = str(image_refs.get(name) or row.get("ref") or "")
@@ -437,7 +436,12 @@ def _load_images(
             issues.append(_issue(f"{where}.target", "unknown target"))
         if kind not in {"host", "container"}:
             issues.append(_issue(f"{where}.kind", "must be host or container"))
-        if not ref:
+        if kind == "container" and row.get("ref"):
+            issues.append(_issue(
+                f"{where}.ref",
+                "container refs are owned by the image recipe in scripts/ci/config/ci.yml",
+            ))
+        if kind == "host" and not ref:
             issues.append(_issue(f"{where}.ref", "image ref is required"))
         images[name] = CiImage(
             name=name,

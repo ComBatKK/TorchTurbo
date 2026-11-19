@@ -29,21 +29,25 @@ changed files -> routing.change_router -> image | execution
 Plan 作为检查占位，不构建、不解析 candidate，也不接收 registry 凭据。
 
 Executor 只消费 Plan 中的一个 Job；Gate 只消费 Plan 与 JobResult。两者都不重新选测，
-也不解析镜像。lint-plan 先用 `scripts.ci.image refs` 把全部 container image 解析成
-`cann<cann版本>-<hardware>-c<hash>` content ref，Plan 只携带这些不可变引用。
-Normal PR/Nightly 的 job graph 不包含镜像构建节点。
+也不解析镜像。lint-plan 只调用一次 `scripts.ci.image resolve`，image 域内部完成
+content tag 计算和 registry digest 解析。Plan 只携带 digest ref。Normal PR/Nightly
+的 job graph 不包含镜像构建节点。
 
 ## 目录
 
 ```text
 scripts/ci/
   config/
-    ci.yml            唯一 CI 配置：测试资源、镜像 build recipe、workloads、scopes
+    ci.yml            唯一 CI YAML：测试配置 + image recipe
     envs/             Python 依赖清单
   image/              镜像发布域：构建、解析、registry、promotion
-    plan.py           Git revision + image inputs -> content hash/tag/action
-    build.py          resolve / resolve-candidate / build / verify -> ImageResult
-    registry.py       SWR manifest、digest、alias
+    __main__.py        package 入口，仅调用 cli.main()
+    recipe.py          加载并校验 ci.yml 中的 image recipe
+    identity.py        Dockerfile/context -> content hash/tag
+    selection.py       changed files / image names -> 公开 matrix
+    registry.py        registry token、manifest 和 alias promotion
+    release.py         组合 resolve/build/promote 生命周期
+    cli.py             plan/resolve/build/promote/check-envs 的稳定 CLI 契约
   execution/          测试执行域：事实、计划、执行、判定
     producer/
       ci_config.py    CiConfig loader
@@ -80,11 +84,11 @@ changed files 路由到两个域；`contracts/` 和 `config/` 是共享边界。
 | Executor | PlanArtifact + 一个 `job_id` | `job-result.json` | 不读取 CiConfig/TestFacts |
 | Gate | PlanArtifact + 全部 JobResult | `decision.json` | 不重新选测 |
 
-镜像发布链路只读取 `scripts/ci/config/ci.yml` 中 image 的 `ref`、`target` 和
-`build`；测试配置加载器保留 `build` 字段但不解释它。Image PR 的外层 Plan 一次计算
-全部受影响镜像的 identity、action 和 content tag；`ascend-image-pipeline.yml` 直接消费该
-`image_plan`，只有手动触发时才在内部计算 identity。测试入口继续复用既有
-Plan/JobResult/Gate 语义。
+测试域只读取逻辑镜像的 `target`、`kind` 和 `default`；同一个 `resources.images` 条目下
+的 `recipe` 对测试域不透明。Dockerfile、context、registry repository、alias、CANN 版本
+和 build args 全部位于 `recipe`，由 image 域独占解释。CI 只有一个 YAML 配置文件：
+`scripts/ci/config/ci.yml`。跨域接口仍然只有逻辑镜像名和不可变 digest ref；workflow 不
+读取 content tag，也不传递内部 plan。
 
 Planner 按 CPU/NPU/GPU 输出 matrix。matrix 项只包含 `job_id`、`image_ref`、
 `runner_variable`、`runner`、`timeout_minutes`，完整 Job 只存在于 PlanArtifact。
@@ -97,52 +101,59 @@ runner 被外部杀死，Gate 仍能区分“缺结果”和“执行未完成�
 
 ```text
 Image PR
-  changed Dockerfiles -> selection -> affected images
-  Dockerfile-only -> per image: build candidate -> tests
-  Dockerfile+code -> CPU preflight once -> per image: build -> tests
+  changed Dockerfiles -> plan -> affected images
+  image-only -> per image: build -> tests
+  image+code -> CPU preflight once -> per image: build -> tests
 
 Image Main
-  main merge -> selected images -> per image: resolve candidate -> promote alias
+  main merge -> affected images -> per image: promote
 
 测试 CI（PR/nightly/manual）
-  base/current SHA -> content ref -> Plan -> CPU/NPU -> Gate
+  base/current SHA -> resolve -> digest ref -> Plan -> CPU/NPU -> Gate
 ```
 
-普通代码 PR 不等待镜像构建，也不查询 registry。所有 Dockerfile PR 由
-`.github/workflows/ascend-image-pr.yml` 独占测试所有权；`selection.py` 根据
-`resources.images.<name>.build.dockerfile` 只选择被修改的逻辑镜像。每个镜像调用
+普通代码 PR 不构建镜像，也不接收 SWR 写凭据；它只读查询 candidate digest。所有
+Dockerfile PR 由 `.github/workflows/ascend-image-pr.yml` 独占测试所有权；`selection.py`
+根据 `ci.yml` 中的 `recipe.dockerfile` 映射选择受影响逻辑镜像。修改 Dockerfile 之外的
+`docker/**` 文件或 `ci.yml` 都按普通 PR 处理，不触发镜像构建。每个镜像调用
 `ascend-image-pipeline.yml`，内部串行执行 build、candidate tests；不同镜像
-由 matrix 并行执行，没有全局阶段栅栏。Dockerfile-only PR 跳过 CPU，混合 PR 先执行
+由 matrix 并行执行，没有全局阶段栅栏。image-only PR 跳过 CPU，混合 PR 先执行
 一次 CPU preflight，失败时不构建 candidate。`Ascend-PR-CI` 检测到 Dockerfile 时只生成
 delegated Plan，不重复跑用例。同仓 PR 自动运行，fork PR 需要维护者添加
 `image-ci/run` 标签。
 
 main 合并后，`.github/workflows/ascend-image-promote.yml` 用同一套 selection 规则选择
-main 上修改的 Dockerfile 对应镜像，并在 promotion workflow 内完成
-`resolve candidate -> promote alias`。每个单镜像单元只解析已测试 candidate，然后把
-content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接失败，不创建
+main 上修改的 Dockerfile 对应镜像，并对每个镜像调用一次 `promote`。image 域内部解析
+已测试 candidate，再把 content tag promote 为 `cann9.0.0-a3-base`。candidate 不存在时该镜像直接失败，不创建
 未经 Image PR 测试的替代镜像。手动 dispatch 使用 `images=all` 或逗号分隔的逻辑镜像列表。
 
-其他 `docker/**` 文件不自动触发 Image PR，仍由普通 PR CI 看护。
+Image workflow 的唯一自动触发路径是 `docker/**/Dockerfile*`。普通 PR 只忽略这些
+Dockerfile；`ci.yml` 和 Dockerfile 之外的 `docker/**` 文件仍会参与普通 PR CI。Dockerfile
+未被任何 image recipe 映射时 Image plan fail closed，而不是静默跳过。recipe loader 强制
+Dockerfile 和 context 位于 `docker/**`。
 
-`scripts/ci/image/**`、`ci.yml` 的 image build recipe 和 image workflow 变更不会自动
-构建 candidate，避免 CI 维护 PR 占用数小时的镜像资源。这类变更必须在合并前手动执行
-candidate 验证，并确认目标 content tag 已存在；否则 main promotion 会 fail closed。
+`scripts/ci/image/**` 的代码和 workflow 不参与镜像 identity。`ci.yml` 中的 recipe、
+Dockerfile 和 build context 是 identity 输入；只有 Dockerfile 变化会自动构建 candidate
+并在 main 上 promote。
 
 镜像身份分为两层：
 
 ```text
-content tag  cann9.0.0-a3-c<hash>   测试实际运行身份，不可变
+content tag  cann9.0.0-a3-c<hash>   recipe + build context 身份
+digest       sha256:<digest>         测试实际运行的不可变镜像
 alias        cann9.0.0-a3-base      发布/回滚入口，不参与 CI 正确性
 ```
 
-普通 PR 使用 `github.event.pull_request.base.sha` 的 content tag；nightly/manual 使用
-当前 checkout SHA 的 content tag；Image PR 使用 candidate digest。alias 必须包含 CANN
-版本和硬件，支持多个版本长期并存。rank 数、lane、pytest 选择都不进入镜像 tag。
+content hash 覆盖 recipe 的 Dockerfile、context、platform、build args 和 manual
+revision，并递归覆盖 build context 内的文件。因此 COPY/ADD 不需要额外维护输入清单。
+alias 和 registry repository 不进入 hash。
 
-迁移到 content tag 前，旧 base 提交可能还没有 `resources.images.*.build`。此时普通 PR
-会 fail closed，不会静默回退 alias。首次迁移先用 `Ascend-Manual-CI` 的显式
-`image_ref` 完成 bootstrap，并在新的 main candidate 可解析后恢复普通 PR。
+普通 PR 使用 `github.event.pull_request.base.sha` 计算 content ref，再解析为 digest；
+nightly/manual 使用当前 checkout SHA；Image PR 使用 candidate digest。alias 必须包含
+CANN 版本和硬件，支持多个版本长期并存。rank 数、lane、pytest 选择都不进入镜像 tag。
+
+如果 base 提交还没有 image recipe，`resolve` 会告警并回退到当前 checkout 的配置，用于
+迁移期 bootstrap。配置存在但 recipe 格式错误时仍然 fail closed。
 
 ## 用例模型
 
@@ -209,8 +220,10 @@ integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tens
 - 新增逻辑镜像：增加 `resources.images`；需要按 scope、workload 或单个 test/case
   覆盖时，分别使用 scope `images[target]`、workload `images[target]` 或 override
   `image`。选择顺序是“显式 > scope > workload > target 默认”。
-- 新增镜像构建 recipe：修改 `resources.images.<name>.build`，不修改
-  Planner/Executor/Gate；该变更需在合并前手动构建并验证 candidate。
+- 新增镜像构建 recipe：在同一个 `resources.images.<name>` 条目下增加 `recipe`，并提供
+  对应的 Dockerfile。只有新增或修改 Dockerfile 会触发 Image PR。
+  Planner/Executor/Gate 只把 recipe 当作不透明字段；image 域负责 Dockerfile、context、
+  alias、content tag 和 registry。
 - 新增 lane：改 `resources.lanes`，lane 只绑定 target 和 runner 容量，不绑定 image。
   Planner 选择容量最小且满足 ranks 的 lane，不在 consumer 写平台分支。
 - 新增 venv：改 `resources.venvs`，可用 `extends` 复用依赖链；依赖文件内容计入 digest。
@@ -243,14 +256,31 @@ python3 -m scripts.ci.tools.lint
 python3 -m scripts.ci.tools.lint --only contract
 python3 -m scripts.ci.tools.lint --only config
 
-# 从 Git revision 计算全部 container image 的不可变身份；不访问 registry
-python3 -m scripts.ci.image refs \
+# 选择受影响镜像；只输出逻辑 image/target/device/hardware matrix
+python3 -m scripts.ci.image plan \
+  --changed-files /tmp/changed-files \
+  --output /tmp/image-jobs.json
+
+# build/promote runner 的 Docker/Buildx 预检
+python3 -m scripts.ci.image check-envs
+
+# 从 Git revision 解析全部 container image 的不可变 digest ref
+python3 -m scripts.ci.image resolve \
   --revision <sha> \
   --output /tmp/image-refs
 
+# Image PR：复用已有 candidate，缺失时构建
+python3 -m scripts.ci.image build \
+  --image npu-default \
+  --output /tmp/image-result.json
+
+# main promotion：内部解析已验证 candidate 并移动 alias
+python3 -m scripts.ci.image promote \
+  --image npu-default
+
 # 生成 PlanArtifact 和平台 matrix
 python3 -m scripts.ci.execution.producer.planner \
-  --image-ref "npu-default=<content-ref>" \
+  --image-ref "npu-default=<digest-ref>" \
   --scope pull_request \
   --output /tmp/plan.json \
   --github-output /tmp/github-output
@@ -264,7 +294,7 @@ python3 -m scripts.ci.execution.producer.planner \
 python3 -m scripts.ci.execution.producer.planner \
   --scope pull_request \
   --targets npu-a3 \
-  --image-ref "npu-default=<candidate-ref>" \
+  --image-ref "npu-default=<candidate-digest-ref>" \
   --output /tmp/pr-npu-plan.json
 
 # 单 Job 诊断

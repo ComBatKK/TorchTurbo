@@ -1,4 +1,4 @@
-"""Minimal registry client shared by image resolution, build, and promotion."""
+"""Docker registry authentication, manifests, and alias promotion."""
 
 from __future__ import annotations
 
@@ -32,9 +32,13 @@ class Manifest:
     media_type: str
     raw: dict[str, Any]
 
-    @property
-    def layer_bytes(self) -> int:
-        return sum(int(layer.get("size", 0)) for layer in self.raw.get("layers", []))
+
+def verify_manifest(manifest: Manifest) -> None:
+    if manifest.media_type not in {DOCKER_V2, DOCKER_LIST_V2}:
+        raise RegistryError(
+            "registry returned unsupported manifest media type "
+            f"{manifest.media_type!r}; expected Docker v2s2"
+        )
 
 
 class Registry:
@@ -71,9 +75,7 @@ class Registry:
     def manifest(self, reference: str) -> Manifest | None:
         token = self.token()
         if not token:
-            raise RegistryError(
-                f"cannot obtain registry token for {self.repository}"
-            )
+            raise RegistryError(f"cannot obtain registry token for {self.repository}")
         encoded = urllib.parse.quote(reference, safe=":")
         request = urllib.request.Request(
             f"https://{self.host}/v2/{self.repo_path}/manifests/{encoded}",
@@ -101,9 +103,6 @@ class Registry:
         if not digest:
             digest = "sha256:" + hashlib.sha256(body).hexdigest()
         return Manifest(reference=reference, digest=digest, media_type=media_type, raw=raw)
-
-    def exists(self, reference: str) -> bool:
-        return self.manifest(reference) is not None
 
     def require(self, reference: str) -> Manifest:
         manifest = self.manifest(reference)

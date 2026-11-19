@@ -2,7 +2,7 @@ name: Ascend Candidate
 run-name: Candidate ${{ inputs.image }}
 
 # One logical image's candidate pipeline. The parent workflow expands this as a
-# matrix so different Dockerfiles run independently without global barriers.
+# matrix so different images run independently without global barriers.
 # Candidate tests consume the immutable image digest and intentionally do not
 # reuse the complete PR workflow: the image path already ran lint and owns only
 # the build -> test-plan -> NPU -> gate lifecycle.
@@ -16,16 +16,6 @@ on:
         type: string
       target:
         description: 'Target slice used by candidate tests; required when run_tests is true'
-        required: false
-        default: ''
-        type: string
-      image_plan:
-        description: 'Precomputed compact ImagePlan JSON from the image PR Plan'
-        required: false
-        default: ''
-        type: string
-      content_tag:
-        description: 'Precomputed content tag used for build concurrency'
         required: false
         default: ''
         type: string
@@ -109,7 +99,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_IMAGE_RUNNER || vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 350
     concurrency:
-      group: image-${{ inputs.content_tag || inputs.image }}
+      group: image-${{ inputs.image }}-${{ inputs.checkout_ref || github.sha }}
       cancel-in-progress: false
     outputs:
       ref: ${{ steps.result.outputs.ref }}
@@ -140,22 +130,19 @@ jobs:
         with:
           driver: docker-container
 
+      - name: check build environment
+        run: python3 -m scripts.ci.image check-envs
+
       - name: build image
         id: result
         env:
           IMAGE: ${{ inputs.image }}
-          IMAGE_PLAN: ${{ inputs.image_plan }}
           MAX_JOBS: ${{ inputs.max_jobs }}
           USE_CACHE: ${{ inputs.use_cache }}
         run: |
           set -euo pipefail
           result="$RUNNER_TEMP/image-result.json"
-          common=(--image "$IMAGE" --output "$result")
-          build=(python3 -m scripts.ci.image build "${common[@]}" --policy build_if_missing)
-          if [ -n "$IMAGE_PLAN" ]; then
-            printf '%s' "$IMAGE_PLAN" > "$RUNNER_TEMP/image-plan.json"
-            build+=(--plan-file "$RUNNER_TEMP/image-plan.json")
-          fi
+          build=(python3 -m scripts.ci.image build --image "$IMAGE" --output "$result")
           if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
           if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
           "${build[@]}"
@@ -215,7 +202,6 @@ jobs:
       - name: summary
         if: always()
         env:
-          CONTENT_TAG: ${{ steps.result.outputs.content_tag }}
           DIGEST: ${{ steps.result.outputs.digest }}
           BUILT: ${{ steps.result.outputs.built }}
         run: |
@@ -224,7 +210,6 @@ jobs:
             echo ''
             echo '| field | value |'
             echo '|---|---|'
-            echo "| content tag | \`${CONTENT_TAG:-missing}\` |"
             echo "| digest | \`${DIGEST:-missing}\` |"
             echo "| built | \`${BUILT:-unknown}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

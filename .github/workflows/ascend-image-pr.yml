@@ -81,24 +81,31 @@ jobs:
           changed="$RUNNER_TEMP/ci-changed-files.txt"
           git diff --name-only --no-renames "$BASE_SHA...HEAD" > "$changed"
 
-          echo "Stage 2: route image-only vs mixed changes"
+          echo "Stage 2: classify non-image changes"
           route=$(python3 -m scripts.ci.routing.change_router --changed-files "$changed")
           route=${route#change_route=}
           case "$route" in
-            image_only|mixed) ;;
-            *) echo "::error::expected image_only or mixed; got $route"; exit 1 ;;
+            code|image_only|mixed) ;;
+            *) echo "::error::expected code, image_only or mixed; got $route"; exit 1 ;;
           esac
 
-          echo "Stage 3: select affected images and build the image plan"
+          echo "Stage 3: select affected images from changed Dockerfiles"
           matrix="$RUNNER_TEMP/image-matrix.json"
-          python3 -m scripts.ci.image.selection \
+          python3 -m scripts.ci.image plan \
             --root "$GITHUB_WORKSPACE" --changed-files "$changed" \
-            --plan-policy build_if_missing --base-sha "$BASE_SHA" \
-            --output "$matrix" --plans-output "$RUNNER_TEMP/ci-plan/image-plans.json" \
-            --github-output "$GITHUB_OUTPUT"
+            --output "$matrix" --github-output "$GITHUB_OUTPUT"
 
-          echo "Stage 4: generate the CPU plan for mixed PRs only"
-          if [ "$route" = mixed ]; then
+          image_count=$(sed -n 's/^image_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          if [ "${image_count:-0}" -eq 0 ]; then
+            effective_route=no_image
+          elif [ "$route" = mixed ]; then
+            effective_route=mixed
+          else
+            effective_route=image_only
+          fi
+
+          echo "Stage 4: generate the CPU plan for mixed image PRs only"
+          if [ "$effective_route" = mixed ]; then
             python3 -m scripts.ci.execution.producer.planner \
               --scope pull_request --change-scope code --targets cpu \
               --output "$RUNNER_TEMP/ci-plan/plan.json" --github-output "$GITHUB_OUTPUT"
@@ -107,10 +114,10 @@ jobs:
           fi
 
           echo "Stage 5: publish step outputs and summary"
-          printf 'change_route=%s\n' "$route" >> "$GITHUB_OUTPUT"
+          printf 'change_route=%s\n' "$effective_route" >> "$GITHUB_OUTPUT"
           images=$(sed -n 's/^images=//p' "$GITHUB_OUTPUT" | tail -n 1)
           printf '## Image PR route\n\n| route | images |\n|---|---|\n| %s | %s |\n' \
-            "$route" "$images" >> "$GITHUB_STEP_SUMMARY"
+            "$effective_route" "$images" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload plan
         if: always()
@@ -195,8 +202,6 @@ jobs:
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
       image: ${{ matrix.image }}
-      image_plan: ${{ matrix.image_plan }}
-      content_tag: ${{ matrix.content_tag }}
       target: ${{ matrix.target }}
       checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
       max_jobs: auto
@@ -242,26 +247,41 @@ jobs:
             fi
           }
           require_success plan "$PLAN_RESULT"
-          if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
-            echo "::error::no affected image entered the candidate matrix"
-            failed=1
-          fi
-          if [ "$CHANGE_ROUTE" = mixed ]; then
-            if [ "${CPU_JOB_COUNT:-0}" -lt 1 ]; then
-              echo "::error::mixed PR has no CPU Plan jobs"
+          if [ "$CHANGE_ROUTE" = no_image ]; then
+            if [ "${IMAGE_COUNT:-0}" -ne 0 ]; then
+              echo "::error::no-image PR unexpectedly reported affected images"
               failed=1
             fi
-            require_success cpu-tests "$CPU_RESULT"
-          elif [ "$CHANGE_ROUTE" = image_only ]; then
             if [ "$CPU_RESULT" != skipped ]; then
-              echo "::error::CPU tests must be skipped for Dockerfile-only PRs"
+              echo "::error::CPU tests must be skipped when no image changed"
+              failed=1
+            fi
+            if [ "$CANDIDATE_RESULT" != skipped ]; then
+              echo "::error::candidate builds must be skipped when no image changed"
               failed=1
             fi
           else
-            echo "::error::Plan did not report image_only or mixed"
-            failed=1
+            if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
+              echo "::error::no affected image entered the candidate matrix"
+              failed=1
+            fi
+            if [ "$CHANGE_ROUTE" = mixed ]; then
+              if [ "${CPU_JOB_COUNT:-0}" -lt 1 ]; then
+                echo "::error::mixed PR has no CPU Plan jobs"
+                failed=1
+              fi
+              require_success cpu-tests "$CPU_RESULT"
+            elif [ "$CHANGE_ROUTE" = image_only ]; then
+              if [ "$CPU_RESULT" != skipped ]; then
+                echo "::error::CPU tests must be skipped for image-only PRs"
+                failed=1
+              fi
+            else
+              echo "::error::Plan did not report no_image, image_only or mixed"
+              failed=1
+            fi
+            require_success candidates "$CANDIDATE_RESULT"
           fi
-          require_success candidates "$CANDIDATE_RESULT"
           if [ "$failed" -ne 0 ]; then
             exit 1
           fi

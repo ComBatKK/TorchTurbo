@@ -29,6 +29,8 @@ def test_config_resources(config: CiConfig) -> None:
     ] == [
         "npu-default"
     ]
+    assert config.images["npu-default"].kind == "container"
+    assert config.images["npu-default"].ref == ""
     assert not [image for image in config.images.values() if image.target == "gpu"]
     assert set(config.venvs) == {
         "default",

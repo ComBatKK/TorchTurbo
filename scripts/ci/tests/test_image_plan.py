@@ -1,58 +1,138 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
-from scripts.ci.image.__main__ import main
-from scripts.ci.image.plan import ImageError, load_image_plan, plan_image, split_reference
-
-
-def test_image_plan_uses_cann_version_hardware_and_alias(repo_root: Path) -> None:
-    plan = plan_image(repo_root, "npu-default")
-
-    assert plan.alias == "cann9.0.0-a3-base"
-    assert plan.hardware == "a3"
-    assert plan.cann_version == "9.0.0"
-    assert plan.content_tag == f"cann9.0.0-a3-c{plan.content_hash}"
-    assert plan.content_ref.endswith(f":{plan.content_tag}")
-    assert plan.action == "resolve"
-    assert plan.repository.endswith("/ascend/torchturbo_npu")
+from scripts.ci.image.cli import main
+from scripts.ci.image.identity import image_plan, image_plans
+from scripts.ci.image.recipe import ImageError, split_reference
 
 
-def test_image_hash_ignores_business_code_and_tracks_dockerfile(
-    repo_root: Path, tmp_path: Path
-) -> None:
-    config_dir = tmp_path / "scripts" / "ci" / "config"
-    config_dir.mkdir(parents=True)
-    shutil.copy(repo_root / "scripts/ci/config/ci.yml", config_dir / "ci.yml")
-    shutil.copytree(repo_root / "scripts/ci/config/envs", config_dir / "envs")
-    (tmp_path / "tests/integration_tests/scripts").mkdir(parents=True)
-    (tmp_path / "tests/integration_tests/scripts/run_tests.py").write_text(
-        "", encoding="utf-8"
+def _write_repo(root: Path) -> Path:
+    config = root / "scripts/ci/config/ci.yml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "resources": {
+                    "targets": {"npu-a3": {"device": "npu", "hardware": "a3"}},
+                    "images": {
+                        "npu-default": {
+                            "target": "npu-a3",
+                            "kind": "container",
+                            "default": True,
+                            "recipe": {
+                                "ref": "registry.example/team/image:cann9.0.0-a3-base",
+                                "dockerfile": "docker/npu/Dockerfile_aarch64",
+                                "context": "docker/npu",
+                                "platform": "linux/arm64",
+                                "cann_version": "9.0.0",
+                                "revision": 1,
+                            },
+                        }
+                    },
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
     )
-    override = tmp_path / "tests/unit_tests/models/bailing_moe_v3_vl"
-    override.mkdir(parents=True)
-    (override / "test_lf_image_parity.py").write_text("", encoding="utf-8")
-    context = tmp_path / "docker" / "npu"
+    context = root / "docker/npu"
     context.mkdir(parents=True)
-    dockerfile = context / "Dockerfile_aarch64"
-    dockerfile.write_text("FROM example:cann@sha256:abc\n", encoding="utf-8")
+    (context / "Dockerfile_aarch64").write_text(
+        "FROM base:one\nCOPY setup.sh /setup.sh\n", encoding="utf-8"
+    )
+    (context / "setup.sh").write_text("echo one\n", encoding="utf-8")
+    return config
 
-    first = plan_image(tmp_path, "npu-default")
+
+def test_identity_tracks_recipe_and_the_whole_build_context(tmp_path: Path) -> None:
+    config = _write_repo(tmp_path)
+    first = image_plan(tmp_path, "npu-default")
+
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "business.py").write_text("value = 1\n", encoding="utf-8")
-    second = plan_image(tmp_path, "npu-default")
-    dockerfile.write_text("FROM example:cann@sha256:def\n", encoding="utf-8")
-    third = plan_image(tmp_path, "npu-default")
+    (tmp_path / "src/business.py").write_text("value = 1\n", encoding="utf-8")
+    assert image_plan(tmp_path, "npu-default").content_tag == first.content_tag
 
-    assert first.content_hash == second.content_hash
-    assert first.content_tag == second.content_tag
-    assert first.content_hash != third.content_hash
-    assert first.content_tag != third.content_tag
+    (tmp_path / "docker/npu/setup.sh").write_text("echo two\n", encoding="utf-8")
+    context_change = image_plan(tmp_path, "npu-default")
+    assert context_change.content_tag != first.content_tag
+
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["resources"]["images"]["npu-default"]["recipe"]["build_args"] = {
+        "PIP_INDEX_URL": "https://example.invalid"
+    }
+    config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    recipe_change = image_plan(tmp_path, "npu-default")
+    assert recipe_change.content_tag != context_change.content_tag
+
+
+def test_alias_is_not_part_of_content_identity(tmp_path: Path) -> None:
+    config = _write_repo(tmp_path)
+    first = image_plan(tmp_path, "npu-default")
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["resources"]["images"]["npu-default"]["recipe"]["ref"] = (
+        "registry.example/team/image:cann9.0.0-a3-next"
+    )
+    config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    assert image_plan(tmp_path, "npu-default").content_tag == first.content_tag
+
+
+def test_alias_must_include_cann_version_and_hardware(tmp_path: Path) -> None:
+    config = _write_repo(tmp_path)
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["resources"]["images"]["npu-default"]["recipe"]["ref"] = (
+        "registry.example/team/image:a3-base"
+    )
+    config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ImageError, match="alias must start with"):
+        image_plan(tmp_path, "npu-default")
+
+
+def test_build_inputs_must_stay_under_the_docker_trigger_root(tmp_path: Path) -> None:
+    config = _write_repo(tmp_path)
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["resources"]["images"]["npu-default"]["recipe"]["context"] = "src"
+    config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ImageError, match="must be under docker/"):
+        image_plan(tmp_path, "npu-default")
+
+
+def test_identity_can_be_computed_from_a_git_revision(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(tmp_path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    _write_repo(tmp_path)
+    git("init", "-q")
+    git("config", "user.email", "ci@example.invalid")
+    git("config", "user.name", "CI Test")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base_sha = git("rev-parse", "HEAD")
+    base = image_plan(tmp_path, "npu-default", revision=base_sha)
+
+    setup = tmp_path / "docker/npu/setup.sh"
+    setup.write_text("echo two\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "head")
+    head_sha = git("rev-parse", "HEAD")
+    head = image_plan(tmp_path, "npu-default", revision=head_sha)
+
+    assert base.content_tag != head.content_tag
+    assert image_plan(tmp_path, "npu-default").content_tag == head.content_tag
 
 
 def test_split_reference_handles_registry_port() -> None:
@@ -62,263 +142,58 @@ def test_split_reference_handles_registry_port() -> None:
     )
 
 
-def test_image_plan_round_trips_through_the_plan_artifact(
-    repo_root: Path, tmp_path: Path
-) -> None:
-    expected = plan_image(repo_root, "npu-default", policy="build_if_missing")
-    path = tmp_path / "image-plan.json"
-    path.write_text(json.dumps(expected.to_dict()), encoding="utf-8")
-
-    loaded = load_image_plan(path)
-
-    assert loaded == expected
+def test_image_plans_sort_and_reject_unknown_names(repo_root: Path) -> None:
+    plans = image_plans(repo_root)
+    assert [plan.name for plan in plans] == ["npu-default"]
+    with pytest.raises(ImageError, match="unknown logical image"):
+        image_plans(repo_root, names="missing")
 
 
-def test_candidate_build_can_be_blocked(repo_root: Path) -> None:
-    plan = plan_image(
-        repo_root,
-        "npu-default",
-        policy="build_if_missing",
-        build_allowed=False,
-    )
-    assert plan.action == "blocked"
+def test_plan_cli_outputs_only_the_public_matrix(repo_root: Path, tmp_path: Path) -> None:
+    changed = tmp_path / "changed.txt"
+    changed.write_text("docker/npu/Dockerfile_aarch64\n", encoding="utf-8")
+    output = tmp_path / "image-jobs.json"
+    github_output = tmp_path / "github-output"
 
-
-def test_alias_must_include_cann_version_and_hardware(tmp_path: Path) -> None:
-    config = tmp_path / "scripts/ci/config/ci.yml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        "resources:\n"
-        "  targets:\n"
-        "    npu-a3: {device: npu, hardware: a3}\n"
-        "  images:\n"
-        "    npu-default:\n"
-        "      target: npu-a3\n"
-        "      kind: container\n"
-        "      ref: registry.example/team/image:a3-base\n"
-        "      build:\n"
-        "        dockerfile: docker/npu/Dockerfile_aarch64\n"
-        "        context: docker/npu\n"
-        "        platform: linux/arm64\n"
-        "        cann_version: '9.0.0'\n",
-        encoding="utf-8",
-    )
-    context = tmp_path / "docker/npu"
-    context.mkdir(parents=True)
-    (context / "Dockerfile_aarch64").write_text("FROM base:one\n", encoding="utf-8")
-
-    with pytest.raises(ImageError, match="alias must start with"):
-        plan_image(tmp_path, "npu-default")
-
-
-def test_auto_policy_only_builds_when_image_inputs_change(tmp_path: Path) -> None:
-    def git(*args: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(tmp_path), *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-
-    ci_config = tmp_path / "scripts/ci/config/ci.yml"
-    ci_config.parent.mkdir(parents=True)
-    ci_config.write_text(
-        "resources:\n"
-        "  targets:\n"
-        "    npu-a3: {device: npu, hardware: a3}\n"
-        "  images:\n"
-        "    npu-default:\n"
-        "      target: npu-a3\n"
-        "      kind: container\n"
-        "      ref: registry.example/team/image:cann9.0.0-a3-base\n"
-        "      build:\n"
-        "        dockerfile: docker/npu/Dockerfile_aarch64\n"
-        "        context: docker/npu\n"
-        "        platform: linux/arm64\n"
-        "        cann_version: '9.0.0'\n",
-        encoding="utf-8",
-    )
-    context = tmp_path / "docker/npu"
-    context.mkdir(parents=True)
-    dockerfile = context / "Dockerfile_aarch64"
-    dockerfile.write_text("FROM base:one\n", encoding="utf-8")
-
-    git("init", "-q")
-    git("config", "user.email", "ci@example.invalid")
-    git("config", "user.name", "CI Test")
-    git("add", ".")
-    git("commit", "-qm", "base")
-    base_sha = git("rev-parse", "HEAD")
-
-    assert plan_image(tmp_path, "npu-default", base_sha=base_sha).action == "resolve"
-
-    dockerfile.write_text("FROM base:two\n", encoding="utf-8")
-    changed = plan_image(tmp_path, "npu-default", base_sha=base_sha)
-    assert changed.image_changed is True
-    assert changed.action == "build_if_missing"
-
-    blocked = plan_image(
-        tmp_path,
-        "npu-default",
-        base_sha=base_sha,
-        build_allowed=False,
-    )
-    assert blocked.action == "blocked"
-
-
-def test_image_identity_can_be_computed_from_a_git_revision(tmp_path: Path) -> None:
-    def git(*args: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(tmp_path), *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-
-    config = tmp_path / "scripts/ci/config/ci.yml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        "resources:\n"
-        "  targets:\n"
-        "    npu-a3: {device: npu, hardware: a3}\n"
-        "  images:\n"
-        "    npu-default:\n"
-        "      target: npu-a3\n"
-        "      kind: container\n"
-        "      ref: registry.example/team/image:cann9.0.0-a3-base\n"
-        "      build:\n"
-        "        dockerfile: docker/npu/Dockerfile_aarch64\n"
-        "        context: docker/npu\n"
-        "        platform: linux/arm64\n"
-        "        cann_version: '9.0.0'\n",
-        encoding="utf-8",
-    )
-    context = tmp_path / "docker/npu"
-    context.mkdir(parents=True)
-    dockerfile = context / "Dockerfile_aarch64"
-    dockerfile.write_text("FROM base:one\n", encoding="utf-8")
-
-    git("init", "-q")
-    git("config", "user.email", "ci@example.invalid")
-    git("config", "user.name", "CI Test")
-    git("add", ".")
-    git("commit", "-qm", "base")
-    base_sha = git("rev-parse", "HEAD")
-    base = plan_image(tmp_path, "npu-default", revision=base_sha)
-
-    dockerfile.write_text("FROM base:two\n", encoding="utf-8")
-    git("add", ".")
-    git("commit", "-qm", "head")
-    head_sha = git("rev-parse", "HEAD")
-    head = plan_image(tmp_path, "npu-default", revision=head_sha)
-
-    assert base.content_ref == f"{base.repository}:{base.content_tag}"
-    assert head.content_tag != base.content_tag
-    assert plan_image(tmp_path, "npu-default").content_tag == head.content_tag
-
-
-def test_resolve_candidate_policy_uses_only_the_content_tag(repo_root: Path) -> None:
-    plan = plan_image(repo_root, "npu-default", policy="resolve_candidate")
-
-    assert plan.action == "resolve_candidate"
-
-
-def test_identity_cli_emits_a_content_ref_without_registry_access(
-    repo_root: Path, tmp_path: Path
-) -> None:
-    output = tmp_path / "github-output"
     assert main([
-        "identity",
-        "--root",
-        str(repo_root),
-        "--image",
-        "npu-default",
-        "--github-output",
-        str(output),
+        "plan",
+        "--root", str(repo_root),
+        "--changed-files", str(changed),
+        "--output", str(output),
+        "--github-output", str(github_output),
     ]) == 0
 
-    expected = plan_image(repo_root, "npu-default").content_ref
-    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert values["content_ref"] == expected
+    matrix = json.loads(output.read_text(encoding="utf-8"))
+    assert matrix == {
+        "include": [{
+            "image": "npu-default",
+            "target": "npu-a3",
+            "device": "npu",
+            "hardware": "a3",
+        }]
+    }
+    values = github_output.read_text(encoding="utf-8")
+    assert "image_count=1" in values
+    assert "images=npu-default" in values
+    assert "content_tag" not in values
+    assert "dockerfile" not in values
 
 
-def test_refs_cli_resolves_only_container_images(
-    repo_root: Path, tmp_path: Path
+def test_check_envs_cli_writes_toolchain_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    output = tmp_path / "image-refs"
-    assert main([
-        "refs",
-        "--root",
-        str(repo_root),
-        "--output",
-        str(output),
-    ]) == 0
+    from scripts.ci.image import cli
 
-    refs = dict(
-        line.split("=", 1)
-        for line in output.read_text(encoding="utf-8").splitlines()
-        if line
+    output = tmp_path / "envs.txt"
+    monkeypatch.setattr(
+        cli,
+        "check_envs",
+        lambda: ["host=runner arch=arm64", "client=27.0.0", "buildx=v0.20.0"],
     )
-    expected = plan_image(repo_root, "npu-default").content_ref
-    assert refs == {"npu-default": expected}
 
-
-def test_refs_cli_bootstraps_from_worktree_when_base_has_no_ci_config(
-    tmp_path: Path,
-) -> None:
-    def git(*args: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(tmp_path), *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-
-    git("init", "-q")
-    git("config", "user.email", "ci@example.invalid")
-    git("config", "user.name", "CI Test")
-    (tmp_path / "README.md").write_text("bootstrap\n", encoding="utf-8")
-    git("add", ".")
-    git("commit", "-qm", "base without CI config")
-    base_sha = git("rev-parse", "HEAD")
-
-    config = tmp_path / "scripts/ci/config/ci.yml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        "resources:\n"
-        "  targets:\n"
-        "    npu-a3: {device: npu, hardware: a3}\n"
-        "  images:\n"
-        "    npu-default:\n"
-        "      target: npu-a3\n"
-        "      kind: container\n"
-        "      ref: registry.example/team/image:cann9.0.0-a3-base\n"
-        "      build:\n"
-        "        dockerfile: docker/npu/Dockerfile_aarch64\n"
-        "        context: docker/npu\n"
-        "        platform: linux/arm64\n"
-        "        cann_version: '9.0.0'\n",
-        encoding="utf-8",
-    )
-    context = tmp_path / "docker/npu"
-    context.mkdir(parents=True)
-    (context / "Dockerfile_aarch64").write_text("FROM base:one\n", encoding="utf-8")
-    git("add", ".")
-    git("commit", "-qm", "add CI config")
-
-    output = tmp_path / "image-refs"
-    assert main([
-        "refs",
-        "--root",
-        str(tmp_path),
-        "--revision",
-        base_sha,
-        "--output",
-        str(output),
-    ]) == 0
-
-    expected = plan_image(tmp_path, "npu-default").content_ref
-    assert output.read_text(encoding="utf-8") == f"npu-default={expected}\n"
+    assert main(["check-envs", "--output", str(output)]) == 0
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        "host=runner arch=arm64",
+        "client=27.0.0",
+        "buildx=v0.20.0",
+    ]
