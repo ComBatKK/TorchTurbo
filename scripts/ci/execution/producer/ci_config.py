@@ -63,6 +63,7 @@ class CiLane:
     capacity_slots: int
     runner_variable: str
     runner: str
+    container_options: str = "--user root"
 
 
 @dataclass(frozen=True)
@@ -207,14 +208,27 @@ class CiConfig:
         target: str | CiTarget,
         *,
         explicit: str | None = None,
+        image_override: str | None = None,
         scope_images: dict[str, str] | None = None,
         workload_images: dict[str, str] | None = None,
     ) -> CiImage:
         target_name = target.name if isinstance(target, CiTarget) else target
+        applied_override = None
+        if image_override:
+            override = self.images.get(image_override)
+            if override is None:
+                raise CiConfigError([Issue(
+                    "unknown-image",
+                    image_override,
+                    f"unknown image {image_override!r}",
+                )])
+            if override.target == target_name:
+                applied_override = image_override
         name = (
             explicit
-            or (scope_images or {}).get(target_name)
+            or applied_override
             or (workload_images or {}).get(target_name)
+            or (scope_images or {}).get(target_name)
         )
         return self.image_for(target_name, name)
 
@@ -581,7 +595,13 @@ def _load_lanes(
         row = _row(
             value,
             where,
-            {"target", "capacity_slots", "runner_variable", "runner"},
+            {
+                "target",
+                "capacity_slots",
+                "runner_variable",
+                "runner",
+                "container_options",
+            },
             issues,
         )
         target = str(row.get("target") or "")
@@ -595,6 +615,7 @@ def _load_lanes(
             ),
             runner_variable=str(row.get("runner_variable") or ""),
             runner=str(row.get("runner") or ""),
+            container_options=str(row.get("container_options") or "--user root"),
         )
         if not lane.runner_variable or not lane.runner:
             issues.append(_issue(where, "runner_variable and runner are required"))

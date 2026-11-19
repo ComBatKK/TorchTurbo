@@ -42,8 +42,9 @@ def test_config_resources(config: CiConfig) -> None:
     assert config.pytest.job_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
     assert config.pytest.step_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
     suite = config.integration.suites["base_suite"]
-    assert suite.job_timeout_minutes == {"cpu": 40, "npu": 90}
-    assert suite.step_timeout_minutes == {"cpu": 40, "npu": 90}
+    assert suite.job_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
+    assert suite.step_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
+    assert config.lanes["npu/default-2"].container_options == "--user root"
 
 
 @pytest.mark.parametrize(
@@ -92,13 +93,24 @@ def test_image_resolution_precedence(config: CiConfig) -> None:
         target,
         scope_images=scope_image,
         workload_images=workload_image,
-    ).name == alternative.name
+    ).name == "npu-default"
     assert candidate.resolve_image(
         target,
-        explicit="npu-default",
+        image_override=alternative.name,
         scope_images=scope_image,
         workload_images=workload_image,
-    ).name == "npu-default"
+    ).name == alternative.name
+    assert candidate.resolve_image(
+        "cpu",
+        image_override=alternative.name,
+    ).name == "cpu-default"
+    assert candidate.resolve_image(
+        target,
+        explicit=alternative.name,
+        image_override="npu-default",
+        scope_images=scope_image,
+        workload_images=workload_image,
+    ).name == alternative.name
 
 
 def test_image_must_match_target(config: CiConfig) -> None:

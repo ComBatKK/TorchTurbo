@@ -123,6 +123,7 @@ def _build_pytest_jobs(
     facts: TestFacts,
     scope: Scope,
     issues: list[Issue],
+    image_override: str = "",
 ) -> tuple[list[Job], dict[str, Any], list[dict[str, str]]]:
     groups: dict[tuple[str, str, str, str], _PytestGroup] = {}
     selected_files = {suite: set() for suite in SUITES}
@@ -189,6 +190,7 @@ def _build_pytest_jobs(
                     image = config.resolve_image(
                         target,
                         explicit=image_name,
+                        image_override=image_override,
                         scope_images=scope.images,
                         workload_images=config.pytest.images,
                     )
@@ -320,6 +322,7 @@ def _build_integration_jobs(
     facts: TestFacts,
     scope: Scope,
     issues: list[Issue],
+    image_override: str = "",
 ) -> tuple[list[Job], dict[str, Any]]:
     jobs: list[Job] = []
     coverage: dict[str, Any] = {}
@@ -418,6 +421,7 @@ def _build_integration_jobs(
                     image = config.resolve_image(
                         target,
                         explicit=explicit_image,
+                        image_override=image_override,
                         scope_images=scope.images,
                         workload_images=suite.images,
                     )
@@ -455,8 +459,13 @@ def _build_integration_jobs(
     return jobs, coverage
 
 
-def _plan_inputs(config: CiConfig, facts: TestFacts, change_scope: str) -> dict[str, str]:
-    return {
+def _plan_inputs(
+    config: CiConfig,
+    facts: TestFacts,
+    change_scope: str,
+    image_override: str,
+) -> dict[str, str]:
+    inputs = {
         "config_digest": config.digest,
         "facts_digest": facts.digest,
         "image_refs_digest": digest({
@@ -464,6 +473,9 @@ def _plan_inputs(config: CiConfig, facts: TestFacts, change_scope: str) -> dict[
         }),
         "change_scope": change_scope,
     }
+    if image_override:
+        inputs["image_override"] = image_override
+    return inputs
 
 
 def _empty_coverage(config: CiConfig) -> dict[str, Any]:
@@ -488,6 +500,7 @@ def build(
     source: Source,
     *,
     change_scope: str = "code",
+    image_override: str = "",
 ) -> Plan:
     """Build a ready plan or raise PlanError with structured issues."""
     if change_scope not in {"code", "docs_only", "delegated"}:
@@ -500,27 +513,35 @@ def build(
         return build_plan(
             scope=scope.name,
             source=source,
-            inputs=_plan_inputs(config, facts, change_scope),
+            inputs=_plan_inputs(config, facts, change_scope, image_override),
             coverage=_empty_coverage(config),
             jobs=(),
         )
 
     issues: list[Issue] = []
     pytest_jobs, pytest_coverage, unsupported_routes = _build_pytest_jobs(
-        config, facts, scope, issues
+        config, facts, scope, issues, image_override
     )
     integration_jobs, integration_coverage = _build_integration_jobs(
-        config, facts, scope, issues
+        config, facts, scope, issues, image_override
     )
     jobs = sorted((*pytest_jobs, *integration_jobs), key=lambda job: job.id)
     if len({job.id for job in jobs}) != len(jobs):
         issues.append(_issue("plan.jobs", "job ids are not unique", "duplicate-job"))
+    if image_override and not any(
+        job.runtime.image.name == image_override for job in jobs
+    ):
+        issues.append(_issue(
+            "image_override",
+            f"image {image_override!r} was not selected by any job",
+            "unused-image-override",
+        ))
     if issues:
         raise PlanError(issues)
     return build_plan(
         scope=scope.name,
         source=source,
-        inputs=_plan_inputs(config, facts, change_scope),
+        inputs=_plan_inputs(config, facts, change_scope, image_override),
         coverage={
             "pytest": pytest_coverage,
             "integration": integration_coverage,
@@ -637,8 +658,16 @@ def validate_plan(plan: Plan, config: CiConfig, facts: TestFacts) -> list[Issue]
             f"does not match plan contents; expected {expected_id}",
         ))
     scope = plan.inputs.get("change_scope", "code")
+    image_override = plan.inputs.get("image_override", "")
     try:
-        expected = build(config, facts, plan.scope, plan.source, change_scope=scope)
+        expected = build(
+            config,
+            facts,
+            plan.scope,
+            plan.source,
+            change_scope=scope,
+            image_override=image_override,
+        )
         if target := plan.inputs.get("target_job"):
             expected = _selected_plan(expected, target_jobs=target)
         if targets := plan.inputs.get("targets"):
@@ -663,6 +692,7 @@ def artifact_for(
     target_job: str = "",
     targets: str = "",
     change_scope: str = "code",
+    image_override: str = "",
 ) -> PlanArtifact:
     values = tuple(issues)
     if not values and (config is None or facts is None):
@@ -674,7 +704,14 @@ def artifact_for(
     if config is None or facts is None or values:
         return build_plan_artifact(scope=scope_name, source=source, errors=values)
     try:
-        plan = build(config, facts, scope_name, source, change_scope=change_scope)
+        plan = build(
+            config,
+            facts,
+            scope_name,
+            source,
+            change_scope=change_scope,
+            image_override=image_override,
+        )
         if target_job or targets:
             plan = _selected_plan(plan, target_jobs=target_job, targets=targets)
     except PlanError as exc:
@@ -685,16 +722,23 @@ def artifact_for(
 def matrix_outputs(plan: Plan, config: CiConfig) -> dict[str, list[dict[str, Any]]]:
     """Build platform matrix entries without embedding full job payloads."""
     output = {f"{device}_jobs": [] for device in ("cpu", "npu", "gpu")}
+    output["container_jobs"] = []
     for job in plan.jobs:
         lane = config.lanes[job.runtime.lane]
-        output[f"{job.runtime.device}_jobs"].append({
+        item = {
             "job_id": job.id,
             "display_name": _matrix_display_name(job, config),
             "image_ref": job.runtime.image.ref,
+            "device": job.runtime.device,
+            "target": job.runtime.target,
             "runner_variable": lane.runner_variable,
             "runner": lane.runner,
+            "container_options": lane.container_options,
             "timeout_minutes": job.timeout_minutes,
-        })
+        }
+        output[f"{job.runtime.device}_jobs"].append(item)
+        if job.runtime.device != "cpu":
+            output["container_jobs"].append(item)
     return output
 
 
@@ -745,6 +789,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", default="")
     parser.add_argument("--github-output", default="")
     parser.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
+    parser.add_argument(
+        "--image",
+        default="",
+        help="logical image selected for jobs without an explicit test/case image",
+    )
     parser.add_argument("--source-repository", default="")
     parser.add_argument("--source-ref", default="")
     parser.add_argument("--source-sha", default="")
@@ -845,6 +894,7 @@ def main(argv: list[str]) -> int:
         target_job=args.target_job,
         targets=args.targets,
         change_scope=args.change_scope,
+        image_override=args.image,
     )
     if args.output:
         write_json(Path(args.output), artifact.to_dict())

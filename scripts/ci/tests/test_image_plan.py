@@ -95,6 +95,37 @@ def test_alias_must_include_cann_version_and_hardware(tmp_path: Path) -> None:
         image_plan(tmp_path, "npu-default")
 
 
+def test_version_prefix_supports_non_cann_images(tmp_path: Path) -> None:
+    config = _write_repo(tmp_path)
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    document["resources"]["targets"] = {
+        "gpu-h100": {"device": "gpu", "hardware": "h100"}
+    }
+    recipe = document["resources"]["images"]["npu-default"]["recipe"]
+    recipe.update({
+        "ref": "registry.example/team/image:cuda12.4-h100-base",
+        "dockerfile": "docker/gpu/Dockerfile",
+        "context": "docker/gpu",
+        "platform": "linux/amd64",
+        "version": "12.4",
+        "version_prefix": "cuda",
+    })
+    recipe.pop("cann_version")
+    document["resources"]["images"]["npu-default"].update({
+        "target": "gpu-h100",
+    })
+    config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    context = tmp_path / "docker/gpu"
+    context.mkdir(parents=True)
+    (context / "Dockerfile").write_text("FROM base:gpu\n", encoding="utf-8")
+
+    plan = image_plan(tmp_path, "npu-default")
+
+    assert plan.spec.version == "12.4"
+    assert plan.spec.version_prefix == "cuda"
+    assert plan.content_tag.startswith("cuda12.4-h100-c")
+
+
 def test_build_inputs_must_stay_under_the_docker_trigger_root(tmp_path: Path) -> None:
     config = _write_repo(tmp_path)
     document = yaml.safe_load(config.read_text(encoding="utf-8"))
@@ -177,6 +208,28 @@ def test_plan_cli_outputs_only_the_public_matrix(repo_root: Path, tmp_path: Path
     assert "images=npu-default" in values
     assert "content_tag" not in values
     assert "dockerfile" not in values
+
+
+def test_plan_cli_accepts_no_changed_images(
+    repo_root: Path, tmp_path: Path
+) -> None:
+    changed = tmp_path / "changed.txt"
+    changed.write_text("src/model.py\n", encoding="utf-8")
+    output = tmp_path / "image-jobs.json"
+    github_output = tmp_path / "github-output"
+
+    assert main([
+        "plan",
+        "--root", str(repo_root),
+        "--changed-files", str(changed),
+        "--output", str(output),
+        "--github-output", str(github_output),
+    ]) == 0
+
+    assert json.loads(output.read_text(encoding="utf-8")) == {"include": []}
+    values = github_output.read_text(encoding="utf-8").splitlines()
+    assert "image_count=0" in values
+    assert "images=" in values
 
 
 def test_check_envs_cli_writes_toolchain_report(

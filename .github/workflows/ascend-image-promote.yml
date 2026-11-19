@@ -74,7 +74,8 @@ jobs:
             python3 -m scripts.ci.image plan --images "$IMAGES" "${common[@]}"
           else
             changed="$RUNNER_TEMP/ci-changed-files.txt"
-            git diff --name-only --no-renames "$BEFORE_SHA...HEAD" > "$changed"
+            git diff --name-only --diff-filter=AM --no-renames \
+              "$BEFORE_SHA...HEAD" > "$changed"
             python3 -m scripts.ci.image plan \
               --changed-files "$changed" "${common[@]}"
           fi

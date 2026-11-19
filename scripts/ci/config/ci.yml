@@ -23,7 +23,8 @@ resources:
         dockerfile: docker/npu/Dockerfile_aarch64
         context: docker/npu
         platform: linux/arm64
-        cann_version: "9.0.0"
+        version: "9.0.0"
+        version_prefix: cann
         revision: 1
         build_args:
           GIT_HTTP_USER_AGENT: git/2.56.1
@@ -99,8 +100,8 @@ workloads:
       base_suite:
         runner: tests/integration_tests/scripts/run_tests.py
         defaults:
-          job_timeout_minutes: {cpu: 40, npu: 90}
-          step_timeout_minutes: {cpu: 40, npu: 90}
+          job_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
+          step_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
         framework_venvs:
           swift: swift
           llamafactory: lf

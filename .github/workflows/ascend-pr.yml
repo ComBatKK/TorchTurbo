@@ -107,8 +107,8 @@ jobs:
     outputs:
       cpu_jobs: ${{ steps.publish.outputs.cpu_jobs || '[]' }}
       cpu_job_count: ${{ steps.publish.outputs.cpu_job_count || '0' }}
-      npu_jobs: ${{ steps.publish.outputs.npu_jobs || '[]' }}
-      npu_job_count: ${{ steps.publish.outputs.npu_job_count || '0' }}
+      container_jobs: ${{ steps.publish.outputs.container_jobs || '[]' }}
+      container_job_count: ${{ steps.publish.outputs.container_job_count || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -219,6 +219,9 @@ jobs:
           fi
           if [ -n "$CI_TARGETS" ]; then
             COMMON+=(--targets "$CI_TARGETS")
+          fi
+          if [ -n "$CI_IMAGE_REF" ]; then
+            COMMON+=(--image "$CI_IMAGE_NAME")
           fi
           if [ "$CHANGE_SCOPE" = delegated ]; then
             echo "Dockerfile PR is delegated to Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
@@ -363,22 +366,22 @@ jobs:
             exit 1
           fi
 
-  npu:
-    name: Ascend-PR-NPU (${{ matrix.job_id }})
+  container:
+    name: Ascend-PR-Container (${{ matrix.job_id }})
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
-      needs.plan.outputs.npu_job_count != '0'
+      needs.plan.outputs.container_job_count != '0'
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: ${{ fromJSON(vars.CI_CONTAINER_MAX_PARALLEL || '2') }}
       matrix:
-        include: ${{ fromJSON(needs.plan.outputs.npu_jobs) }}
+        include: ${{ fromJSON(needs.plan.outputs.container_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     container:
       image: ${{ matrix.image_ref }}
-      options: --user root
+      options: ${{ matrix.container_options }}
     defaults:
       run:
         shell: bash
@@ -460,7 +463,7 @@ jobs:
 
   gate:
     name: Ascend-PR-Gate
-    needs: [plan, cpu, npu]
+    needs: [plan, cpu, container]
     if: ${{ always() }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10

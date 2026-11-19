@@ -91,7 +91,7 @@ def identity_digest(root: Path, spec: ImageSpec, revision: str | None = None) ->
 def content_tag(root: Path, spec: ImageSpec, revision: str | None = None) -> str:
     """Return the immutable candidate tag for a recipe."""
     digest = identity_digest(root, spec, revision)
-    return f"cann{spec.cann_version}-{spec.hardware}-c{digest}"
+    return f"{spec.version_prefix}{spec.version}-{spec.hardware}-c{digest}"
 
 
 def image_plans(

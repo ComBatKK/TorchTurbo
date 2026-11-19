@@ -3,7 +3,7 @@ run-name: Image PR ${{ format('#{0}', github.event.pull_request.number) }}
 
 # Dockerfile PR validation. One Plan job does lint, change routing, image
 # identity planning and CPU test planning:
-#   Plan -> CPU matrix -> per-image build -> NPU tests -> Gate
+#   Plan -> CPU matrix -> per-image build -> container tests -> Gate
 #
 # A mixed Dockerfile + code PR runs the CPU matrix before any build. Different
 # images remain independent reusable pipelines.
@@ -82,12 +82,8 @@ jobs:
           git diff --name-only --diff-filter=AM --no-renames \
             "$BASE_SHA...HEAD" > "$changed"
 
-          echo "Stage 2: classify non-image changes"
+          echo "Stage 2: route changes"
           route=$(python3 -m scripts.ci.routing.ci_router --changed-files "$changed")
-          case "$route" in
-            image_only|mixed) ;;
-            *) echo "::error::expected image_only or mixed; got $route"; exit 1 ;;
-          esac
 
           echo "Stage 3: select affected images from changed Dockerfiles"
           matrix="$RUNNER_TEMP/image-matrix.json"
@@ -97,11 +93,14 @@ jobs:
 
           image_count=$(sed -n 's/^image_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
           if [ "${image_count:-0}" -eq 0 ]; then
+            echo "No added or modified Dockerfile; skipping image work"
             effective_route=no_image
-          elif [ "$route" = mixed ]; then
-            effective_route=mixed
           else
-            effective_route=image_only
+            case "$route" in
+              image_only|mixed) ;;
+              *) echo "::error::image changes require image_only or mixed; got $route"; exit 1 ;;
+            esac
+            effective_route=$route
           fi
 
           echo "Stage 4: generate the CPU plan for mixed image PRs only"
@@ -187,8 +186,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  candidates:
-    name: Candidate image (${{ matrix.image }})
+  build_and_test_images:
+    name: Build and test image (${{ matrix.image }})
     needs: [plan, cpu-tests]
     if: |
       always() &&
@@ -213,7 +212,7 @@ jobs:
 
   gate:
     name: Image gate
-    needs: [plan, cpu-tests, candidates]
+    needs: [plan, cpu-tests, build_and_test_images]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 5
@@ -232,7 +231,7 @@ jobs:
           CHANGE_ROUTE: ${{ needs.plan.outputs.change_route }}
           CPU_JOB_COUNT: ${{ needs.plan.outputs.cpu_job_count }}
           CPU_RESULT: ${{ needs.cpu-tests.result }}
-          CANDIDATE_RESULT: ${{ needs.candidates.result }}
+          BUILD_AND_TEST_RESULT: ${{ needs.build_and_test_images.result }}
           IMAGE_COUNT: ${{ needs.plan.outputs.image_count }}
           IMAGES: ${{ needs.plan.outputs.images }}
         run: |
@@ -256,13 +255,13 @@ jobs:
               echo "::error::CPU tests must be skipped when no image changed"
               failed=1
             fi
-            if [ "$CANDIDATE_RESULT" != skipped ]; then
-              echo "::error::candidate builds must be skipped when no image changed"
+            if [ "$BUILD_AND_TEST_RESULT" != skipped ]; then
+              echo "::error::build-and-test image job must be skipped when no image changed"
               failed=1
             fi
           else
             if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
-              echo "::error::no affected image entered the candidate matrix"
+              echo "::error::no affected image entered the build-and-test image matrix"
               failed=1
             fi
             if [ "$CHANGE_ROUTE" = mixed ]; then
@@ -280,7 +279,7 @@ jobs:
               echo "::error::Plan did not report no_image, image_only or mixed"
               failed=1
             fi
-            require_success candidates "$CANDIDATE_RESULT"
+            require_success build-and-test-images "$BUILD_AND_TEST_RESULT"
           fi
           if [ "$failed" -ne 0 ]; then
             exit 1

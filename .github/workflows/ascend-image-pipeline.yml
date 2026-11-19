@@ -103,8 +103,8 @@ jobs:
       cancel-in-progress: false
     outputs:
       ref: ${{ steps.result.outputs.ref }}
-      npu_jobs: ${{ steps.plan.outputs.npu_jobs || '[]' }}
-      npu_job_count: ${{ steps.plan.outputs.npu_job_count || '0' }}
+      container_jobs: ${{ steps.plan.outputs.container_jobs || '[]' }}
+      container_job_count: ${{ steps.plan.outputs.container_job_count || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,6 +166,7 @@ jobs:
             --scope pull_request \
             --change-scope code \
             --targets "$TARGETS" \
+            --image "$IMAGE_NAME" \
             --image-ref "$IMAGE_NAME=$IMAGE_REF" \
             --source-repository "$GITHUB_REPOSITORY" \
             --source-ref "$SOURCE_REF" \
@@ -173,9 +174,9 @@ jobs:
             --output "$RUNNER_TEMP/ci-plan/plan.json" \
             --github-output "$matrix"
           cat "$matrix"
-          count=$(sed -n 's/^npu_job_count=//p' "$matrix" | tail -n 1)
+          count=$(sed -n 's/^container_job_count=//p' "$matrix" | tail -n 1)
           if [ "${count:-0}" -lt 1 ]; then
-            echo "::error::candidate tests produced no NPU jobs"
+            echo "::error::candidate tests produced no container jobs"
             exit 1
           fi
           cat "$matrix" >> "$GITHUB_OUTPUT"
@@ -214,22 +215,22 @@ jobs:
             echo "| built | \`${BUILT:-unknown}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  npu-tests:
-    name: NPU (${{ matrix.display_name }})
+  container-tests:
+    name: Container (${{ matrix.display_name }})
     needs: build
     if: |
       always() && needs.build.result == 'success' &&
-      needs.build.outputs.npu_job_count != '0'
+      needs.build.outputs.container_job_count != '0'
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: ${{ fromJSON(vars.CI_CONTAINER_MAX_PARALLEL || '2') }}
       matrix:
-        include: ${{ fromJSON(needs.build.outputs.npu_jobs) }}
+        include: ${{ fromJSON(needs.build.outputs.container_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     container:
       image: ${{ needs.build.outputs.ref }}
-      options: --user root
+      options: ${{ matrix.container_options }}
     defaults:
       run:
         shell: bash
@@ -267,7 +268,7 @@ jobs:
 
   gate:
     name: Candidate gate
-    needs: npu-tests
+    needs: container-tests
     if: always() && inputs.run_tests
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10

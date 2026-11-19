@@ -94,6 +94,7 @@ def test_docs_only_scope_has_no_jobs(
         "cpu_jobs": 0,
         "npu_jobs": 0,
         "gpu_jobs": 0,
+        "container_jobs": 0,
     }
 
 
@@ -233,6 +234,131 @@ def test_integration_case_target_routes_to_a5(
     assert validate_plan(plan, a5_config, a5_facts) == []
 
 
+def test_gpu_target_routes_to_the_container_matrix(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    target = CiTarget(name="gpu-h100", device="gpu", hardware="h100")
+    image = CiImage(
+        name="gpu-h100-default",
+        target=target.name,
+        kind="container",
+        ref="swr.example/torchturbo_gpu:h100",
+        default=True,
+    )
+    lane = CiLane(
+        name="gpu-h100/default-1",
+        target=target.name,
+        capacity_slots=1,
+        runner_variable="CI_GPU_H100_1_RUNNER",
+        runner="linux-x86_64-h100-1",
+        container_options="--user root --gpus all",
+    )
+    pr_scope = config.scope("pull_request")
+    gpu_scope = replace(
+        pr_scope,
+        targets=(*pr_scope.targets, target.name),
+        images={**pr_scope.images, target.name: image.name},
+    )
+    gpu_config = replace(
+        config,
+        targets={**config.targets, target.name: target},
+        images={**config.images, image.name: image},
+        lanes={**config.lanes, lane.name: lane},
+        scopes={**config.scopes, pr_scope.name: gpu_scope},
+    )
+
+    plan = build(gpu_config, facts, "pull_request", source)
+    gpu_jobs = [job for job in plan.jobs if job.runtime.device == "gpu"]
+
+    assert len(gpu_jobs) == 1
+    assert gpu_jobs[0].runtime.target == "gpu-h100"
+    assert gpu_jobs[0].runtime.image.name == "gpu-h100-default"
+    assert gpu_jobs[0].runtime.lane == "gpu-h100/default-1"
+    matrices = matrix_outputs(plan, gpu_config)
+    assert matrices["gpu_jobs"][0]["job_id"] == gpu_jobs[0].id
+    assert matrices["gpu_jobs"][0]["container_options"] == (
+        "--user root --gpus all"
+    )
+    assert any(item["device"] == "gpu" for item in matrices["container_jobs"])
+    assert validate_plan(plan, gpu_config, facts) == []
+
+
+def test_pytest_workload_image_overrides_scope_image(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    target = config.targets["npu-a3"]
+    alternative = replace(
+        config.images["npu-default"],
+        name="npu-a3-cann9.2",
+        ref="swr.example/torchturbo_npu:cann9.2",
+        default=False,
+    )
+    pr_scope = config.scope("pull_request")
+    candidate = replace(
+        config,
+        images={**config.images, alternative.name: alternative},
+        pytest=replace(
+            config.pytest,
+            images={target.name: "npu-default"},
+        ),
+        scopes={
+            **config.scopes,
+            pr_scope.name: replace(
+                pr_scope,
+                images={target.name: alternative.name},
+            ),
+        },
+    )
+
+    plan = build(candidate, facts, "pull_request", source)
+    unit_job = next(
+        job for job in plan.jobs
+        if job.runtime.target == target.name and job.kind == "pytest"
+    )
+
+    assert unit_job.runtime.image.name == "npu-default"
+
+
+def test_image_override_selects_the_candidate_before_scope(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    target = config.targets["npu-a3"]
+    candidate_image = replace(
+        config.images["npu-default"],
+        name="npu-a3-cann9.2",
+        ref="swr.example/torchturbo_npu:cann9.2",
+        default=False,
+    )
+    pr_scope = config.scope("pull_request")
+    candidate = replace(
+        config,
+        images={**config.images, candidate_image.name: candidate_image},
+        scopes={
+            **config.scopes,
+            pr_scope.name: replace(
+                pr_scope,
+                images={target.name: "npu-default"},
+            ),
+        },
+    )
+
+    plan = build(
+        candidate,
+        facts,
+        "pull_request",
+        source,
+        image_override=candidate_image.name,
+    )
+    unit_job = next(
+        job for job in plan.jobs
+        if job.runtime.target == target.name and job.kind == "pytest"
+    )
+
+    assert unit_job.runtime.image.name == candidate_image.name
+    assert plan.inputs["image_override"] == candidate_image.name
+    assert validate_plan(plan, candidate, facts) == []
+
+
 def test_target_integration_job(
     config: CiConfig, facts: TestFacts, pr_plan: Plan, source
 ) -> None:
@@ -277,6 +403,7 @@ def test_target_cpu_and_npu_jobs_in_one_plan(
     matrices = matrix_outputs(artifact.plan, config)
     assert matrices["cpu_jobs"][0]["job_id"] == cpu
     assert matrices["npu_jobs"][0]["job_id"] == npu
+    assert matrices["container_jobs"][0]["job_id"] == npu
     assert matrices["cpu_jobs"][0]["display_name"] == "pytest-core-cpu-default"
     assert matrices["npu_jobs"][0]["display_name"] == "pytest-core-npu-a3-default"
     assert validate_plan(artifact.plan, config, facts) == []
@@ -383,9 +510,14 @@ def test_cli_uses_scope_and_writes_matrix(
     assert main([
         "--root", str(config.root),
         "--scope", "pull_request",
+        "--image", "npu-default",
         "--output", str(output),
         "--github-output", str(matrix),
     ]) == 0
     assert output.is_file()
+    artifact = load_plan_artifact(output)
+    assert artifact.plan is not None
+    assert artifact.plan.inputs["image_override"] == "npu-default"
     assert "cpu_job_count=5" in matrix.read_text(encoding="utf-8")
     assert "npu_job_count=2" in matrix.read_text(encoding="utf-8")
+    assert "container_job_count=2" in matrix.read_text(encoding="utf-8")

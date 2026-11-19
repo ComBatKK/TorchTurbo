@@ -38,7 +38,8 @@ class ImageSpec:
     dockerfile: str
     context: str
     platform: str
-    cann_version: str
+    version: str
+    version_prefix: str
     build_args: Mapping[str, str] = field(default_factory=dict)
     revision: int = 1
 
@@ -165,10 +166,21 @@ def _spec_from(
 ) -> ImageSpec:
     where = f"images.{name}"
     repository, alias = split_reference(_text(recipe.get("ref"), f"{where}.ref"))
-    cann_version = _text(recipe.get("cann_version"), f"{where}.cann_version")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cann_version):
-        raise ImageError(f"{where}.cann_version must be Docker-tag-safe")
-    alias_prefix = f"cann{cann_version}-{hardware}-"
+    version = _text(
+        recipe.get("version") or recipe.get("cann_version"),
+        f"{where}.version",
+    )
+    version_prefix = _text(
+        recipe.get("version_prefix") or "cann",
+        f"{where}.version_prefix",
+    )
+    for label, value in (
+        ("version", version),
+        ("version_prefix", version_prefix),
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+            raise ImageError(f"{where}.{label} must be Docker-tag-safe")
+    alias_prefix = f"{version_prefix}{version}-{hardware}-"
     if not alias.startswith(alias_prefix):
         raise ImageError(
             f"{where}.ref alias must start with {alias_prefix!r} so multiple "
@@ -190,7 +202,8 @@ def _spec_from(
         dockerfile=_build_input(recipe.get("dockerfile"), f"{where}.dockerfile"),
         context=_build_input(recipe.get("context"), f"{where}.context"),
         platform=_text(recipe.get("platform"), f"{where}.platform"),
-        cann_version=cann_version,
+        version=version,
+        version_prefix=version_prefix,
         build_args=build_args,
         revision=_integer(recipe.get("revision"), f"{where}.revision", 1),
     )

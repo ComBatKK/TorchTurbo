@@ -166,7 +166,8 @@ resources:
         dockerfile: docker/npu/Dockerfile_aarch64
         context: docker/npu
         platform: linux/arm64
-        cann_version: "9.0.0"
+        version: "9.0.0"
+        version_prefix: cann
         revision: 1
         build_args: {}
 ```
@@ -425,14 +426,23 @@ resources:
       capacity_slots: 2
       runner_variable: CI_NPU_A3_2_RUNNER
       runner: linux-aarch64-a3-800i-2
+      container_options: --user root
     npu-a5/default-2:
       target: npu-a5
       capacity_slots: 2
       runner_variable: CI_NPU_A5_2_RUNNER
       runner: linux-aarch64-a5-800i-2
+      container_options: --user root
+    gpu-h100/default-8:
+      target: gpu-h100
+      capacity_slots: 8
+      runner_variable: CI_GPU_H100_8_RUNNER
+      runner: linux-x86_64-h100-8
+      container_options: --user root --gpus all
 ```
 
 `lane` 不再包含 `image`。同一 target 的 2/4/8/16 卡 lane 可以复用任意兼容镜像。
+`container_options` 由 lane 声明并进入 execution matrix，workflow 不维护硬件分支。
 
 ### 4.2 image 选择与发布边界
 
@@ -440,10 +450,14 @@ Planner 在生成 Job 时只选择逻辑 image，优先级从具体到通用：
 
 ```text
 test/case 显式 image
-    > scope image[target]
     > workload/suite image[target]
+    > scope image[target]
     > target 的默认 image
 ```
+
+Image PR 的 candidate test 传入 `planner --image <candidate>`。该覆盖只作用于 candidate
+所属 target，优先级低于 test/case 显式绑定，高于 workload/suite、scope 和 target default，
+确保构建出的 candidate 实际进入测试，而不是回退到 scope 中的默认版本。
 
 示例：PR 使用 A3 稳定镜像，nightly 额外覆盖 A5 和新版 A3 镜像。
 
@@ -525,9 +539,30 @@ main merge
 - image engine、`ci.yml` 和 Dockerfile 之外的 `docker/**` 变更由普通 PR CI 验证。
 - 新增或修改 Dockerfile 自动触发 Image PR，并只选择映射到这些 Dockerfile 的镜像。
 - nightly 只运行当前 content tag 上的全量测试，不构建、不 promote 镜像。
-- alias 必须使用 `cann<cann_version>-<hardware>-...` 前缀，使多个 CANN 版本可以并存。
+- alias 必须使用 `<version_prefix><version>-<hardware>-...` 前缀，使多个运行时版本可以并存；
+  例如 CANN 使用 `cann9.2.0-a3-...`，CUDA 使用 `cuda12.4-h100-...`。
 - 禁止使用 `base-latest` 等无版本 alias。alias 是发布和回滚入口；CI 正确性只依赖
-  `cann<cann_version>-<hardware>-c<hash>` content tag。
+  `<version_prefix><version>-<hardware>-c<hash>` content tag。
+
+### 4.2.1 多硬件、多卡和多版本
+
+硬件、镜像版本、卡数和测试类型是多个独立资源维度，不做全量笛卡尔积：
+
+```text
+scope    选择本次覆盖的 target 和默认 image
+test     声明 device、target 和 ranks
+planner  解析唯一 image，并按 ranks 选择 lane
+```
+
+- `target` 只表达硬件，例如 `npu-a3`、`npu-a5`、`gpu-h100`。
+- `image` 表达某个 target 上的软件版本，例如 `npu-a3-cann9.0`、`npu-a3-cann9.2`。
+- 每个 target 可以配置多个 image，但只能有一个默认 image。
+- 未绑定 image 的测试使用 workload/suite、scope 或 target default。
+- 版本特例显式绑定 image，只在该版本运行；新增版本不会自动复制全部测试。
+- 默认版本切换后，通用测试整体迁移；旧版本只保留显式兼容测试或独立兼容 scope。
+- NPU/GPU 卡数只影响测试的 `ranks` 和 lane 选择，不复制测试套件。
+- A3/A5/GPU 共用一个 workflow；Planner 输出统一 `container_jobs`，不为每种硬件建立入口。
+- 统一容器矩阵的并发由 `CI_CONTAINER_MAX_PARALLEL` 控制，默认 2。
 
 ### 4.3 target 选择
 
@@ -566,7 +601,9 @@ Planner 仍按以下维度聚合 pytest：
 - 新增镜像版本不会增加 lane。
 - 新增 A3/A5 会增加 target 和对应 lane，但不会把 image 乘进 lane。
 - 只有 scope、case 或 test 明确选择多个 target/image 时，Job 数才会增加。
-- matrix 仍然只传 `job_id`、`image_ref`、`runner_variable`、`runner`、`timeout_minutes`，workflow 不参与 image 选择。
+- matrix 只传执行所需的 `job_id`、`image_ref`、`device`、`target`、`runner_variable`、
+  `runner`、`container_options` 和 `timeout_minutes`；CPU 使用 host runner，NPU/GPU 使用统一
+  `container_jobs`，workflow 不参与 image 选择。
 - Job ID 暂时保持原有 `suite/device/image/venv` 命名，避免 manual 命令失效；具体硬件代际记录在 `runtime.target` 中。
 
 ### 4.5 当前落地状态

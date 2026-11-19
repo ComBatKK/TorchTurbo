@@ -87,23 +87,22 @@ def test_changed_images_reject_unmapped_docker_input(repo_root: Path) -> None:
         select_images(repo_root, changed_files=["docker/other/Dockerfile_unknown"])
 
 
-def test_changed_images_require_a_configured_dockerfile(repo_root: Path) -> None:
-    with pytest.raises(SelectionError, match="no configured Dockerfile changed"):
-        select_images(repo_root, changed_files=["docs/ci.md"])
+def test_changed_files_without_dockerfile_select_no_images(repo_root: Path) -> None:
+    assert select_images(repo_root, changed_files=["docs/ci.md"]) == []
 
 
 def test_changed_context_does_not_trigger_an_image_build(tmp_path: Path) -> None:
     _write_two_image_repo(tmp_path)
 
-    with pytest.raises(SelectionError, match="no configured Dockerfile changed"):
-        select_images(tmp_path, changed_files=["docker/npu-a5/setup.sh"])
+    assert select_images(tmp_path, changed_files=["docker/npu-a5/setup.sh"]) == []
 
 
 def test_config_change_alone_does_not_trigger_an_image_build(tmp_path: Path) -> None:
     _write_two_image_repo(tmp_path)
 
-    with pytest.raises(SelectionError, match="no configured Dockerfile changed"):
-        select_images(tmp_path, changed_files=["scripts/ci/config/ci.yml"])
+    assert select_images(
+        tmp_path, changed_files=["scripts/ci/config/ci.yml"]
+    ) == []
 
 
 def test_named_images_can_select_all_or_explicit_names(repo_root: Path) -> None:

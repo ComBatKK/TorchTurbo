@@ -63,7 +63,7 @@ def _changed(
             + ", ".join(sorted(unmatched))
         )
     if not matched:
-        raise SelectionError("no configured Dockerfile changed; image pipeline has no work")
+        return []
     return _selected(matched.values())
 
 

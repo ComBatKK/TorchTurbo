@@ -89,13 +89,14 @@ changed files 路由到两个域；`contracts/` 和 `config/` 是共享边界。
 | Gate | PlanArtifact + 全部 JobResult | `decision.json` | 不重新选测 |
 
 测试域只读取逻辑镜像的 `target`、`kind` 和 `default`；同一个 `resources.images` 条目下
-的 `recipe` 对测试域不透明。Dockerfile、context、registry repository、alias、CANN 版本
-和 build args 全部位于 `recipe`，由 image 域独占解释。CI 只有一个 YAML 配置文件：
+的 `recipe` 对测试域不透明。Dockerfile、context、registry repository、alias、运行时
+版本（CANN/CUDA）和 build args 全部位于 `recipe`，由 image 域独占解释。CI 只有一个 YAML 配置文件：
 `scripts/ci/config/ci.yml`。跨域接口仍然只有逻辑镜像名和不可变 digest ref；workflow 不
 读取 content tag，也不传递内部 plan。
 
-Planner 按 CPU/NPU/GPU 输出 matrix。matrix 项只包含 `job_id`、`image_ref`、
-`runner_variable`、`runner`、`timeout_minutes`，完整 Job 只存在于 PlanArtifact。
+Planner 输出 `cpu_jobs` 和统一 `container_jobs`，同时保留按设备拆分的兼容输出。
+matrix 项只包含 `job_id`、`image_ref`、`device`、`target`、`runner_variable`、`runner`、
+`container_options`、`timeout_minutes`，完整 Job 只存在于 PlanArtifact。
 Planner 和 `ci.yml` 中 Job/Step 超时统一使用分钟，Executor 在启动子进程时转换为秒。
 
 Executor 执行前先写 `infra_error/executor-incomplete` 占位结果，结束时原子覆盖。即使
@@ -135,6 +136,10 @@ Image workflow 的唯一自动触发路径是 `docker/**/Dockerfile*`。普通 P
 Dockerfile；`ci.yml` 和 Dockerfile 之外的 `docker/**` 文件仍会参与普通 PR CI。Dockerfile
 未被任何 image recipe 映射时 Image plan fail closed，而不是静默跳过。recipe loader 强制
 Dockerfile 和 context 位于 `docker/**`。
+
+GitHub 的 `paths` 无法区分新增、修改和删除，所以删除 Dockerfile 也会触发 Image PR。
+workflow 只把 A/M 文件交给 image plan；没有 A/M Dockerfile 时输出 `image_count=0` 并
+以 `no_image` 成功跳过构建。被删除的 Dockerfile 如果仍被 `ci.yml` 引用，lint 会失败。
 
 `scripts/ci/image/**` 的代码和 workflow 不参与镜像 identity。`ci.yml` 中的 recipe、
 Dockerfile 和 build context 是 identity 输入；只有 Dockerfile 变化会自动构建 candidate
@@ -228,7 +233,7 @@ integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tens
   对应的 Dockerfile。只有新增或修改 Dockerfile 会触发 Image PR。
   Planner/Executor/Gate 只把 recipe 当作不透明字段；image 域负责 Dockerfile、context、
   alias、content tag 和 registry。
-- 新增 lane：改 `resources.lanes`，lane 只绑定 target 和 runner 容量，不绑定 image。
+- 新增 lane：改 `resources.lanes`，lane 只绑定 target、runner 容量和 `container_options`，不绑定 image。
   Planner 选择容量最小且满足 ranks 的 lane，不在 consumer 写平台分支。
 - 新增 venv：改 `resources.venvs`，可用 `extends` 复用依赖链；依赖文件内容计入 digest。
 - 新增 pytest：普通 CPU 用例无需 device marker，会自动归入 `cpu`；NPU/GPU 用例必须补
@@ -298,6 +303,7 @@ python3 -m scripts.ci.execution.producer.planner \
 python3 -m scripts.ci.execution.producer.planner \
   --scope pull_request \
   --targets npu-a3 \
+  --image npu-default \
   --image-ref "npu-default=<candidate-digest-ref>" \
   --output /tmp/pr-npu-plan.json
 
