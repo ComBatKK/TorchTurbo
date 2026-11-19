@@ -271,7 +271,6 @@ def _hash_from_files(
     files: Mapping[str, str],
 ) -> str:
     payload = {
-        "schema": IMAGE_SCHEMA_VERSION,
         "logical_image": spec.name,
         "target": spec.target,
         "hardware": spec.hardware,

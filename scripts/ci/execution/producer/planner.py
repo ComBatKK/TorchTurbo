@@ -31,7 +31,6 @@ from .facts import (
     load as load_facts,
 )
 from ...contracts.artifacts import (
-    SCHEMA_VERSION,
     SUITES,
     CommandSpec,
     IntegrationSpec,
@@ -631,8 +630,6 @@ def _selected_plan(
 def validate_plan(plan: Plan, config: CiConfig, facts: TestFacts) -> list[Issue]:
     """Check a plan by rebuilding the Plan its inputs must produce."""
     issues: list[Issue] = []
-    if plan.schema_version != SCHEMA_VERSION:
-        issues.append(_issue("plan.schema_version", f"expected {SCHEMA_VERSION}"))
     expected_id = plan_digest(plan)
     if plan.plan_id != expected_id:
         issues.append(_issue(

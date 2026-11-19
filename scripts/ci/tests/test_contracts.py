@@ -12,6 +12,7 @@ from scripts.ci.contracts.artifacts import (
     JobResult,
     PytestEvidence,
     StepResult,
+    build_plan_artifact,
     digest,
     load_job_result,
     load_plan,
@@ -25,8 +26,19 @@ def test_plan_round_trip(tmp_path: Path, pr_plan) -> None:
     write_json(path, pr_plan.to_dict())
     loaded = load_plan(path)
     assert loaded.to_dict() == pr_plan.to_dict()
-    assert loaded.schema_version == SCHEMA_VERSION
     assert loaded.scope == "pull_request"
+
+
+def test_plan_artifact_owns_the_schema_version(pr_plan) -> None:
+    artifact = build_plan_artifact(
+        scope=pr_plan.scope,
+        source=pr_plan.source,
+        plan=pr_plan,
+    )
+
+    payload = artifact.to_dict()
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert "schema_version" not in payload["plan"]
 
 
 def test_plan_rejects_unknown_field(tmp_path: Path, pr_plan) -> None:

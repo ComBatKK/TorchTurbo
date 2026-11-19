@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 JOB_RESULT_FILENAME = "job-result.json"
 SUITES = ("core", "model", "adapter")
 JOB_KINDS = ("pytest", "integration")
@@ -125,7 +125,6 @@ class Job(Contract):
 
 @dataclass(frozen=True)
 class Plan(Contract):
-    schema_version: int
     plan_id: str
     scope: str
     source: Source
@@ -190,7 +189,6 @@ class JobResult(Contract):
 
 @dataclass(frozen=True)
 class Result(Contract):
-    schema_version: int
     plan_id: str
     jobs: tuple[JobResult, ...]
 
@@ -254,7 +252,6 @@ def build_plan(
     jobs: list[Job] | tuple[Job, ...],
 ) -> Plan:
     plan = Plan(
-        schema_version=SCHEMA_VERSION,
         plan_id="",
         scope=scope,
         source=source,
@@ -459,9 +456,6 @@ def _validate(value: Any, path: str) -> None:
         if any(step.kind != value.kind for step in value.steps):
             _fail(path, "contains a step with a different kind")
     if isinstance(value, Plan):
-        if value.schema_version != SCHEMA_VERSION:
-            _fail(f"{path}.schema_version",
-                  f"is {value.schema_version}, expected {SCHEMA_VERSION}")
         expected = plan_digest(value)
         if value.plan_id != expected:
             _fail(f"{path}.plan_id", f"does not match plan contents; expected {expected}")
@@ -509,7 +503,7 @@ def _validate(value: Any, path: str) -> None:
 
 
 def load_plan(path: Path) -> Plan:
-    """Load a Plan and verify its schema, fields, and content digest."""
+    """Load a Plan and verify its fields and content digest."""
     try:
         return _decode(Plan, read_json(path), "plan")
     except (OSError, ValueError) as exc:
@@ -543,4 +537,4 @@ def load_result(paths: list[Path]) -> Result:
     job_ids = [job.job_id for job in jobs]
     if len(set(job_ids)) != len(job_ids):
         raise ContractError("job results contain duplicate job_id values")
-    return Result(schema_version=SCHEMA_VERSION, plan_id=next(iter(plan_ids)), jobs=tuple(jobs))
+    return Result(plan_id=next(iter(plan_ids)), jobs=tuple(jobs))

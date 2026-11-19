@@ -61,7 +61,7 @@ scripts/ci/
   routing/            跨域变更路由，不执行测试
     change_router.py  changed files -> docs/code/image/mixed
   contracts/
-    artifacts.py      schema v3 artifact 编解码与校验
+    artifacts.py      schema v4 artifact 编解码与校验
   tools/
     lint.py           通用 linter + CI 契约检查
   tests/              config / facts / contracts / planner / executor / gate
@@ -302,4 +302,4 @@ python3 -m pytest scripts/ci/tests -q
 - CI 执行 integration 时固定 `--skip-install --forbid-update-golden`。
 - pytest 必须收集到测试；integration evidence 的 suite/case 必须与 Plan 一致。
 - skip 必须带原因，且原因出现在 Plan 的 `allowed_skip_reasons` 中。
-- 跨阶段只传带 `schema_version` 和内容 digest 的 JSON artifact。
+- 跨阶段只传带顶层 `schema_version` 和内容 digest 的 JSON artifact；嵌套对象不重复写版本。

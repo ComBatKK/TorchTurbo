@@ -50,8 +50,6 @@ def _failure(
 
 def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    if plan.schema_version != SCHEMA_VERSION:
-        failures.append(_failure("plan-schema", f"unsupported schema {plan.schema_version}"))
     job_ids: set[str] = set()
     step_ids: set[str] = set()
     test_routes: set[tuple[str, str, str]] = set()

@@ -574,7 +574,7 @@ Planner 仍按以下维度聚合 pytest：
 1. `ci.yml` 升级到 schema 2，使用 `resources.targets`、`resources.images`、`resources.lanes`。
 2. `lane.image` 已删除，lane 只绑定 target 和 runner 容量。
 3. Planner 使用统一 image 解析顺序和 `lane_for(target, ranks)`。
-4. `Runtime` 增加 `target`，artifact schema 升级到 3。
+4. `Runtime` 增加 `target`；artifact schema 升级到 4，版本只保留在顶层 artifact。
 5. 生产配置保留 `cpu` / `npu-a3`，PR 为 7 Job、nightly 为 12 Job。
 6. A5 通过临时配置单测覆盖；生产配置不声明不存在的 A5 runner。
 7. 测试入口使用 `cann9.0.0-a3-c<hash>` content tag；`cann9.0.0-a3-base` 只做发布别名。
@@ -590,7 +590,7 @@ Planner 仍按以下维度聚合 pytest：
 
 - `ci_config.py`：已实现 target/image/lane 模型、scope/workload image 覆盖和交叉校验。
 - `planner.py`：已实现 target 展开、统一 image 解析、`lane_for(target, ranks)` 和 runtime target。
-- `contracts/artifacts.py`：Job runtime 已增加 target 字段，artifact schema 为 3。
+- `contracts/artifacts.py`：Job runtime 已增加 target 字段；artifact schema 为 4，嵌套 Plan 不重复携带版本。
 - workflow：lint-plan 用 `refs` 解析全部 container content ref，matrix 已包含不可变
   `image_ref`；普通 PR 用 `targets` 做通用执行切片。
 - Image PR：changed Dockerfile 先映射为 affected images；混合 PR 只做一次 CPU 预检，
