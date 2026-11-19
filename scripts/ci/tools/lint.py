@@ -84,6 +84,7 @@ def _arch() -> str:
 
 
 PROBE = {"actionlint": "-version", "hadolint": "--version", "shellcheck": "--version"}
+SOURCE_ENTRYPOINTS = {"push", "pull_request", "pull_request_target", "merge_group", "schedule"}
 
 
 def _tool_path(name: str, version: str | None = None) -> Path | None:
@@ -315,6 +316,17 @@ def _job_run_text(job: dict) -> str:
     return "\n".join(chunks)
 
 
+def _trigger_names(document: dict) -> set[str]:
+    value = document.get(True, document.get("on")) or {}
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list):
+        return {str(item) for item in value}
+    if isinstance(value, dict):
+        return {str(item) for item in value}
+    return set()
+
+
 def _job_closure(jobs: dict[str, dict], name: str) -> set[str]:
     """Return every job reachable from `name` through `needs` edges."""
     seen: set[str] = set()
@@ -349,12 +361,23 @@ def check_contract() -> list[Problem]:
         plan_jobs = [name for name, job in jobs.items()
                      if "scripts.ci.execution.producer.planner" in _job_run_text(job)]
         if plan_jobs:
-            problems.extend(_check_planner_v2(rel, jobs, yaml.safe_dump(doc, allow_unicode=True)))
+            problems.extend(_check_planner_v2(
+                rel,
+                jobs,
+                yaml.safe_dump(doc, allow_unicode=True),
+                requires_lint=bool(_trigger_names(doc) & SOURCE_ENTRYPOINTS),
+            ))
             continue
     return problems
 
 
-def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
+def _check_planner_v2(
+    rel: str,
+    jobs: dict,
+    dumped: str,
+    *,
+    requires_lint: bool,
+) -> list[Problem]:
     """Validate the Planner -> Executor -> Gate topology."""
     problems: list[Problem] = []
     planners = [name for name, job in jobs.items()
@@ -364,7 +387,7 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     planner_name = planners[0]
     planner = jobs[planner_name]
     planner_body = _job_run_text(planner)
-    if not any(
+    if requires_lint and not any(
         marker in planner_body
         for marker in ("scripts/ci/tools/lint.py", "scripts.ci.tools.lint")
     ):

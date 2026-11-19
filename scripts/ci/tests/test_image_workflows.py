@@ -122,24 +122,34 @@ def test_image_pipeline_validation_is_serial_per_image(repo_root: Path) -> None:
     jobs = document["jobs"]
     dumped = yaml.safe_dump(document)
 
-    assert set(jobs) == {"build", "tests"}
+    assert set(jobs) == {"build", "npu-tests", "gate"}
     build = jobs["build"]
     assert "uses" not in build
-    assert set(build["outputs"]) == {"ref", "digest", "content_tag", "built"}
+    assert set(build["outputs"]) == {"ref", "npu_jobs", "npu_job_count"}
     assert build["concurrency"]["group"] == "image-${{ inputs.content_tag || inputs.image }}"
     assert "scripts.ci.image build" in dumped
     assert "scripts.ci.image resolve" not in dumped
     assert "inputs.image_mode" not in dumped
     assert "--plan-file" in dumped
-    assert "docker buildx" in dumped
-    assert "inputs.run_tests" in jobs["tests"]["if"]
-    assert jobs["tests"]["needs"] == "build"
-    assert jobs["tests"]["uses"] == "./.github/workflows/ascend-pr.yml"
-    assert jobs["tests"]["with"]["image_name"] == "${{ inputs.image }}"
-    assert jobs["tests"]["with"]["image_ref"] == "${{ needs.build.outputs.ref }}"
-    assert jobs["tests"]["with"]["targets"] == "${{ inputs.target }}"
+    assert "docker/login-action@v3" in dumped
+    assert "docker/setup-buildx-action@v3" in dumped
+    assert jobs["npu-tests"]["needs"] == "build"
+    assert jobs["gate"]["needs"] == "npu-tests"
+    assert "ascend-pr.yml" not in dumped
+    assert "scripts.ci.execution.producer.planner" in dumped
+    assert "--image-ref" in dumped
+    assert "${{ steps.result.outputs.ref }}" in yaml.safe_dump(build)
+    assert "${{ needs.build.outputs.ref }}" in yaml.safe_dump(jobs["npu-tests"]["container"])
+    assert "${{ inputs.target }}" in yaml.safe_dump(build)
+    assert "scripts.ci.tools.lint" not in dumped
+    assert "inputs.run_tests" in yaml.safe_dump(build)
     assert "smoke" not in dumped
-    assert "scripts.ci.execution.consumer" not in dumped
+    assert "scripts.ci.execution.consumer.executor" in yaml.safe_dump(jobs["npu-tests"])
+    assert "scripts.ci.execution.consumer.gate" in yaml.safe_dump(jobs["gate"])
+    assert jobs["npu-tests"]["name"] == "NPU (${{ matrix.display_name }})"
+    assert jobs["gate"]["name"] == "Candidate gate"
+    assert "ci-plan-${{ inputs.image }}" in dumped
+    assert "ci-result-${{ inputs.image }}" in dumped
     assert "scripts.ci.image promote" not in dumped
 
 

@@ -3,7 +3,9 @@ run-name: Candidate ${{ inputs.image }}
 
 # One logical image's candidate pipeline. The parent workflow expands this as a
 # matrix so different Dockerfiles run independently without global barriers.
-# Manual dispatch runs the same build path without the parent image PR workflow.
+# Candidate tests consume the immutable image digest and intentionally do not
+# reuse the complete PR workflow: the image path already ran lint and owns only
+# the build -> test-plan -> NPU -> gate lifecycle.
 
 on:
   workflow_call:
@@ -111,9 +113,8 @@ jobs:
       cancel-in-progress: false
     outputs:
       ref: ${{ steps.result.outputs.ref }}
-      digest: ${{ steps.result.outputs.digest }}
-      content_tag: ${{ steps.result.outputs.content_tag }}
-      built: ${{ steps.result.outputs.built }}
+      npu_jobs: ${{ steps.plan.outputs.npu_jobs || '[]' }}
+      npu_job_count: ${{ steps.plan.outputs.npu_job_count || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,39 +129,22 @@ jobs:
       - name: install CI dependencies
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
-      - name: check build environment
-        run: python3 -m scripts.ci.image env
-
       - name: log in to SWR
-        env:
-          SWR_USER: ${{ secrets.SWR_USERNAME }}
-          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
-          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
-        run: |
-          set -euo pipefail
-          : "${SWR_USER:?SWR_USERNAME is required for image builds}"
-          : "${SWR_PASS:?SWR_PASSWORD is required for image builds}"
-          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+          username: ${{ secrets.SWR_USERNAME }}
+          password: ${{ secrets.SWR_PASSWORD }}
 
-      - name: create buildx builder
-        id: builder
-        run: |
-          set -euo pipefail
-          name="imageci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          if docker buildx create --name "$name" --driver docker-container --use; then
-            docker buildx inspect --bootstrap >/dev/null
-            echo "name=$name" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::docker-container builder failed; falling back to the default builder"
-            echo "name=" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
 
       - name: build image
         id: result
         env:
           IMAGE: ${{ inputs.image }}
           IMAGE_PLAN: ${{ inputs.image_plan }}
-          BUILDER: ${{ steps.builder.outputs.name }}
           MAX_JOBS: ${{ inputs.max_jobs }}
           USE_CACHE: ${{ inputs.use_cache }}
         run: |
@@ -172,10 +156,51 @@ jobs:
             printf '%s' "$IMAGE_PLAN" > "$RUNNER_TEMP/image-plan.json"
             build+=(--plan-file "$RUNNER_TEMP/image-plan.json")
           fi
-          if [ -n "${BUILDER:-}" ]; then build+=(--builder "$BUILDER"); fi
           if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
           if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
           "${build[@]}"
+
+      - name: plan candidate tests
+        id: plan
+        if: inputs.run_tests
+        env:
+          TARGETS: ${{ inputs.target }}
+          IMAGE_NAME: ${{ inputs.image }}
+          IMAGE_REF: ${{ steps.result.outputs.ref }}
+          SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
+        run: |
+          set -euo pipefail
+          : "${TARGETS:?target is required when run_tests is true}"
+          : "${IMAGE_REF:?build did not publish an image ref}"
+          mkdir -p "$RUNNER_TEMP/ci-plan"
+          matrix="$RUNNER_TEMP/ci-matrix-output"
+          python3 -m scripts.ci.execution.producer.planner \
+            --root "$GITHUB_WORKSPACE" \
+            --scope pull_request \
+            --change-scope code \
+            --targets "$TARGETS" \
+            --image-ref "$IMAGE_NAME=$IMAGE_REF" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-ref "$SOURCE_REF" \
+            --source-sha "$(git rev-parse HEAD)" \
+            --output "$RUNNER_TEMP/ci-plan/plan.json" \
+            --github-output "$matrix"
+          cat "$matrix"
+          count=$(sed -n 's/^npu_job_count=//p' "$matrix" | tail -n 1)
+          if [ "${count:-0}" -lt 1 ]; then
+            echo "::error::candidate tests produced no NPU jobs"
+            exit 1
+          fi
+          cat "$matrix" >> "$GITHUB_OUTPUT"
+
+      - name: upload test plan
+        if: always() && inputs.run_tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: upload build log
         if: always()
@@ -204,22 +229,88 @@ jobs:
             echo "| built | \`${BUILT:-unknown}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: cleanup
-        if: always() && steps.builder.outputs.name != ''
-        continue-on-error: true
-        env:
-          BUILDER: ${{ steps.builder.outputs.name }}
-        run: docker buildx rm "$BUILDER"
-
-  tests:
-    name: Test
-    if: inputs.run_tests
+  npu-tests:
+    name: NPU (${{ matrix.display_name }})
     needs: build
-    uses: ./.github/workflows/ascend-pr.yml
-    with:
-      mode: pr
-      scope: pull_request
-      targets: ${{ inputs.target }}
-      checkout_ref: ${{ inputs.checkout_ref }}
-      image_name: ${{ inputs.image }}
-      image_ref: ${{ needs.build.outputs.ref }}
+    if: |
+      always() && needs.build.result == 'success' &&
+      needs.build.outputs.npu_job_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.build.outputs.npu_jobs) }}
+    runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    container:
+      image: ${{ needs.build.outputs.ref }}
+      options: --user root
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
+        env:
+          RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
+          CI_VENV_ROOT: /tmp/turbo-ci-venv
+        run: |
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
+          python3 -m scripts.ci.execution.consumer.executor \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$result_root/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ inputs.image }}-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: Candidate gate
+    needs: npu-tests
+    if: always() && inputs.run_tests
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download plan
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: download results
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-result-${{ inputs.image }}-*
+          path: ${{ runner.temp }}/ci-results
+
+      - name: judge
+        env:
+          PLAN: ${{ runner.temp }}/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-results
+        run: |
+          python3 -m scripts.ci.execution.consumer.gate \
+            --plan "$PLAN" \
+            --results "$RESULTS" \
+            --summary "$GITHUB_STEP_SUMMARY"
