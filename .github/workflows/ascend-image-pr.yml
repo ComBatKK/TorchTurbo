@@ -1,7 +1,7 @@
 name: Ascend Image PR
 run-name: Image PR ${{ format('#{0}', github.event.pull_request.number) }}
 
-# Dockerfile PR validation. One Plan job does lint, change routing, image
+# Dockerfile PR validation. One Plan job does lint, change classification, image
 # identity planning and CPU test planning:
 #   Plan -> CPU matrix -> per-image build -> container tests -> Gate
 #
@@ -30,12 +30,12 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      change_route: ${{ steps.plan.outputs.change_route }}
-      cpu_jobs: ${{ steps.plan.outputs.cpu_jobs }}
-      cpu_job_count: ${{ steps.plan.outputs.cpu_job_count }}
-      image_jobs: ${{ steps.plan.outputs.image_jobs }}
-      image_count: ${{ steps.plan.outputs.image_count }}
-      images: ${{ steps.plan.outputs.images }}
+      change_kind: ${{ steps.images.outputs.change_kind }}
+      cpu_jobs: ${{ steps.cpu.outputs.cpu_jobs }}
+      cpu_job_count: ${{ steps.cpu.outputs.cpu_job_count }}
+      image_jobs: ${{ steps.images.outputs.image_jobs }}
+      image_count: ${{ steps.images.outputs.image_count }}
+      images: ${{ steps.images.outputs.images }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,53 +70,59 @@ jobs:
           echo "::error::fork image PR requires maintainer approval via the 'image-ci/run' label"
           exit 1
 
-      - name: Route and plan
-        id: plan
+      - name: classify changes
+        id: changes
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-
-          echo "Stage 1: collect changed files"
           changed="$RUNNER_TEMP/ci-changed-files.txt"
           git diff --name-only --diff-filter=AM --no-renames \
             "$BASE_SHA...HEAD" > "$changed"
+          kind=$(python3 -m scripts.ci.tools.change_kind --changed-files "$changed")
+          printf 'kind=%s\n' "$kind" >> "$GITHUB_OUTPUT"
 
-          echo "Stage 2: route changes"
-          route=$(python3 -m scripts.ci.routing.ci_router --changed-files "$changed")
-
-          echo "Stage 3: select affected images from changed Dockerfiles"
+      - name: select changed images
+        id: images
+        env:
+          KIND: ${{ steps.changes.outputs.kind }}
+        run: |
+          set -euo pipefail
+          changed="$RUNNER_TEMP/ci-changed-files.txt"
           matrix="$RUNNER_TEMP/image-matrix.json"
-          python3 -m scripts.ci.image plan \
+          python3 -m scripts.ci.image.cli plan \
             --root "$GITHUB_WORKSPACE" --changed-files "$changed" \
             --output "$matrix" --github-output "$GITHUB_OUTPUT"
 
           image_count=$(sed -n 's/^image_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
           if [ "${image_count:-0}" -eq 0 ]; then
             echo "No added or modified Dockerfile; skipping image work"
-            effective_route=no_image
+            effective_kind=no_image
           else
-            case "$route" in
+            case "$KIND" in
               image_only|mixed) ;;
-              *) echo "::error::image changes require image_only or mixed; got $route"; exit 1 ;;
+              *) echo "::error::image changes require image_only or mixed; got $KIND"; exit 1 ;;
             esac
-            effective_route=$route
+            effective_kind=$KIND
           fi
+          printf 'change_kind=%s\n' "$effective_kind" >> "$GITHUB_OUTPUT"
+          images=$(sed -n 's/^images=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          printf '## Image PR change kind\n\n| kind | images |\n|---|---|\n| %s | %s |\n' \
+            "$effective_kind" "$images" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Stage 4: generate the CPU plan for mixed image PRs only"
-          if [ "$effective_route" = mixed ]; then
-            python3 -m scripts.ci.execution.producer.planner \
-              --scope pull_request --change-scope code --targets cpu \
-              --output "$RUNNER_TEMP/ci-plan/plan.json" --github-output "$GITHUB_OUTPUT"
+      - name: plan CPU preflight
+        id: cpu
+        env:
+          CHANGE_KIND: ${{ steps.images.outputs.change_kind }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGE_KIND" = mixed ]; then
+            python3 -m scripts.ci.execution.producer.cli plan \
+              --scope pull_request --change-mode code --targets cpu \
+              --output "$RUNNER_TEMP/ci-plan/plan.json"
           else
             printf 'cpu_jobs=[]\ncpu_job_count=0\n' >> "$GITHUB_OUTPUT"
           fi
-
-          echo "Stage 5: publish step outputs and summary"
-          printf 'change_route=%s\n' "$effective_route" >> "$GITHUB_OUTPUT"
-          images=$(sed -n 's/^images=//p' "$GITHUB_OUTPUT" | tail -n 1)
-          printf '## Image PR route\n\n| route | images |\n|---|---|\n| %s | %s |\n' \
-            "$effective_route" "$images" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload plan
         if: always()
@@ -132,7 +138,7 @@ jobs:
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
-      needs.plan.outputs.change_route == 'mixed' &&
+      needs.plan.outputs.change_kind == 'mixed' &&
       needs.plan.outputs.cpu_job_count != '0'
     strategy:
       fail-fast: false
@@ -187,7 +193,7 @@ jobs:
           retention-days: 7
 
   build_and_test_images:
-    name: Build and test image (${{ matrix.image }})
+    name: Build and test image (${{ matrix.image_id }})
     needs: [plan, cpu-tests]
     if: |
       always() &&
@@ -200,7 +206,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.image_jobs) }}
     uses: ./.github/workflows/ascend-image-pipeline.yml
     with:
-      image: ${{ matrix.image }}
+      image_id: ${{ matrix.image_id }}
       target: ${{ matrix.target }}
       checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
       max_jobs: auto
@@ -228,7 +234,7 @@ jobs:
       - name: evaluate image PR pipeline
         env:
           PLAN_RESULT: ${{ needs.plan.result }}
-          CHANGE_ROUTE: ${{ needs.plan.outputs.change_route }}
+          CHANGE_KIND: ${{ needs.plan.outputs.change_kind }}
           CPU_JOB_COUNT: ${{ needs.plan.outputs.cpu_job_count }}
           CPU_RESULT: ${{ needs.cpu-tests.result }}
           BUILD_AND_TEST_RESULT: ${{ needs.build_and_test_images.result }}
@@ -246,7 +252,7 @@ jobs:
             fi
           }
           require_success plan "$PLAN_RESULT"
-          if [ "$CHANGE_ROUTE" = no_image ]; then
+          if [ "$CHANGE_KIND" = no_image ]; then
             if [ "${IMAGE_COUNT:-0}" -ne 0 ]; then
               echo "::error::no-image PR unexpectedly reported affected images"
               failed=1
@@ -264,13 +270,13 @@ jobs:
               echo "::error::no affected image entered the build-and-test image matrix"
               failed=1
             fi
-            if [ "$CHANGE_ROUTE" = mixed ]; then
+            if [ "$CHANGE_KIND" = mixed ]; then
               if [ "${CPU_JOB_COUNT:-0}" -lt 1 ]; then
                 echo "::error::mixed PR has no CPU Plan jobs"
                 failed=1
               fi
               require_success cpu-tests "$CPU_RESULT"
-            elif [ "$CHANGE_ROUTE" = image_only ]; then
+            elif [ "$CHANGE_KIND" = image_only ]; then
               if [ "$CPU_RESULT" != skipped ]; then
                 echo "::error::CPU tests must be skipped for image-only PRs"
                 failed=1
@@ -284,10 +290,10 @@ jobs:
           if [ "$failed" -ne 0 ]; then
             exit 1
           fi
-          echo "image PR pipeline passed for $CHANGE_ROUTE: $IMAGES" >> "$GITHUB_STEP_SUMMARY"
+          echo "image PR pipeline passed for $CHANGE_KIND: $IMAGES" >> "$GITHUB_STEP_SUMMARY"
 
       - name: download CPU Plan
-        if: always() && needs.plan.outputs.change_route == 'mixed'
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -295,7 +301,7 @@ jobs:
           path: ${{ runner.temp }}/ci-plan
 
       - name: download CPU results
-        if: always() && needs.plan.outputs.change_route == 'mixed'
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -303,7 +309,7 @@ jobs:
           path: ${{ runner.temp }}/ci-results
 
       - name: judge CPU Plan results
-        if: always() && needs.plan.outputs.change_route == 'mixed'
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
         env:
           PLAN: ${{ runner.temp }}/ci-plan/plan.json
           RESULTS: ${{ runner.temp }}/ci-results
@@ -315,7 +321,7 @@ jobs:
             echo "::error::missing CPU Plan artifact"
             exit 2
           fi
-          python3 -m scripts.ci.execution.consumer.gate \
+          python3 -m scripts.ci.execution.finalization.gate \
             --plan "$PLAN" \
             --results "$RESULTS" \
             --output "$DECISION" \

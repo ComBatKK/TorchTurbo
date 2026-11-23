@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pod environment checks, torch guard, and cleanup.
+"""Pod device checks, torch guard, and cleanup.
 
 Commands:
   probe    capture torch, then verify the selected CPU, NPU, or GPU stack

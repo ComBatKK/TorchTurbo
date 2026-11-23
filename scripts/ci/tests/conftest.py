@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -9,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.ci.contracts.artifacts import Source  # noqa: E402
-from scripts.ci.execution.producer.ci_config import (  # noqa: E402
+from scripts.ci.contracts.base import GitSource  # noqa: E402
+from scripts.ci.execution.producer.config import (  # noqa: E402
     CiConfig,
     Scope,
     load as load_config,
@@ -29,7 +30,13 @@ def repo_root() -> Path:
 
 @pytest.fixture(scope="session")
 def config() -> CiConfig:
-    return load_config(ROOT)
+    unbound = load_config(ROOT)
+    bindings = {
+        name: f"test.invalid/{name}@sha256:{hashlib.sha256(name.encode()).hexdigest()}"
+        for name, image in unbound.images.items()
+        if image.kind == "container"
+    }
+    return load_config(ROOT, image_refs=bindings)
 
 
 @pytest.fixture(scope="session")
@@ -38,7 +45,7 @@ def facts(config: CiConfig) -> TestFacts:
 
 
 @pytest.fixture(scope="session")
-def source(repo_root: Path) -> Source:
+def source(repo_root: Path) -> GitSource:
     return source_for(
         repo_root,
         repository="example/torchturbo",
@@ -58,10 +65,10 @@ def nightly_scope(config: CiConfig) -> Scope:
 
 
 @pytest.fixture(scope="session")
-def pr_plan(config: CiConfig, facts: TestFacts, source: Source):
+def pr_plan(config: CiConfig, facts: TestFacts, source: GitSource):
     return build(config, facts, "pull_request", source)
 
 
 @pytest.fixture(scope="session")
-def nightly_plan(config: CiConfig, facts: TestFacts, source: Source):
+def nightly_plan(config: CiConfig, facts: TestFacts, source: GitSource):
     return build(config, facts, "nightly", source)

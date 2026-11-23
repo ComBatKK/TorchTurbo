@@ -1,4 +1,4 @@
-"""Image release lifecycle: resolve, build, verify, and promote."""
+"""Resolve, build, verify, and promote immutable container images."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from ..contracts.image_contract import ImageBinding, ImageBuildResult
 from .identity import ImagePlan, image_plan, image_plans
-from .recipe import ImageConfigMissing, ImageError, split_reference
+from .recipe import ImageError, split_reference
 from .registry import Manifest, Registry, RegistryError, verify_manifest
 
 BUILD_LOG = Path("/tmp/build.log")
@@ -26,29 +27,79 @@ class BuildError(RuntimeError):
 
 @dataclass(frozen=True)
 class ImageResult:
-    name: str
-    target: str
-    ref: str
-    digest: str
-    built: bool
+    build: ImageBuildResult
     elapsed_seconds: int = 0
     alias: str = ""
     promoted: bool = False
 
+    @property
+    def image_id(self) -> str:
+        return self.build.binding.image_id
+
+    @property
+    def ref(self) -> str:
+        return self.build.binding.ref
+
+    @property
+    def digest(self) -> str:
+        return self.build.binding.digest
+
+    @property
+    def built(self) -> bool:
+        return self.build.built
+
     def to_dict(self) -> dict[str, object]:
-        value: dict[str, object] = {
-            "schema_version": 2,
-            "name": self.name,
-            "target": self.target,
-            "ref": self.ref,
-            "digest": self.digest,
-            "built": self.built,
+        return {
+            "schema_version": 1,
+            **self.build.to_dict(),
             "elapsed_seconds": self.elapsed_seconds,
+            "alias": self.alias,
+            "promoted": self.promoted,
         }
-        if self.alias:
-            value["alias"] = self.alias
-            value["promoted"] = self.promoted
-        return value
+
+
+def _source_sha(root: Path) -> str:
+    process = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    value = process.stdout.strip() if process.returncode == 0 else ""
+    return value or os.environ.get("GITHUB_SHA", "") or "local"
+
+
+def _binding(plan: ImagePlan, digest: str, repository: str = "") -> ImageBinding:
+    return ImageBinding(
+        image_id=plan.image_id,
+        target=plan.spec.target,
+        kind="container",
+        ref=f"{repository or plan.spec.repository}@{digest}",
+    )
+
+
+def _result(
+    plan: ImagePlan,
+    digest: str,
+    *,
+    built: bool,
+    elapsed: int = 0,
+    alias: str = "",
+    promoted: bool = False,
+    source_sha: str,
+    repository: str = "",
+) -> ImageResult:
+    return ImageResult(
+        build=ImageBuildResult(
+            binding=_binding(plan, digest, repository),
+            source_sha=source_sha,
+            build_input_hash=plan.build_input_hash,
+            platform=plan.spec.platform,
+            built=built,
+        ),
+        elapsed_seconds=elapsed,
+        alias=alias,
+        promoted=promoted,
+    )
 
 
 def _manifest_for_reference(
@@ -72,21 +123,12 @@ def _manifest_for_reference(
 def resolve_images(
     root: Path,
     *,
-    revision: str | None = None,
     names: str = "",
     overrides: Mapping[str, str] | None = None,
-) -> tuple[list[ImageResult], str]:
-    """Resolve logical images to immutable digest references."""
-    warning = ""
-    try:
-        plans = image_plans(root, names=names, revision=revision)
-    except ImageConfigMissing as exc:
-        if revision is None:
-            raise
-        warning = f"{exc}; using the checked-out CI configuration"
-        plans = image_plans(root, names=names, revision=None)
-
-    by_name = {plan.name: plan for plan in plans}
+) -> list[ImageResult]:
+    """Resolve logical image IDs to immutable digest references."""
+    plans = image_plans(root, names=names or "all")
+    by_name = {plan.image_id: plan for plan in plans}
     refs = dict(overrides or {})
     unknown = sorted(set(refs) - set(by_name))
     if unknown:
@@ -94,23 +136,22 @@ def resolve_images(
 
     registries: dict[str, Registry] = {}
     results: list[ImageResult] = []
+    source_sha = _source_sha(root)
     for plan in plans:
-        reference = refs.get(plan.name, plan.content_ref)
+        reference = refs.get(plan.image_id, plan.candidate_ref)
         repository, manifest = _manifest_for_reference(reference, registries)
-        results.append(
-            ImageResult(
-                name=plan.name,
-                target=plan.spec.target,
-                ref=f"{repository}@{manifest.digest}",
-                digest=manifest.digest,
-                built=False,
-            )
-        )
-    return results, warning
+        results.append(_result(
+            plan,
+            manifest.digest,
+            built=False,
+            source_sha=source_sha,
+            repository=repository,
+        ))
+    return results
 
 
 def format_refs(results: list[ImageResult]) -> str:
-    return "".join(f"{result.name}={result.ref}\n" for result in results)
+    return "".join(f"{result.image_id}={result.ref}\n" for result in results)
 
 
 def check_envs() -> list[str]:
@@ -170,7 +211,10 @@ def build_command(
         f"--file={dockerfile or spec.dockerfile}",
         f"--build-arg=MAX_JOBS={jobs}",
     ]
-    command += [f"--build-arg={key}={value}" for key, value in sorted(spec.build_args.items())]
+    command += [
+        f"--build-arg={key}={value}"
+        for key, value in sorted(spec.ci_build_args.items())
+    ]
     command += ["--provenance=false", "--sbom=false"]
     if use_cache:
         scope = f"torchturbo-{spec.alias}"
@@ -181,7 +225,7 @@ def build_command(
     if should_push:
         command += [
             "--tag",
-            plan.content_ref,
+            plan.candidate_ref,
             f"--metadata-file={metadata_file}",
             "--output=type=image,push=true,oci-mediatypes=false",
         ]
@@ -192,10 +236,10 @@ def build_command(
 
 
 def temporary_build_dockerfile(plan: ImagePlan, root: Path) -> tuple[str, Path | None]:
-    """Inject the GitCode UA workaround into a temporary Dockerfile."""
+    """Inject the GitCode user-agent workaround without changing identity."""
     path = root / plan.spec.dockerfile
     source = path.read_text(encoding="utf-8")
-    user_agent = plan.spec.build_args.get("GIT_HTTP_USER_AGENT", "")
+    user_agent = plan.spec.ci_build_args.get("GIT_HTTP_USER_AGENT", "")
     if not user_agent or "GIT_HTTP_USER_AGENT" in source:
         return plan.spec.dockerfile, None
     injected: list[str] = []
@@ -290,9 +334,9 @@ def build_candidate_image(
             raise BuildError(
                 f"image build failed (exit {process.returncode}); see {BUILD_LOG}"
             )
-        digest = _metadata_digest(metadata_file) or _inspect_digest(plan.content_ref)
+        digest = _metadata_digest(metadata_file) or _inspect_digest(plan.candidate_ref)
         if not digest.startswith("sha256:"):
-            raise BuildError(f"build did not publish a digest for {plan.content_ref}")
+            raise BuildError(f"build did not publish a digest for {plan.candidate_ref}")
         return digest, elapsed
     finally:
         if temporary is not None:
@@ -300,20 +344,9 @@ def build_candidate_image(
         Path(metadata_file).unlink(missing_ok=True)
 
 
-def _result(plan: ImagePlan, digest: str, *, built: bool, elapsed: int = 0) -> ImageResult:
-    return ImageResult(
-        name=plan.name,
-        target=plan.spec.target,
-        ref=f"{plan.spec.repository}@{digest}",
-        digest=digest,
-        built=built,
-        elapsed_seconds=elapsed,
-    )
-
-
 def ensure_image(
     root: Path,
-    image: str,
+    image_id: str,
     *,
     should_push: bool = True,
     use_cache: bool = True,
@@ -321,15 +354,20 @@ def ensure_image(
     jobs: str = "auto",
 ) -> ImageResult:
     """Return an immutable candidate, building it only when it is absent."""
-    plan = image_plan(root, image)
+    plan = image_plan(root, image_id)
     registry = Registry(plan.spec.repository)
-    existing = registry.manifest(plan.content_tag)
+    existing = registry.manifest(plan.candidate_tag)
     if existing is not None:
         verify_manifest(existing)
-        return _result(plan, existing.digest, built=False)
+        return _result(
+            plan,
+            existing.digest,
+            built=False,
+            source_sha=_source_sha(root),
+        )
     if not should_push:
         raise BuildError(
-            f"candidate {plan.content_ref} is absent and pushing is disabled"
+            f"candidate {plan.candidate_ref} is absent and pushing is disabled"
         )
     check_envs()
     digest, elapsed = build_candidate_image(
@@ -339,26 +377,33 @@ def ensure_image(
         builder=builder,
         jobs=max_jobs(jobs),
     )
-    manifest = registry.require(plan.content_tag)
+    manifest = registry.require(plan.candidate_tag)
     verify_manifest(manifest)
     if manifest.digest != digest:
         raise BuildError(
             f"built digest {digest} differs from registry {manifest.digest} "
-            f"for {plan.content_tag}"
+            f"for {plan.candidate_ref}"
         )
-    return _result(plan, manifest.digest, built=True, elapsed=elapsed)
+    return _result(
+        plan,
+        manifest.digest,
+        built=True,
+        elapsed=elapsed,
+        source_sha=_source_sha(root),
+    )
 
 
-def promote_image(root: Path, image: str, *, digest: str = "") -> ImageResult:
-    """Move a stable alias to the tested content candidate."""
-    plan = image_plan(root, image)
+def promote_image(root: Path, image_id: str, *, digest: str = "") -> ImageResult:
+    """Move the stable publish alias to the tested candidate."""
+    plan = image_plan(root, image_id)
     registry = Registry(plan.spec.repository)
-    content = registry.require(plan.content_tag)
-    verify_manifest(content)
-    target = digest or content.digest
-    if target != content.digest:
+    candidate = registry.require(plan.candidate_tag)
+    verify_manifest(candidate)
+    target = digest or candidate.digest
+    if target != candidate.digest:
         raise RegistryError(
-            f"requested digest {target} does not match {plan.content_tag}={content.digest}"
+            f"requested digest {target} does not match "
+            f"{plan.candidate_tag}={candidate.digest}"
         )
     check_envs()
     registry.promote(plan.spec.alias, target)
@@ -368,12 +413,11 @@ def promote_image(root: Path, image: str, *, digest: str = "") -> ImageResult:
             f"promote verification failed: {plan.spec.alias}={alias.digest}, "
             f"expected {target}"
         )
-    return ImageResult(
-        name=plan.name,
-        target=plan.spec.target,
-        ref=f"{plan.spec.repository}@{target}",
-        digest=target,
+    return _result(
+        plan,
+        target,
         built=False,
         alias=plan.spec.alias,
         promoted=True,
+        source_sha=_source_sha(root),
     )

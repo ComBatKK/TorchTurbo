@@ -2,41 +2,41 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.ci.routing.ci_router import (
-    ChangeRoute,
+from scripts.ci.tools.change_kind import (
+    ChangeKind,
+    classify_changes,
     main,
-    route_changes,
 )
 
 
-def test_router_handles_docs_code_and_image_changes() -> None:
-    assert route_changes([]) == ChangeRoute.CODE
-    assert route_changes(["docs/design.md", "README.md"]) == ChangeRoute.DOCS_ONLY
-    assert route_changes([
+def test_classify_changes_handles_docs_code_and_image_changes() -> None:
+    assert classify_changes([]) == ChangeKind.CODE
+    assert classify_changes(["docs/design.md", "README.md"]) == ChangeKind.DOCS_ONLY
+    assert classify_changes([
         "docs/design.md",
         "scripts/ci/execution/producer/planner.py",
-    ]) == ChangeRoute.CODE
-    assert route_changes(["requirements.txt"]) == ChangeRoute.CODE
-    assert route_changes(["docker/npu/Dockerfile_aarch64"]) == ChangeRoute.IMAGE_ONLY
-    assert route_changes(["docker/npu/setup.sh"]) == ChangeRoute.CODE
-    assert route_changes(["scripts/ci/config/ci.yml"]) == ChangeRoute.CODE
-    assert route_changes(["scripts/ci/image/selection.py"]) == ChangeRoute.CODE
-    assert route_changes([
+    ]) == ChangeKind.CODE
+    assert classify_changes(["requirements.txt"]) == ChangeKind.CODE
+    assert classify_changes(["docker/npu/Dockerfile_aarch64"]) == ChangeKind.IMAGE_ONLY
+    assert classify_changes(["docker/npu/setup.sh"]) == ChangeKind.CODE
+    assert classify_changes(["scripts/ci/config/ci.yml"]) == ChangeKind.CODE
+    assert classify_changes(["scripts/ci/image/selection.py"]) == ChangeKind.CODE
+    assert classify_changes([
         "docker/npu/Dockerfile_aarch64",
         "docs/design.md",
-    ]) == ChangeRoute.IMAGE_ONLY
-    assert route_changes([
+    ]) == ChangeKind.IMAGE_ONLY
+    assert classify_changes([
         "docker/npu/Dockerfile_aarch64",
         "scripts/ci/execution/producer/planner.py",
-    ]) == ChangeRoute.MIXED
-    assert route_changes([
+    ]) == ChangeKind.MIXED
+    assert classify_changes([
         "docker/npu-new/Dockerfile_new",
         "scripts/ci/config/ci.yml",
-    ]) == ChangeRoute.MIXED
-    assert route_changes([
+    ]) == ChangeKind.MIXED
+    assert classify_changes([
         "docker/npu/setup.sh",
         "scripts/ci/execution/producer/planner.py",
-    ]) == ChangeRoute.CODE
+    ]) == ChangeKind.CODE
 
 
 def test_cli_reads_changed_files(tmp_path: Path, capsys) -> None:

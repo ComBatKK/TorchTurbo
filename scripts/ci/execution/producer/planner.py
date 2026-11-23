@@ -1,62 +1,60 @@
 #!/usr/bin/env python3
-"""Compile CiConfig and TestFacts into a self-contained CI PlanArtifact."""
+"""Compile CI configuration and test facts into an execution plan."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import re
 import subprocess
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
-from ... import repository_root
-from .ci_config import (
+from ...contracts.base import Diagnostic, GitSource, SCHEMA_VERSION
+from ...contracts.planner_contract import (
+    CHANGE_MODES,
+    SUITES,
+    ExecutionPlan,
+    IntegrationSpec,
+    Job,
+    PlannerOutput,
+    PytestSpec,
+    Runtime,
+    TestTask,
+    plan_digest,
+)
+from .config import (
     CiConfig,
     CiConfigError,
     CiImage,
-    CiLane,
+    CiRunner,
     CiTarget,
-    IntegrationSuite,
     Scope,
-    load as load_config,
 )
-from .facts import (
-    FactsError,
-    IntegrationFact,
-    PytestFact,
-    TestFacts,
-    load as load_facts,
-)
-from ...contracts.artifacts import (
-    SUITES,
-    CommandSpec,
-    IntegrationSpec,
-    Issue,
-    Job,
-    Plan,
-    PlanArtifact,
-    PytestSpec,
-    Runtime,
-    Source,
-    Step,
-    build_plan,
-    build_plan_artifact,
-    canonical_json,
-    digest,
-    plan_digest,
-    write_json,
-)
+from .facts import IntegrationFact, PytestFact, TestFacts
 
 
 class PlanError(ValueError):
     """Raised when selected work cannot be compiled into a valid plan."""
 
-    def __init__(self, issues: Iterable[Issue]) -> None:
+    def __init__(self, issues: Iterable[Diagnostic]) -> None:
         self.issues = tuple(issues)
         super().__init__("; ".join(issue.message for issue in self.issues))
+
+
+@dataclass(frozen=True)
+class ImageSelection:
+    index: int
+    image: CiImage
+    test_areas: tuple[str, ...] | None
+
+    def selects_pytest(self, suite: str) -> bool:
+        return self._selects(f"pytest/{suite}")
+
+    def selects_integration(self, suite: str, case_id: str) -> bool:
+        return self._selects(f"integration/{suite}/{case_id}")
+
+    def _selects(self, area_id: str) -> bool:
+        return self.test_areas is None or area_id in self.test_areas
 
 
 @dataclass
@@ -67,19 +65,69 @@ class _PytestGroup:
     image: CiImage
     venv_name: str
     entries: list[PytestFact] = field(default_factory=list)
+    paths: set[str] = field(default_factory=set)
     max_ranks: int = 1
 
 
-def _issue(path: str, message: str, code: str = "invalid-plan") -> Issue:
-    return Issue(code=code, path=path, message=message)
+def _issue(path: str, message: str, code: str = "invalid-plan") -> Diagnostic:
+    return Diagnostic(code=code, location=path, message=message)
 
 
-def _slug(value: str) -> str:
+def slugify(value: str) -> str:
+    """Return a lowercase identifier safe for Job IDs."""
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "job"
 
 
 def _marker(device: str) -> str:
     return "cpu" if device == "cpu" else f"{device} or multi_{device}"
+
+
+def _claim_job_id(base: str, seen: set[str], suffix: str) -> str:
+    if base not in seen:
+        seen.add(base)
+        return base
+    candidate = slugify(f"{base}-{suffix}")
+    index = 2
+    while candidate in seen:
+        candidate = slugify(f"{base}-{suffix}-{index}")
+        index += 1
+    seen.add(candidate)
+    return candidate
+
+
+def _selections(
+    config: CiConfig,
+    scope: Scope,
+    image_override: str,
+    issues: list[Diagnostic],
+) -> tuple[ImageSelection, ...]:
+    override = None
+    if image_override:
+        override = config.images.get(image_override)
+        if override is None:
+            issues.append(_issue(
+                "image_override",
+                f"unknown image {image_override!r}",
+                "unknown-image",
+            ))
+            return ()
+    values: list[ImageSelection] = []
+    for index, selection in enumerate(scope.selections):
+        configured = config.image_for(selection.image)
+        if override is not None:
+            if configured.target != override.target:
+                continue
+            image = override
+        else:
+            image = configured
+        values.append(ImageSelection(index, image, selection.test_areas))
+    if override is not None and not values:
+        issues.append(_issue(
+            "image_override",
+            f"scope {scope.name!r} has no selection for target {override.target!r}",
+            "unused-image-override",
+        ))
+    return tuple(values)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -91,11 +139,11 @@ def _git(root: Path, *args: str) -> str:
 
 def source_for(
     root: Path, *, repository: str = "", ref: str = "", sha: str = ""
-) -> Source:
-    return Source(
+) -> GitSource:
+    return GitSource(
         repository=repository or _git(root, "config", "--get", "remote.origin.url"),
-        ref=ref or _git(root, "rev-parse", "--abbrev-ref", "HEAD"),
-        sha=sha or _git(root, "rev-parse", "HEAD"),
+        git_ref=ref or _git(root, "rev-parse", "--abbrev-ref", "HEAD"),
+        commit_sha=sha or _git(root, "rev-parse", "HEAD"),
     )
 
 
@@ -106,172 +154,128 @@ def _runtime(
     ranks: int,
     image: CiImage,
     venv_name: str,
-    lane: CiLane,
+    runner: CiRunner,
 ) -> Runtime:
     return Runtime(
         device=device,
         target=target,
         ranks=ranks,
-        lane=lane.name,
+        runner=runner.name,
         image=image.as_ref(),
         venv=config.venvs[venv_name],
     )
 
 
-def _build_pytest_jobs(
+def _pytest_jobs(
     config: CiConfig,
     facts: TestFacts,
     scope: Scope,
-    issues: list[Issue],
-    image_override: str = "",
-) -> tuple[list[Job], dict[str, Any], list[dict[str, str]]]:
-    groups: dict[tuple[str, str, str, str], _PytestGroup] = {}
-    selected_files = {suite: set() for suite in SUITES}
-    selected_routes = {suite: set() for suite in SUITES}
-    unsupported: set[tuple[str, str]] = set()
-
-    for fact in facts.pytest:
-        if scope.pytest.get(fact.suite) != "all":
-            continue
-        selected_files[fact.suite].add(fact.path)
-        venv_name, venv_issues = config.resolve_pytest_venv(
-            fact.path, fact.model_families, fact.frameworks
-        )
-        issues.extend(venv_issues)
-        if venv_issues:
-            continue
-        if venv_name not in config.venvs:
-            issues.append(_issue(
-                fact.path,
-                f"resolved venv {venv_name!r} is not defined",
-                "unknown-venv",
-            ))
-            continue
-        override = config.pytest.overrides.get(fact.path)
-        image_name = override.image if override is not None else None
-        required_targets = override.targets if override is not None else ()
-        if image_name in config.images and not required_targets:
-            required_targets = (config.images[image_name].target,)
-        invalid_targets = [
-            name for name in required_targets
-            if config.targets[name].device not in fact.devices
-        ]
-        if invalid_targets:
-            issues.append(_issue(
-                fact.path,
-                f"target override {invalid_targets[0]!r} has no matching test device",
-                "target-device",
-            ))
-            continue
-        for device in fact.devices:
-            ranks = fact.ranks_by_device.get(device, 1)
-            if not config.device_is_configured(device):
-                unsupported.add((fact.path, device))
+    selections: tuple[ImageSelection, ...],
+    issues: list[Diagnostic],
+    used_areas: set[tuple[int, str]],
+    used_selections: set[int],
+) -> list[Job]:
+    groups: dict[tuple[str, ...], _PytestGroup] = {}
+    selected_suites = {
+        suite for suite in SUITES
+        if any(selection.selects_pytest(suite) for selection in selections)
+    }
+    suites_with_files = {
+        fact.suite for fact in facts.pytest if fact.suite in selected_suites
+    }
+    venvs: dict[str, str] = {}
+    for selection in selections:
+        target = config.target_for(selection.image.target)
+        for fact in facts.pytest:
+            if not selection.selects_pytest(fact.suite):
                 continue
-            required_for_device = tuple(
-                name for name in required_targets
-                if config.targets[name].device == device
+            if target.device not in fact.devices:
+                continue
+            if fact.path not in venvs:
+                venv_name, venv_issues = config.resolve_pytest_venv(
+                    fact.path, fact.model_families, fact.frameworks
+                )
+                issues.extend(venv_issues)
+                venvs[fact.path] = venv_name
+            venv_name = venvs[fact.path]
+            if not venv_name:
+                continue
+            key = (
+                fact.suite,
+                target.device,
+                target.name,
+                selection.image.name,
+                venv_name,
             )
-            if required_targets and not required_for_device:
-                continue
-            try:
-                targets = config.targets_for(
-                    device,
-                    scope.targets,
-                    required_for_device,
-                )
-            except CiConfigError as exc:
-                issues.extend(exc.issues)
-                continue
-            if not targets:
-                continue
-            for target in targets:
-                try:
-                    image = config.resolve_image(
-                        target,
-                        explicit=image_name,
-                        image_override=image_override,
-                        scope_images=scope.images,
-                        workload_images=config.pytest.images,
-                    )
-                    config.lane_for(target, ranks)
-                except CiConfigError as exc:
-                    issues.extend(exc.issues)
-                    continue
-                key = (fact.suite, target.name, image.name, venv_name)
-                group = groups.setdefault(
-                    key,
-                    _PytestGroup(
-                        suite=fact.suite,
-                        device=device,
-                        target=target,
-                        image=image,
-                        venv_name=venv_name,
-                    ),
-                )
+            group = groups.setdefault(
+                key,
+                _PytestGroup(
+                    suite=fact.suite,
+                    device=target.device,
+                    target=target,
+                    image=selection.image,
+                    venv_name=venv_name,
+                ),
+            )
+            if fact.path not in group.paths:
+                group.paths.add(fact.path)
                 group.entries.append(fact)
-                group.max_ranks = max(group.max_ranks, ranks)
-                selected_routes[fact.suite].add((fact.path, target.name))
+            group.max_ranks = max(
+                group.max_ranks, fact.ranks_by_device.get(target.device, 1)
+            )
+            used_areas.add((selection.index, f"pytest/{fact.suite}"))
+            used_selections.add(selection.index)
 
     jobs: list[Job] = []
     job_ids: set[str] = set()
     for key in sorted(groups):
         group = groups[key]
-        job_timeout = config.pytest.job_timeout_minutes.get(group.device)
-        step_timeout = config.pytest.step_timeout_minutes.get(group.device)
+        try:
+            runner = config.runner_for(group.target.name, group.max_ranks)
+        except CiConfigError as exc:
+            issues.extend(exc.issues)
+            continue
+        job_timeout = config.pytest_areas.job_timeout_minutes.get(group.device)
+        step_timeout = config.pytest_areas.step_timeout_minutes.get(group.device)
         if job_timeout is None or step_timeout is None:
             issues.append(_issue(
-                f"workloads.pytest.defaults.{group.device}",
+                f"test_areas.pytest.defaults.{group.device}",
                 "missing pytest timeout for selected device",
             ))
             continue
-        job_id = _slug(
-            f"pytest-{group.suite}-{group.device}-{group.image.name}-{group.venv_name}"
+        job_id = _claim_job_id(
+            slugify(
+                f"pytest-{group.suite}-{group.device}-"
+                f"{group.image.name}-{group.venv_name}"
+            ),
+            job_ids,
+            runner.name,
         )
-        if job_id in job_ids:
-            issues.append(_issue(
-                job_id,
-                f"duplicate pytest job id {job_id!r}",
-                "duplicate-job-id",
-            ))
-            continue
-        job_ids.add(job_id)
-        lane = config.lane_for(group.target, group.max_ranks)
-        steps_by_key: dict[tuple[str, str], list[PytestFact]] = {}
+        tasks_by_key: dict[tuple[str, str], list[PytestFact]] = {}
         for entry in group.entries:
-            steps_by_key.setdefault(
+            tasks_by_key.setdefault(
                 (entry.process_group, _marker(group.device)), []
             ).append(entry)
-        steps: list[Step] = []
-        for (process_group, marker), entries in sorted(steps_by_key.items()):
-            files = tuple(sorted({entry.path for entry in entries}))
-            steps.append(Step(
-                id=f"{job_id}/{_slug(process_group)}-{_slug(marker)}",
+        tasks = [
+            TestTask(
+                id=f"{job_id}/{slugify(process_group)}-{slugify(marker)}",
+                timeout_minutes=step_timeout,
+                spec=PytestSpec(
+                    suite=group.suite,
+                    test_files=tuple(sorted({entry.path for entry in entries})),
+                    device_marker=marker,
+                ),
                 kind="pytest",
                 ranks=max(
                     entry.ranks_by_device.get(group.device, 1) for entry in entries
                 ),
-                timeout_minutes=step_timeout,
-                spec=PytestSpec(
-                    suite=group.suite,
-                    frameworks=tuple(sorted({
-                        value for entry in entries for value in entry.frameworks
-                    })),
-                    model_families=tuple(sorted({
-                        value for entry in entries for value in entry.model_families
-                    })),
-                    marker=marker,
-                    process_group=process_group,
-                    tags=tuple(sorted({
-                        value for entry in entries for value in entry.tags
-                    })),
-                    files=files,
-                ),
-            ))
+            )
+            for (process_group, marker), entries in sorted(tasks_by_key.items())
+        ]
         jobs.append(Job(
             id=job_id,
             kind="pytest",
-            allowed_skip_reasons=scope.allow_skip.get(group.device, ()),
+            allowed_skip_reasons=(),
             timeout_minutes=job_timeout,
             runtime=_runtime(
                 config,
@@ -280,256 +284,207 @@ def _build_pytest_jobs(
                 group.max_ranks,
                 group.image,
                 group.venv_name,
-                lane,
+                runner,
             ),
-            steps=tuple(steps),
+            tasks=tuple(tasks),
         ))
-
-    coverage = {
-        suite: {
-            "mode": scope.pytest.get(suite, "none"),
-            "files": len(selected_files[suite]),
-            "routes": len(selected_routes[suite]),
-        }
-        for suite in SUITES
-    }
-    for suite in SUITES:
-        if scope.pytest.get(suite) == "all" and not selected_files[suite]:
-            issues.append(_issue(
-                f"scopes.{scope.name}.pytest.{suite}",
-                "selected suite contains no tests",
-                "empty-suite",
-            ))
-    unsupported_routes = [
-        {"path": path, "device": device} for path, device in sorted(unsupported)
-    ]
-    return jobs, coverage, unsupported_routes
+    for suite in selected_suites - suites_with_files:
+        issues.append(_issue(
+            f"scopes.{scope.name}.test_areas",
+            "selected suite contains no tests",
+            "empty-suite",
+        ))
+    return jobs
 
 
-def _integration_spec(suite: IntegrationSuite, case: IntegrationFact) -> IntegrationSpec:
-    return IntegrationSpec(
-        suite=case.suite,
-        case_id=case.case_id,
-        framework=case.framework,
-        config_digest=case.config_digest,
-        golden_digest=case.golden_digest,
-        runner=CommandSpec(script=suite.runner),
-    )
-
-
-def _build_integration_jobs(
+def _integration_jobs(
     config: CiConfig,
     facts: TestFacts,
     scope: Scope,
-    issues: list[Issue],
-    image_override: str = "",
-) -> tuple[list[Job], dict[str, Any]]:
-    jobs: list[Job] = []
-    coverage: dict[str, Any] = {}
-    for suite_name, suite in sorted(config.integration.suites.items()):
-        selection = scope.integration.get(suite_name)
-        mode = selection.mode if selection is not None else "none"
-        available = facts.integration_for(suite_name)
-        by_id = {case.case_id: case for case in available}
-        selected: list[IntegrationFact]
-        if mode == "none":
-            selected = []
-        elif mode == "all":
-            selected = list(available)
-            if not selected:
-                issues.append(_issue(
-                    f"scopes.{scope.name}.integration.{suite_name}",
-                    "all mode selected no integration cases",
-                    "empty-case-suite",
-                ))
+    selections: tuple[ImageSelection, ...],
+    issues: list[Diagnostic],
+    used_areas: set[tuple[int, str]],
+    used_selections: set[int],
+) -> list[Job]:
+    cases = {(case.suite, case.case_id): case for case in facts.integration}
+    selected: dict[int, list[IntegrationFact]] = {}
+    for selection in selections:
+        chosen: list[IntegrationFact] = []
+        if selection.test_areas is None:
+            chosen = list(facts.integration)
         else:
-            selected = []
-            for case_id in selection.cases if selection is not None else ():
-                case = by_id.get(case_id)
+            for area_id in selection.test_areas:
+                if not area_id.startswith("integration/"):
+                    continue
+                parts = area_id.split("/", 2)
+                case = cases.get((parts[1], parts[2])) if len(parts) == 3 else None
                 if case is None:
                     issues.append(_issue(
-                        f"scopes.{scope.name}.integration.{suite_name}.cases",
-                        f"unknown integration case {case_id!r}",
+                        f"scopes.{scope.name}.test_areas",
+                        f"unknown integration case in TestArea {area_id!r}",
                         "unknown-case",
                     ))
-                    continue
-                selected.append(case)
-        coverage[suite_name] = {
-            "mode": mode,
-            "cases": [case.case_id for case in selected],
-        }
-        for case in selected:
-            if not case.compare:
-                issues.append(_issue(
-                    case.case_id,
-                    "CI integration cases must compare metrics",
-                    "integration-compare-disabled",
-                ))
+                else:
+                    chosen.append(case)
+        selected[selection.index] = chosen
+
+    available_suites = {case.suite for case in facts.integration}
+    for suite_name in config.integration_areas.suites:
+        if suite_name not in available_suites and any(
+            selection.test_areas is None for selection in selections
+        ):
+            issues.append(_issue(
+                f"scopes.{scope.name}.test_areas",
+                f"suite {suite_name!r} contains no integration cases",
+                "empty-case-suite",
+            ))
+
+    jobs: list[Job] = []
+    job_ids: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
+    for selection in selections:
+        target = config.target_for(selection.image.target)
+        for case in selected[selection.index]:
+            if case.platform != target.device:
                 continue
-            venv_name = suite.framework_venvs.get(case.framework)
-            if venv_name is None:
-                issues.append(_issue(
-                    f"workloads.integration.suites.{suite_name}.framework_venvs",
-                    f"no venv for framework {case.framework!r}",
-                    "missing-framework-venv",
-                ))
+            if case.targets and target.name not in case.targets:
                 continue
-            if venv_name not in config.venvs:
-                issues.append(_issue(
-                    f"workloads.integration.suites.{suite_name}.framework_venvs.{case.framework}",
-                    f"unknown venv {venv_name!r}",
-                ))
-                continue
-            if not config.device_is_configured(case.platform):
-                issues.append(_issue(
-                    case.case_id,
-                    f"platform {case.platform!r} has no CI image or lane",
-                    "missing-integration-resource",
-                ))
-                continue
-            override = suite.overrides.get(case.case_id)
-            explicit_image = override.image if override is not None else None
-            required_targets = (
-                override.targets if override is not None and override.targets
-                else case.targets
-            )
-            if explicit_image in config.images and not required_targets:
-                required_targets = (config.images[explicit_image].target,)
             try:
-                targets = config.targets_for(
-                    case.platform,
-                    scope.targets,
-                    required_targets,
-                )
+                runner = config.runner_for(target.name, case.ranks)
             except CiConfigError as exc:
                 issues.extend(exc.issues)
                 continue
-            if not targets:
+            key = (case.suite, case.case_id, target.name, selection.image.name)
+            if key in seen:
                 continue
+            seen.add(key)
+            suite = config.integration_suite(case.suite)
             try:
-                job_timeout = suite.job_timeout_minutes_for(case.platform, case.case_id)
-                step_timeout = suite.step_timeout_minutes_for(case.platform, case.case_id)
+                job_timeout = suite.job_timeout_minutes_for(
+                    case.platform, case.case_id
+                )
+                step_timeout = suite.step_timeout_minutes_for(
+                    case.platform, case.case_id
+                )
             except KeyError:
                 issues.append(_issue(
-                    f"workloads.integration.suites.{suite_name}.defaults.{case.platform}",
+                    f"test_areas.integration.suites.{case.suite}."
+                    f"defaults.{case.platform}",
                     "missing integration timeout for selected platform",
                     "missing-timeout",
                 ))
                 continue
-            for target in targets:
-                try:
-                    image = config.resolve_image(
-                        target,
-                        explicit=explicit_image,
-                        image_override=image_override,
-                        scope_images=scope.images,
-                        workload_images=suite.images,
-                    )
-                    lane = config.lane_for(target, case.ranks)
-                except CiConfigError as exc:
-                    issues.extend(exc.issues)
-                    continue
-                base_id = _slug(f"integration-{suite_name}-{case.case_id}")
-                job_id = (
-                    _slug(f"{base_id}-{target.name}")
-                    if len(targets) > 1 else base_id
-                )
-                jobs.append(Job(
-                    id=job_id,
-                    kind="integration",
-                    allowed_skip_reasons=scope.allow_skip.get(case.platform, ()),
-                    timeout_minutes=job_timeout,
-                    runtime=_runtime(
-                        config,
-                        case.platform,
-                        target.name,
-                        case.ranks,
-                        image,
-                        venv_name,
-                        lane,
+            used_areas.add((
+                selection.index,
+                f"integration/{case.suite}/{case.case_id}",
+            ))
+            used_selections.add(selection.index)
+            job_id = _claim_job_id(
+                slugify(f"integration-{case.suite}-{case.case_id}"),
+                job_ids,
+                f"{target.name}-{selection.image.name}-{runner.name}",
+            )
+            jobs.append(Job(
+                id=job_id,
+                kind="integration",
+                allowed_skip_reasons=(),
+                timeout_minutes=job_timeout,
+                runtime=_runtime(
+                    config,
+                    case.platform,
+                    target.name,
+                    case.ranks,
+                    selection.image,
+                    suite.framework_venvs[case.framework],
+                    runner,
+                ),
+                tasks=(TestTask(
+                    id=f"{job_id}/run",
+                    timeout_minutes=step_timeout,
+                    spec=IntegrationSpec(
+                        suite=case.suite,
+                        case_id=case.case_id,
+                        framework=case.framework,
+                        runner_script=suite.runner,
+                        config_sha256=case.config_sha256,
+                        golden_sha256=case.golden_sha256,
                     ),
-                    steps=(Step(
-                        id=f"{job_id}/run",
-                        kind="integration",
-                        ranks=case.ranks,
-                        timeout_minutes=step_timeout,
-                        spec=_integration_spec(suite, case),
-                    ),),
-                ))
-    return jobs, coverage
-
-
-def _plan_inputs(
-    config: CiConfig,
-    facts: TestFacts,
-    change_scope: str,
-    image_override: str,
-) -> dict[str, str]:
-    inputs = {
-        "config_digest": config.digest,
-        "facts_digest": facts.digest,
-        "image_refs_digest": digest({
-            name: image.ref for name, image in sorted(config.images.items())
-        }),
-        "change_scope": change_scope,
-    }
-    if image_override:
-        inputs["image_override"] = image_override
-    return inputs
-
-
-def _empty_coverage(config: CiConfig) -> dict[str, Any]:
-    return {
-        "pytest": {
-            suite: {"mode": "none", "files": 0, "routes": 0}
-            for suite in SUITES
-        },
-        "integration": {
-            suite: {"mode": "none", "cases": []}
-            for suite in sorted(config.integration.suites)
-        },
-        "unsupported_routes": [],
-        "jobs": 0,
-    }
+                    kind="integration",
+                    ranks=case.ranks,
+                ),),
+            ))
+    return jobs
 
 
 def build(
     config: CiConfig,
     facts: TestFacts,
-    scope_name: str,
-    source: Source,
+    ci_type: str,
+    git_source: GitSource,
     *,
-    change_scope: str = "code",
+    change_mode: str = "code",
     image_override: str = "",
-) -> Plan:
+    targets: str = "",
+) -> ExecutionPlan:
     """Build a ready plan or raise PlanError with structured issues."""
-    if change_scope not in {"code", "docs_only", "delegated"}:
-        raise ValueError(f"unknown change scope {change_scope!r}")
+    if change_mode not in CHANGE_MODES:
+        raise ValueError(f"unknown change mode {change_mode!r}")
     try:
-        scope = config.scope(scope_name)
+        scope = config.scope(ci_type)
     except CiConfigError as exc:
         raise PlanError(exc.issues) from exc
-    if change_scope in {"docs_only", "delegated"}:
-        return build_plan(
-            scope=scope.name,
-            source=source,
-            inputs=_plan_inputs(config, facts, change_scope, image_override),
-            coverage=_empty_coverage(config),
+    if change_mode != "code":
+        return build_execution_plan(
+            ci_type=scope.name,
+            change_mode=change_mode,
+            git_source=git_source,
             jobs=(),
         )
-
-    issues: list[Issue] = []
-    pytest_jobs, pytest_coverage, unsupported_routes = _build_pytest_jobs(
-        config, facts, scope, issues, image_override
+    issues: list[Diagnostic] = []
+    selections = _selections(config, scope, image_override, issues)
+    target_values = set(_values(targets))
+    if target_values:
+        selections = tuple(
+            selection for selection in selections
+            if selection.image.target in target_values
+        )
+    for selection in selections:
+        if not selection.image.ref:
+            issues.append(_issue(
+                f"resources.images.{selection.image.name}.ref",
+                "missing ImageBinding for container image",
+                "missing-image-binding",
+            ))
+    if issues:
+        raise PlanError(issues)
+    used_areas: set[tuple[int, str]] = set()
+    used_selections: set[int] = set()
+    jobs = sorted(
+        (
+            *_pytest_jobs(
+                config, facts, scope, selections, issues, used_areas, used_selections
+            ),
+            *_integration_jobs(
+                config, facts, scope, selections, issues, used_areas, used_selections
+            ),
+        ),
+        key=lambda job: job.id,
     )
-    integration_jobs, integration_coverage = _build_integration_jobs(
-        config, facts, scope, issues, image_override
-    )
-    jobs = sorted((*pytest_jobs, *integration_jobs), key=lambda job: job.id)
+    for selection in selections:
+        path = f"scopes.{scope.name}[{selection.index}]"
+        if selection.index not in used_selections:
+            issues.append(_issue(path, "selected image produced no jobs", "empty-selection"))
+        for area_id in selection.test_areas or ():
+            if (selection.index, area_id) not in used_areas:
+                issues.append(_issue(
+                    path,
+                    f"TestArea {area_id!r} produced no jobs",
+                    "empty-test-area",
+                ))
     if len({job.id for job in jobs}) != len(jobs):
         issues.append(_issue("plan.jobs", "job ids are not unique", "duplicate-job"))
     if image_override and not any(
-        job.runtime.image.name == image_override for job in jobs
+        job.runtime.image.image_id == image_override for job in jobs
     ):
         issues.append(_issue(
             "image_override",
@@ -538,162 +493,121 @@ def build(
         ))
     if issues:
         raise PlanError(issues)
-    return build_plan(
-        scope=scope.name,
-        source=source,
-        inputs=_plan_inputs(config, facts, change_scope, image_override),
-        coverage={
-            "pytest": pytest_coverage,
-            "integration": integration_coverage,
-            "unsupported_routes": unsupported_routes,
-            "jobs": len(jobs),
-        },
+    return build_execution_plan(
+        ci_type=scope.name,
+        change_mode=change_mode,
+        git_source=git_source,
         jobs=jobs,
     )
 
 
-def _selection_values(value: str) -> tuple[str, ...]:
+def requested_images(
+    config: CiConfig, scope_name: str, *, image_override: str = ""
+) -> tuple[str, ...]:
+    """Return the container image IDs selected by a scope."""
+    try:
+        scope = config.scope(scope_name)
+    except CiConfigError as exc:
+        raise PlanError(exc.issues) from exc
+    issues: list[Diagnostic] = []
+    selections = _selections(config, scope, image_override, issues)
+    if issues:
+        raise PlanError(issues)
+    return tuple(sorted({
+        selection.image.name
+        for selection in selections
+        if selection.image.kind == "container"
+    }))
+
+
+def _values(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(
         part for part in re.split(r"[,\s]+", value.strip()) if part
     ))
 
 
 def _selected_plan(
-    plan: Plan,
-    *,
-    target_jobs: str = "",
-    targets: str = "",
-) -> Plan:
-    """Reduce a validated Plan to a job or target slice for one execution."""
-    job_values = _selection_values(target_jobs)
-    target_values = _selection_values(targets)
+    plan: ExecutionPlan, *, target_jobs: str = "", targets: str = ""
+) -> ExecutionPlan:
+    job_values = _values(target_jobs)
+    target_values = _values(targets)
     if job_values and target_values:
-        raise PlanError([_issue(
-            "selection",
-            "target_job and targets cannot be combined",
-            "invalid-selection",
-        )])
+        raise PlanError([_issue("selection", "target_job and targets cannot be combined")])
     if job_values:
         known = {job.id for job in plan.jobs}
         unknown = [value for value in job_values if value not in known]
         if unknown:
             raise PlanError([
-                _issue(
-                    value,
-                    f"target job {value!r} is not in the full plan",
-                    "unknown-job",
-                )
+                _issue(value, f"target job {value!r} is not in the full plan", "unknown-job")
                 for value in unknown
             ])
-        selected_jobs = set(job_values)
-        jobs = tuple(job for job in plan.jobs if job.id in selected_jobs)
-        selection_input = {"target_job": ",".join(job_values)}
+        jobs = tuple(job for job in plan.jobs if job.id in set(job_values))
     elif target_values:
         known = {job.runtime.target for job in plan.jobs}
         unknown = [value for value in target_values if value not in known]
         if unknown:
             raise PlanError([
-                _issue(
-                    value,
-                    f"target {value!r} has no jobs in the full plan",
-                    "unknown-target",
-                )
+                _issue(value, f"target {value!r} has no jobs in the full plan", "unknown-target")
                 for value in unknown
             ])
-        selected_jobs = set(target_values)
-        jobs = tuple(job for job in plan.jobs if job.runtime.target in selected_jobs)
-        selection_input = {"targets": ",".join(target_values)}
+        jobs = tuple(job for job in plan.jobs if job.runtime.target in set(target_values))
     else:
-        raise PlanError([_issue(
-            "selection",
-            "target_job or targets is required",
-            "invalid-selection",
-        )])
-    pytest_files = {suite: set() for suite in plan.coverage.get("pytest", {})}
-    pytest_routes = {suite: 0 for suite in pytest_files}
-    integration_cases = {
-        suite: [] for suite in plan.coverage.get("integration", {})
-    }
-    for job in jobs:
-        for step in job.steps:
-            if isinstance(step.spec, PytestSpec):
-                pytest_files[step.spec.suite].update(step.spec.files)
-                pytest_routes[step.spec.suite] += len(step.spec.files)
-            elif isinstance(step.spec, IntegrationSpec):
-                integration_cases.setdefault(step.spec.suite, []).append(step.spec.case_id)
-    return build_plan(
-        scope=plan.scope,
-        source=plan.source,
-        inputs={**plan.inputs, **selection_input},
-        coverage={
-            "pytest": {
-                suite: {
-                    "mode": "explicit" if files else "none",
-                    "files": len(files),
-                    "routes": pytest_routes[suite],
-                }
-                for suite, files in pytest_files.items()
-            },
-            "integration": {
-                suite: {
-                    "mode": "explicit" if cases else "none",
-                    "cases": sorted(cases),
-                }
-                for suite, cases in integration_cases.items()
-            },
-            "unsupported_routes": [],
-            "jobs": len(jobs),
-        },
+        raise PlanError([_issue("selection", "target_job or targets is required")])
+    return build_execution_plan(
+        ci_type=plan.ci_type,
+        change_mode=plan.change_mode,
+        git_source=plan.git_source,
         jobs=jobs,
     )
 
 
-def validate_plan(plan: Plan, config: CiConfig, facts: TestFacts) -> list[Issue]:
-    """Check a plan by rebuilding the Plan its inputs must produce."""
-    issues: list[Issue] = []
-    expected_id = plan_digest(plan)
-    if plan.plan_id != expected_id:
-        issues.append(_issue(
-            "plan.plan_id",
-            f"does not match plan contents; expected {expected_id}",
-        ))
-    scope = plan.inputs.get("change_scope", "code")
-    image_override = plan.inputs.get("image_override", "")
-    try:
-        expected = build(
-            config,
-            facts,
-            plan.scope,
-            plan.source,
-            change_scope=scope,
-            image_override=image_override,
-        )
-        if target := plan.inputs.get("target_job"):
-            expected = _selected_plan(expected, target_jobs=target)
-        if targets := plan.inputs.get("targets"):
-            expected = _selected_plan(expected, targets=targets)
-    except PlanError as exc:
-        return issues + list(exc.issues)
-    if plan.to_dict() != expected.to_dict():
-        issues.append(_issue(
-            "plan",
-            "does not match CiConfig and TestFacts",
-            "plan-mismatch",
-        ))
-    return issues
+def build_execution_plan(
+    *,
+    ci_type: str,
+    change_mode: str,
+    git_source: GitSource,
+    jobs: Iterable[Job],
+) -> ExecutionPlan:
+    """Build an execution plan and bind its content-addressed ID."""
+    plan = ExecutionPlan(
+        plan_id="",
+        ci_type=ci_type,
+        change_mode=change_mode,
+        git_source=git_source,
+        jobs=tuple(jobs),
+    )
+    return replace(plan, plan_id=plan_digest(plan))
 
 
-def artifact_for(
+def build_planner_output(
+    *,
+    errors: Iterable[Diagnostic] = (),
+    plan: ExecutionPlan | None = None,
+) -> PlannerOutput:
+    """Build portable planner output for success or failure."""
+    values = tuple(errors)
+    if plan is None and not values:
+        values = (_issue("planner", "planner produced no plan", "missing-plan"),)
+    return PlannerOutput(
+        schema_version=SCHEMA_VERSION,
+        status="ready" if plan is not None and not values else "failed",
+        errors=values,
+        plan=plan,
+    )
+
+
+def planner_output_for(
     config: CiConfig | None,
     facts: TestFacts | None,
-    scope_name: str,
-    source: Source,
-    issues: Iterable[Issue],
+    *,
+    ci_type: str,
+    change_mode: str,
+    git_source: GitSource,
+    issues: Iterable[Diagnostic] = (),
     target_job: str = "",
     targets: str = "",
-    change_scope: str = "code",
     image_override: str = "",
-) -> PlanArtifact:
+) -> PlannerOutput:
     values = tuple(issues)
     if not values and (config is None or facts is None):
         values = (_issue(
@@ -702,218 +616,19 @@ def artifact_for(
             "missing-input",
         ),)
     if config is None or facts is None or values:
-        return build_plan_artifact(scope=scope_name, source=source, errors=values)
+        return build_planner_output(errors=values)
     try:
         plan = build(
             config,
             facts,
-            scope_name,
-            source,
-            change_scope=change_scope,
+            ci_type,
+            git_source,
+            change_mode=change_mode,
             image_override=image_override,
+            targets=targets,
         )
         if target_job or targets:
             plan = _selected_plan(plan, target_jobs=target_job, targets=targets)
     except PlanError as exc:
-        return build_plan_artifact(scope=scope_name, source=source, errors=exc.issues)
-    return build_plan_artifact(scope=scope_name, source=source, plan=plan)
-
-
-def matrix_outputs(plan: Plan, config: CiConfig) -> dict[str, list[dict[str, Any]]]:
-    """Build platform matrix entries without embedding full job payloads."""
-    output = {f"{device}_jobs": [] for device in ("cpu", "npu", "gpu")}
-    output["container_jobs"] = []
-    for job in plan.jobs:
-        lane = config.lanes[job.runtime.lane]
-        item = {
-            "job_id": job.id,
-            "display_name": _matrix_display_name(job, config),
-            "image_ref": job.runtime.image.ref,
-            "device": job.runtime.device,
-            "target": job.runtime.target,
-            "runner_variable": lane.runner_variable,
-            "runner": lane.runner,
-            "container_options": lane.container_options,
-            "timeout_minutes": job.timeout_minutes,
-        }
-        output[f"{job.runtime.device}_jobs"].append(item)
-        if job.runtime.device != "cpu":
-            output["container_jobs"].append(item)
-    return output
-
-
-def _matrix_display_name(job: Job, config: CiConfig) -> str:
-    """Return a compact human-facing name without changing the job contract."""
-    if job.kind != "pytest":
-        return job.id
-    spec = next(
-        (step.spec for step in job.steps if isinstance(step.spec, PytestSpec)),
-        None,
-    )
-    if spec is None:
-        return job.id
-    target_images = [
-        image for image in config.images.values()
-        if image.target == job.runtime.target
-    ]
-    image_suffix = "" if len(target_images) == 1 else f"-{job.runtime.image.name}"
-    return _slug(
-        f"pytest-{spec.suite}-{job.runtime.target}{image_suffix}-{job.runtime.venv.name}"
-    )
-
-
-def _write_github_output(path: Path, key: str, value: str) -> None:
-    with path.open("a", encoding="utf-8") as output:
-        output.write(f"{key}={value}\n")
-
-
-def _render(issues: Iterable[Issue]) -> None:
-    for issue in issues:
-        print(f"{issue.path}: {issue.message}", file=sys.stderr)
-
-
-def _image_refs(values: list[str]) -> dict[str, str]:
-    refs: dict[str, str] = {}
-    for value in values:
-        name, separator, ref = value.partition("=")
-        if not separator or not name or not ref:
-            raise ValueError(f"bad --image-ref {value!r}; expected NAME=REF")
-        refs[name] = ref
-    return refs
-
-
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=None)
-    parser.add_argument("--scope", default="pull_request")
-    parser.add_argument("--output", default="")
-    parser.add_argument("--github-output", default="")
-    parser.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
-    parser.add_argument(
-        "--image",
-        default="",
-        help="logical image selected for jobs without an explicit test/case image",
-    )
-    parser.add_argument("--source-repository", default="")
-    parser.add_argument("--source-ref", default="")
-    parser.add_argument("--source-sha", default="")
-    parser.add_argument("--fail-code", default="planner-precondition")
-    parser.add_argument("--fail-path", default="planner")
-    parser.add_argument("--fail-message", default="")
-    parser.add_argument(
-        "--change-scope",
-        choices=("code", "docs_only", "delegated"),
-        default="code",
-    )
-    parser.add_argument(
-        "--target-job",
-        default="",
-        help="exact Plan job id(s), separated by commas or whitespace",
-    )
-    parser.add_argument(
-        "--targets",
-        default="",
-        help="target name(s), separated by commas or whitespace",
-    )
-    parser.add_argument("--verify", action="store_true")
-    args = parser.parse_args(argv)
-    if args.verify and (args.target_job or args.targets):
-        parser.error("--target-job/--targets cannot be combined with --verify")
-    if args.target_job and args.targets:
-        parser.error("--target-job cannot be combined with --targets")
-    if (args.target_job or args.targets) and args.change_scope != "code":
-        parser.error("job/target selection requires a code plan")
-
-    root = Path(args.root).resolve() if args.root else repository_root()
-    source = source_for(
-        root,
-        repository=args.source_repository,
-        ref=args.source_ref,
-        sha=args.source_sha,
-    )
-    try:
-        image_refs = _image_refs(args.image_ref)
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    if args.fail_message:
-        artifact = artifact_for(
-            None,
-            None,
-            args.scope,
-            source,
-            (Issue(code=args.fail_code, path=args.fail_path, message=args.fail_message),),
-        )
-        if args.output:
-            write_json(Path(args.output), artifact.to_dict())
-        _render(artifact.errors)
-        return 1
-
-    try:
-        config = load_config(root, image_refs=image_refs)
-        facts = load_facts(root, config)
-    except (CiConfigError, FactsError) as exc:
-        artifact = artifact_for(None, None, args.scope, source, exc.issues)
-        if args.output:
-            write_json(Path(args.output), artifact.to_dict())
-        _render(exc.issues)
-        return 1
-
-    if args.verify:
-        failures: list[Issue] = []
-        for name in sorted(config.scopes):
-            try:
-                plan = build(config, facts, name, source)
-                docs = build(config, facts, name, source, change_scope="docs_only")
-                delegated = build(
-                    config, facts, name, source, change_scope="delegated"
-                )
-                failures.extend(validate_plan(plan, config, facts))
-                failures.extend(validate_plan(docs, config, facts))
-                failures.extend(validate_plan(delegated, config, facts))
-                print(f"{name}: {len(plan.jobs)} jobs / {len(facts.pytest)} tests")
-                print(f"{name} docs-only: {len(docs.jobs)} jobs")
-                print(f"{name} delegated: {len(delegated.jobs)} jobs")
-            except PlanError as exc:
-                failures.extend(exc.issues)
-        if failures:
-            _render(failures)
-            return 1
-        print(
-            f"planner OK ({len(facts.integration)} integration cases / "
-            f"{len(facts.pytest)} tests)"
-        )
-        return 0
-
-    artifact = artifact_for(
-        config,
-        facts,
-        args.scope,
-        source,
-        (),
-        target_job=args.target_job,
-        targets=args.targets,
-        change_scope=args.change_scope,
-        image_override=args.image,
-    )
-    if args.output:
-        write_json(Path(args.output), artifact.to_dict())
-    if artifact.status != "ready" or artifact.plan is None:
-        _render(artifact.errors)
-        return 1
-    if args.github_output:
-        output_path = Path(args.github_output)
-        for key, value in matrix_outputs(artifact.plan, config).items():
-            _write_github_output(
-                output_path,
-                key,
-                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-            )
-            _write_github_output(output_path, f"{key[:-1]}_count", str(len(value)))
-    if not args.output:
-        print(canonical_json(artifact.plan.to_dict()))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+        return build_planner_output(errors=exc.issues)
+    return build_planner_output(plan=plan)

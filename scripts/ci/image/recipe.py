@@ -1,51 +1,48 @@
-"""Image recipe loading and validation.
-
-This module is the only place that interprets the ``recipe`` object stored in
-``scripts/ci/config/ci.yml``. Other image modules consume ``ImageSpec`` values
-and do not parse the YAML document themselves.
-"""
+"""Load container image definitions from the single CI configuration."""
 
 from __future__ import annotations
 
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
 
+from ..tools.repo_paths import is_dockerfile_path, normalize_repo_path
+
 CI_CONFIG_PATH = Path("scripts/ci/config/ci.yml")
-BUILD_INPUT_ROOT = "docker"
+SCHEMA_VERSION = 5
 
 
 class ImageError(ValueError):
     """Raised when image configuration or identity inputs are invalid."""
 
 
-class ImageConfigMissing(ImageError):
-    """Raised when a Git revision predates the image recipe configuration."""
-
-
 @dataclass(frozen=True)
 class ImageSpec:
-    name: str
+    image_id: str
     target: str
     device: str
     hardware: str
     repository: str
     alias: str
     dockerfile: str
-    context: str
     platform: str
-    version: str
-    version_prefix: str
-    build_args: Mapping[str, str] = field(default_factory=dict)
     revision: int = 1
+    ci_build_args: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def context(self) -> str:
+        return Path(self.dockerfile).parent.as_posix()
+
+    @property
+    def publish_ref(self) -> str:
+        return f"{self.repository}:{self.alias}"
 
     def matrix_item(self) -> dict[str, str]:
         return {
-            "image": self.name,
+            "image_id": self.image_id,
             "target": self.target,
             "device": self.device,
             "hardware": self.hardware,
@@ -80,192 +77,118 @@ def _text(value: Any, where: str) -> str:
     return value
 
 
-def _integer(value: Any, where: str, default: int) -> int:
+def _revision(value: Any, where: str) -> int:
     if value is None:
-        return default
+        return 1
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ImageError(f"{where} must be a positive integer")
     return value
 
 
-def _relative(value: Any, where: str) -> str:
-    text = _text(value, where)
-    path = Path(text)
-    if path.is_absolute() or ".." in path.parts:
-        raise ImageError(f"{where} must be a repository-relative path: {text!r}")
-    return path.as_posix()
+def _build_args(value: Any, where: str) -> dict[str, str]:
+    rows = _mapping(value or {}, where)
+    result: dict[str, str] = {}
+    for key, item in rows.items():
+        if isinstance(item, (dict, list)) or item is None:
+            raise ImageError(f"{where}.{key} must be a scalar")
+        result[str(key)] = str(item)
+    return result
 
 
-def _build_input(value: Any, where: str) -> str:
-    path = _relative(value, where)
-    if not path.startswith(BUILD_INPUT_ROOT + "/"):
+def _dockerfile(value: Any, where: str) -> str:
+    path = normalize_repo_path(_text(value, where))
+    if not is_dockerfile_path(path):
         raise ImageError(
-            f"{where} must be under {BUILD_INPUT_ROOT}/ so image CI triggers cover it: "
+            f"{where} must be docker/**/Dockerfile* so image CI can trigger it: "
             f"{path!r}"
         )
     return path
 
 
-def _git(root: Path, *args: str) -> bytes:
-    process = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
-    if process.returncode != 0:
-        detail = process.stderr.decode("utf-8", "replace").strip()
-        raise ImageError(f"git {' '.join(args)} failed: {detail}")
-    return process.stdout
-
-
-def _git_has_file(root: Path, revision: str, relative: str) -> bool:
-    process = subprocess.run(
-        ["git", "-C", str(root), "cat-file", "-e", f"{revision}:{relative}"],
-        capture_output=True,
-    )
-    return process.returncode == 0
-
-
-def _git_names(root: Path, revision: str, relative: str) -> list[str]:
-    output = _git(root, "ls-tree", "-r", "-z", "--name-only", revision, "--", relative)
-    return sorted(value.decode("utf-8") for value in output.split(b"\0") if value)
-
-
-def _read_file(root: Path, relative: str, revision: str | None) -> bytes:
-    if revision is None:
-        try:
-            return (root / relative).read_bytes()
-        except OSError as exc:
-            raise ImageError(f"cannot read {relative}: {exc}") from exc
-    try:
-        return _git(root, "show", f"{revision}:{relative}")
-    except ImageError as exc:
-        raise ImageError(f"cannot read {relative} at {revision}: {exc}") from exc
-
-
-def _load_yaml(
-    root: Path,
-    relative: Path,
-    revision: str | None,
-    label: str,
-) -> dict[str, Any]:
-    path = relative.as_posix()
-    if revision is not None and not _git_has_file(root, revision, path):
-        raise ImageConfigMissing(f"{path} is absent at revision {revision}")
-    try:
-        value = yaml.safe_load(_read_file(root, path, revision))
-    except yaml.YAMLError as exc:
-        raise ImageError(f"cannot parse {label}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ImageError(f"{label} must contain a mapping")
-    return value
+def _unknown_keys(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ImageError(f"{where} has unknown field(s): {', '.join(unknown)}")
 
 
 def _spec_from(
-    name: str,
-    target: str,
-    device: str,
-    hardware: str,
-    recipe: Mapping[str, Any],
+    root: Path,
+    image_id: str,
+    image: Mapping[str, Any],
+    targets: Mapping[str, Any],
 ) -> ImageSpec:
-    where = f"images.{name}"
-    repository, alias = split_reference(_text(recipe.get("ref"), f"{where}.ref"))
-    version = _text(
-        recipe.get("version") or recipe.get("cann_version"),
-        f"{where}.version",
+    where = f"resources.images.{image_id}"
+    _unknown_keys(image, {"target", "kind", "ref", "build", "publish"}, where)
+    target_name = _text(image.get("target"), f"{where}.target")
+    target = _mapping(targets.get(target_name), f"resources.targets.{target_name}")
+    build = _mapping(image.get("build"), f"{where}.build")
+    _unknown_keys(
+        build,
+        {"dockerfile", "platform", "revision", "ci_build_args"},
+        f"{where}.build",
     )
-    version_prefix = _text(
-        recipe.get("version_prefix") or "cann",
-        f"{where}.version_prefix",
-    )
-    for label, value in (
-        ("version", version),
-        ("version_prefix", version_prefix),
-    ):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
-            raise ImageError(f"{where}.{label} must be Docker-tag-safe")
-    alias_prefix = f"{version_prefix}{version}-{hardware}-"
-    if not alias.startswith(alias_prefix):
-        raise ImageError(
-            f"{where}.ref alias must start with {alias_prefix!r} so multiple "
-            "CANN versions remain addressable"
-        )
-    args_raw = _mapping(recipe.get("build_args") or {}, f"{where}.build_args")
-    build_args: dict[str, str] = {}
-    for key, value in args_raw.items():
-        if isinstance(value, (dict, list)) or value is None:
-            raise ImageError(f"{where}.build_args.{key} must be a scalar")
-        build_args[str(key)] = str(value)
+    publish = _mapping(image.get("publish"), f"{where}.publish")
+    _unknown_keys(publish, {"ref"}, f"{where}.publish")
+    if image.get("ref"):
+        raise ImageError(f"{where}.ref is only valid for host images")
+
+    repository, alias = split_reference(_text(publish.get("ref"), f"{where}.publish.ref"))
+    dockerfile = _dockerfile(build.get("dockerfile"), f"{where}.build.dockerfile")
+    if not (root / dockerfile).is_file():
+        raise ImageError(f"{where}.build.dockerfile is missing: {dockerfile}")
     return ImageSpec(
-        name=name,
-        target=target,
-        device=device,
-        hardware=hardware,
+        image_id=image_id,
+        target=target_name,
+        device=_text(target.get("device"), f"resources.targets.{target_name}.device"),
+        hardware=str(target.get("hardware") or ""),
         repository=repository,
         alias=alias,
-        dockerfile=_build_input(recipe.get("dockerfile"), f"{where}.dockerfile"),
-        context=_build_input(recipe.get("context"), f"{where}.context"),
-        platform=_text(recipe.get("platform"), f"{where}.platform"),
-        version=version,
-        version_prefix=version_prefix,
-        build_args=build_args,
-        revision=_integer(recipe.get("revision"), f"{where}.revision", 1),
+        dockerfile=dockerfile,
+        platform=_text(build.get("platform"), f"{where}.build.platform"),
+        revision=_revision(build.get("revision"), f"{where}.build.revision"),
+        ci_build_args=_build_args(
+            build.get("ci_build_args"), f"{where}.build.ci_build_args"
+        ),
     )
 
 
-def load_recipes(
-    root: Path,
-    revision: str | None = None,
-) -> dict[str, Mapping[str, Any]]:
-    """Load raw container recipes keyed by logical image name."""
-    document = _load_yaml(root, CI_CONFIG_PATH, revision, "CI configuration")
-    resources = _mapping(document.get("resources"), "resources")
-    images = _mapping(resources.get("images"), "resources.images")
-    recipes: dict[str, Mapping[str, Any]] = {}
-    for name, value in images.items():
-        image = _mapping(value, f"resources.images.{name}")
-        if image.get("kind") != "container" or image.get("recipe") is None:
-            continue
-        recipes[name] = _mapping(
-            image.get("recipe"), f"resources.images.{name}.recipe"
+def load_specs(root: Path) -> list[ImageSpec]:
+    """Load all container images and reject ambiguous Dockerfile mappings."""
+    try:
+        document = yaml.safe_load(
+            (root / CI_CONFIG_PATH).read_text(encoding="utf-8")
         )
-    return recipes
-
-
-def load_specs(root: Path, revision: str | None = None) -> list[ImageSpec]:
-    """Load and cross-check logical images with their target and recipe data."""
-    ci_document = _load_yaml(root, CI_CONFIG_PATH, revision, "CI configuration")
-    resources = _mapping(ci_document.get("resources"), "resources")
+    except (OSError, yaml.YAMLError) as exc:
+        raise ImageError(f"cannot read {CI_CONFIG_PATH}: {exc}") from exc
+    config = _mapping(document, "ci")
+    if config.get("schema_version") != SCHEMA_VERSION:
+        raise ImageError(f"schema_version must be {SCHEMA_VERSION}")
+    resources = _mapping(config.get("resources"), "resources")
     targets = _mapping(resources.get("targets"), "resources.targets")
     images = _mapping(resources.get("images"), "resources.images")
 
     specs: list[ImageSpec] = []
-    for name, value in images.items():
-        image = _mapping(value, f"resources.images.{name}")
-        if image.get("kind") != "container":
-            if image.get("recipe") is not None:
+    by_dockerfile: dict[str, str] = {}
+    for image_id, value in images.items():
+        image = _mapping(value, f"resources.images.{image_id}")
+        kind = image.get("kind")
+        if kind == "host":
+            if image.get("build") is not None or image.get("publish") is not None:
                 raise ImageError(
-                    f"resources.images.{name}.recipe is only valid for container images"
+                    f"resources.images.{image_id} has build/publish for a host image"
                 )
             continue
-        target_name = _text(image.get("target"), f"resources.images.{name}.target")
-        target = _mapping(targets.get(target_name), f"resources.targets.{target_name}")
-        recipe = _mapping(
-            image.get("recipe"), f"resources.images.{name}.recipe"
-        )
-        specs.append(
-            _spec_from(
-                name,
-                target_name,
-                _text(target.get("device"), f"resources.targets.{target_name}.device"),
-                _text(target.get("hardware"), f"resources.targets.{target_name}.hardware"),
-                recipe,
+        if kind != "container":
+            raise ImageError(
+                f"resources.images.{image_id}.kind must be host or container"
             )
-        )
-    return sorted(specs, key=lambda item: item.name)
-
-
-def validate_recipes(root: Path) -> None:
-    """Validate the worktree recipe configuration and local build inputs."""
-    for spec in load_specs(root):
-        dockerfile = root / spec.dockerfile
-        if not dockerfile.is_file():
-            raise ImageError(f"dockerfile does not exist: {spec.dockerfile}")
-        if not (root / spec.context).is_dir():
-            raise ImageError(f"build context is not a directory: {spec.context}")
+        spec = _spec_from(root, image_id, image, targets)
+        previous = by_dockerfile.get(spec.dockerfile)
+        if previous is not None:
+            raise ImageError(
+                f"dockerfile {spec.dockerfile!r} maps to both {previous!r} and "
+                f"{image_id!r}"
+            )
+        by_dockerfile[spec.dockerfile] = image_id
+        specs.append(spec)
+    return sorted(specs, key=lambda item: item.image_id)

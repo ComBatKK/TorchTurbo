@@ -7,7 +7,7 @@ run-name: Ascend-Manual-CI ${{ inputs.target_job }} ${{ github.ref_name }}
 #
 # target_job is the Plan job id. Common values:
 #   pytest-core-cpu-cpu-default-default
-#   pytest-core-npu-npu-default-default
+#   pytest-core-npu-npu-a3-cann90-default
 #   integration-base-suite-qwen3-5-moe-sft-2cpu
 #   integration-base-suite-qwen3-5-moe-sft-2npu
 #
@@ -36,6 +36,11 @@ on:
         required: false
         default: ''
         type: string
+      image_id:
+        description: 'logical image ID paired with image_ref'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ci-manual-${{ github.ref }}
@@ -54,3 +59,4 @@ jobs:
       mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}
       target_job: ${{ inputs.target_job }}
       image_ref: ${{ inputs.image_ref }}
+      image_id: ${{ inputs.image_id }}

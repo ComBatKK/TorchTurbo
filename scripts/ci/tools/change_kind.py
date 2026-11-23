@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route a changed-file list to the CI domains that must run."""
+"""Classify a changed-file list for CI execution."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-from ..tools.repo_paths import is_dockerfile_path, is_docs_path
+from .repo_paths import is_dockerfile_path, is_docs_path
 
 
-class ChangeRoute(str, Enum):
-    """Execution route selected from repository changes."""
+class ChangeKind(str, Enum):
+    """Change kind selected from repository changes."""
 
     CODE = "code"
     DOCS_ONLY = "docs_only"
@@ -21,11 +21,11 @@ class ChangeRoute(str, Enum):
     MIXED = "mixed"
 
 
-def route_changes(paths: Iterable[str]) -> ChangeRoute:
-    """Select docs, code, image-only or mixed routing for changed paths."""
+def classify_changes(paths: Iterable[str]) -> ChangeKind:
+    """Select docs, code, image-only or mixed changes from paths."""
     values = [path.strip() for path in paths if path.strip()]
     if not values:
-        return ChangeRoute.CODE
+        return ChangeKind.CODE
 
     has_image = False
     has_code = False
@@ -36,8 +36,8 @@ def route_changes(paths: Iterable[str]) -> ChangeRoute:
             has_code = True
 
     if has_image:
-        return ChangeRoute.MIXED if has_code else ChangeRoute.IMAGE_ONLY
-    return ChangeRoute.CODE if has_code else ChangeRoute.DOCS_ONLY
+        return ChangeKind.MIXED if has_code else ChangeKind.IMAGE_ONLY
+    return ChangeKind.CODE if has_code else ChangeKind.DOCS_ONLY
 
 
 def _read_paths(path: str) -> list[str]:
@@ -47,7 +47,7 @@ def _read_paths(path: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Print one routing decision for workflow consumption."""
+    """Print one change kind for workflow consumption."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--changed-files",
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"cannot read changed-file list: {exc}", file=sys.stderr)
         return 2
-    print(route_changes(paths).value)
+    print(classify_changes(paths).value)
     return 0
 
 

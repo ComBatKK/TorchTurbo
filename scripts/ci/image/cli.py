@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from .. import repository_root
-from ..contracts.artifacts import write_json
+from ..tools.json_io import write_json
 from .recipe import ImageError
 from .release import (
     BuildError,
@@ -86,27 +86,24 @@ def cmd_plan(args: argparse.Namespace) -> int:
         {
             "image_jobs": compact,
             "image_count": len(specs),
-            "images": ",".join(spec.name for spec in specs),
+            "images": ",".join(spec.image_id for spec in specs),
         },
     )
     return 0
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
-    results, warning = resolve_images(
+    results = resolve_images(
         _root(args.root),
-        revision=args.revision or None,
         names=args.images,
         overrides=_image_refs(args.image_ref),
     )
-    if warning:
-        print(f"::warning::{warning}", file=sys.stderr)
     _write_lines(args.output, format_refs(results).splitlines())
     _write_outputs(
         args.github_output,
         {
             "image_count": len(results),
-            "images": ",".join(result.name for result in results),
+            "images": ",".join(result.image_id for result in results),
         },
     )
     return 0
@@ -130,6 +127,8 @@ def cmd_build(args: argparse.Namespace) -> int:
             "built": str(result.built).lower(),
             "cache_hit": str(not result.built).lower(),
             "elapsed_seconds": result.elapsed_seconds,
+            "image_id": result.image_id,
+            "build_input_hash": result.build.build_input_hash,
         },
     )
     return 0
@@ -170,7 +169,6 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=cmd_plan)
 
     resolve = subparsers.add_parser("resolve", parents=[common])
-    resolve.add_argument("--revision", default="")
     resolve.add_argument("--images", default="")
     resolve.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
     resolve.set_defaults(handler=cmd_resolve)
@@ -200,3 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ImageError, SelectionError, RegistryError, BuildError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

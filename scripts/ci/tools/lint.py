@@ -359,7 +359,7 @@ def check_contract() -> list[Problem]:
         rel = relative(path)
         jobs = {str(name): job for name, job in (doc.get("jobs") or {}).items()}
         plan_jobs = [name for name, job in jobs.items()
-                     if "scripts.ci.execution.producer.planner" in _job_run_text(job)]
+                     if "scripts.ci.execution.producer.cli" in _job_run_text(job)]
         if plan_jobs:
             problems.extend(_check_planner_v2(
                 rel,
@@ -381,7 +381,7 @@ def _check_planner_v2(
     """Validate the Planner -> Executor -> Gate topology."""
     problems: list[Problem] = []
     planners = [name for name, job in jobs.items()
-                if "scripts.ci.execution.producer.planner" in _job_run_text(job)]
+                if "scripts.ci.execution.producer.cli" in _job_run_text(job)]
     if len(planners) != 1:
         return [Problem(rel, f"expected one Planner job; found {sorted(planners)}")]
     planner_name = planners[0]
@@ -426,7 +426,7 @@ def _check_planner_v2(
         return problems
     terminal = terminals[0]
     terminal_body = _job_run_text(jobs[terminal])
-    if "scripts.ci.execution.consumer.gate" not in terminal_body:
+    if "scripts.ci.execution.finalization.gate" not in terminal_body:
         problems.append(Problem(rel, f"terminal job {terminal!r} does not invoke the gate"))
     if "download-artifact" not in yaml.safe_dump(jobs[terminal], allow_unicode=True):
         problems.append(Problem(rel, f"terminal job {terminal!r} does not download results"))
@@ -439,16 +439,16 @@ def _check_planner_v2(
 
 def check_config() -> list[Problem]:
     """Validate ci.yml and every test fact derived from the repository."""
-    from ..image.recipe import ImageError, validate_recipes
-    from ..execution.producer.ci_config import CiConfigError, load
+    from ..image.recipe import ImageError, load_specs
+    from ..execution.producer.config import CiConfigError, load
     from ..execution.producer.facts import FactsError, load as load_facts
 
     try:
         config = load(ROOT)
         load_facts(ROOT, config)
-        validate_recipes(ROOT)
+        load_specs(ROOT)
     except (CiConfigError, FactsError) as exc:
-        return [Problem(issue.path, issue.message) for issue in exc.issues]
+        return [Problem(issue.location, issue.message) for issue in exc.issues]
     except ImageError as exc:
         return [Problem("scripts/ci/config/ci.yml", str(exc))]
     return []
@@ -495,7 +495,7 @@ def check_markers() -> list[Problem]:
         if ":" in line:
             configured.add(line.split(":", 1)[0].strip())
 
-    from ..execution.producer.scan import REQUIRED_MARKERS
+    from ..execution.producer.facts import REQUIRED_MARKERS
 
     markers = _test_marker_names()
     for name in sorted(markers - configured):

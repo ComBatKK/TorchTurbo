@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 5
 
 resources:
   targets:
@@ -13,21 +13,37 @@ resources:
       target: cpu
       kind: host
       ref: python:3.11
-      default: true
-    npu-default:
+
+    npu-a3-cann90:
       target: npu-a3
       kind: container
-      default: true
-      recipe:
-        ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-a3-base
+      build:
         dockerfile: docker/npu/Dockerfile_aarch64
-        context: docker/npu
         platform: linux/arm64
-        version: "9.0.0"
-        version_prefix: cann
         revision: 1
-        build_args:
+        ci_build_args:
           GIT_HTTP_USER_AGENT: git/2.56.1
+      publish:
+        ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-a3-base
+
+  runners:
+    - target: cpu
+      rank_capacity: 8
+      runs_on:
+        variable: CI_CPU_RUNNER
+        fallback: ubuntu-22.04-arm
+    - target: npu-a3
+      rank_capacity: 2
+      runs_on:
+        variable: CI_NPU_2_RUNNER
+        fallback: linux-aarch64-a3-800i-2
+      container_options: --user root
+    - target: npu-a3
+      rank_capacity: 16
+      runs_on:
+        variable: CI_NPU_16_RUNNER
+        fallback: linux-aarch64-a3-800i-16
+      container_options: --user root
 
   venvs:
     default:
@@ -52,34 +68,7 @@ resources:
       extends: swift
       constraints: auto
 
-  lanes:
-    cpu/default:
-      target: cpu
-      capacity_slots: 8
-      runner_variable: CI_CPU_RUNNER
-      runner: ubuntu-22.04-arm
-    npu/default-2:
-      target: npu-a3
-      capacity_slots: 2
-      runner_variable: CI_NPU_2_RUNNER
-      runner: linux-aarch64-a3-800i-2
-    npu/default-4:
-      target: npu-a3
-      capacity_slots: 4
-      runner_variable: CI_NPU_4_RUNNER
-      runner: linux-aarch64-a3-800i-4
-    npu/default-8:
-      target: npu-a3
-      capacity_slots: 8
-      runner_variable: CI_NPU_8_RUNNER
-      runner: linux-aarch64-a3-800i-8
-    npu/default-16:
-      target: npu-a3
-      capacity_slots: 16
-      runner_variable: CI_NPU_16_RUNNER
-      runner: linux-aarch64-a3-800i-16
-
-workloads:
+test_areas:
   pytest:
     defaults:
       job_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
@@ -111,16 +100,25 @@ workloads:
 
 scopes:
   pull_request:
-    targets: [cpu, npu-a3]
-    pytest: {core: all, model: none, adapter: all}
-    integration:
-      base_suite:
-        mode: explicit
-        cases: [qwen3_5_moe/sft_2cpu, qwen3_5_moe/sft_2npu]
+    - test_areas:
+        - pytest/core
+        - pytest/adapter
+        - integration/base_suite/qwen3_5_moe/sft_2cpu
+      environment:
+        image: cpu-default
+    - test_areas:
+        - pytest/core
+        - integration/base_suite/qwen3_5_moe/sft_2npu
+      environment:
+        image: npu-a3-cann90
 
   nightly:
-    targets: [cpu, npu-a3]
-    pytest: {core: all, model: all, adapter: all}
-    integration:
-      base_suite:
-        mode: all
+    - environment:
+        image: cpu-default
+    - test_areas:
+        - pytest/core
+        - pytest/model
+        - integration/base_suite/qwen3_5_moe/sft_2npu
+        - integration/base_suite/bailing_v3/sft_16npu
+      environment:
+        image: npu-a3-cann90

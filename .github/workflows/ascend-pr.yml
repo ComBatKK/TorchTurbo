@@ -3,7 +3,7 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 
 # One entry point for PR, nightly and manual scope selection.
 #
-#   lint -> Planner -> PlanArtifact -> Executor -> Gate
+#   lint -> Planner -> PlannerOutput -> Executor -> Gate
 #
 # The Plan carries an immutable digest image reference. Image builds and
 # alias promotion are a separate release pipeline; they are not a job in this
@@ -12,8 +12,6 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - 'docker/**/Dockerfile*'
   workflow_call:
     inputs:
       mode:
@@ -44,10 +42,10 @@ on:
         required: false
         default: ''
         type: string
-      image_name:
-        description: 'Logical image paired with image_ref'
+      image_id:
+        description: 'Logical image ID paired with image_ref'
         required: false
-        default: 'npu-default'
+        default: ''
         type: string
   workflow_dispatch:
     inputs:
@@ -69,10 +67,10 @@ on:
         required: false
         default: ''
         type: string
-      image_name:
-        description: 'logical image paired with image_ref'
+      image_id:
+        description: 'logical image ID paired with image_ref'
         required: false
-        default: 'npu-default'
+        default: ''
         type: string
       targets:
         description: 'optional target slice, for example cpu or npu-a3'
@@ -95,9 +93,8 @@ env:
   CI_TARGET_JOB: ${{ inputs.target_job || '' }}
   CI_TARGETS: ${{ inputs.targets || '' }}
   CI_SCOPE: ${{ inputs.scope || '' }}
-  CI_CHECKOUT_REF: ${{ inputs.checkout_ref || '' }}
   CI_IMAGE_REF: ${{ inputs.image_ref || '' }}
-  CI_IMAGE_NAME: ${{ inputs.image_name || 'npu-default' }}
+  CI_IMAGE_ID: ${{ inputs.image_id || '' }}
 
 jobs:
   plan:
@@ -119,27 +116,32 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: route changes
+      - name: classify changes
         id: changes
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          CI_SCOPE: ${{ inputs.scope || '' }}
+          CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
         run: |
           set -euo pipefail
-          route=code
+          kind=code
           if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ]; then
             changed="$RUNNER_TEMP/ci-changed-files.txt"
             git diff --name-only --diff-filter=AM --no-renames \
               "$BASE_SHA...HEAD" > "$changed"
-            route=$(python3 -m scripts.ci.routing.ci_router --changed-files "$changed")
+            kind=$(python3 -m scripts.ci.tools.change_kind --changed-files "$changed")
           fi
-          case "$route" in
-            code|docs_only) scope=$route ;;
-            image_only|mixed) scope=delegated ;;
-            *) echo "::error::unknown change route: $route"; exit 1 ;;
-          esac
-          printf 'change_scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
-          echo "change scope: $scope" >> "$GITHUB_STEP_SUMMARY"
+          change_mode=$kind
+          if [ -n "$CI_SCOPE" ]; then
+            scope=$CI_SCOPE
+          elif [ "$CI_MODE" = full ]; then
+            scope=nightly
+          else
+            scope=pull_request
+          fi
+          printf 'change_mode=%s\nscope=%s\n' "$change_mode" "$scope" >> "$GITHUB_OUTPUT"
+          echo "kind=$kind; change mode=$change_mode; plan scope=$scope" >> "$GITHUB_STEP_SUMMARY"
 
       - name: install CI dependencies
         run: |
@@ -148,43 +150,49 @@ jobs:
 
       - name: lint
         id: lint
-        if: |
-          steps.changes.outputs.change_scope != 'docs_only' &&
-          steps.changes.outputs.change_scope != 'delegated'
+        if: steps.changes.outputs.change_mode == 'code'
         env:
           PYTHONUNBUFFERED: '1'
         run: |
           set -uo pipefail
           python3 -m scripts.ci.tools.lint
 
-      - name: resolve runtime image
+      - name: resolve runtime images
         id: runtime_image
         if: |
           steps.lint.outcome == 'success' &&
-          steps.changes.outputs.change_scope != 'docs_only' &&
-          steps.changes.outputs.change_scope != 'delegated'
+          steps.changes.outputs.change_mode == 'code'
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          SCOPE: ${{ steps.changes.outputs.scope }}
+          IMAGE_ID: ${{ inputs.image_id || '' }}
+          IMAGE_REF: ${{ inputs.image_ref || '' }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = pull_request ] && [ -n "$PR_BASE_SHA" ]; then
-            revision="$PR_BASE_SHA"
-          else
-            revision=$(git rev-parse HEAD)
+          if [ -n "$IMAGE_REF" ] && [ -z "$IMAGE_ID" ]; then
+            echo "::error::image_ref requires image_id"
+            exit 1
           fi
           refs="$RUNNER_TEMP/ci-image-refs"
-          common=(--revision "$revision" --output "$refs")
-          if [ -n "$CI_IMAGE_REF" ]; then
-            common+=(--image-ref "$CI_IMAGE_NAME=$CI_IMAGE_REF")
-            echo "using caller image: $CI_IMAGE_REF"
+          list=(--scope "$SCOPE")
+          if [ -n "$IMAGE_ID" ]; then
+            list+=(--image "$IMAGE_ID")
           fi
-          python3 -m scripts.ci.image resolve "${common[@]}"
+          images=$(python3 -m scripts.ci.execution.producer.cli images \
+            --root "$GITHUB_WORKSPACE" "${list[@]}")
+          if [ -z "$images" ]; then
+            : > "$refs"
+            echo "no container images selected by $SCOPE"
+            exit 0
+          fi
+          resolve=(--images "$images" --output "$refs")
+          if [ -n "$IMAGE_REF" ]; then
+            resolve+=(--image-ref "$IMAGE_ID=$IMAGE_REF")
+            echo "using caller image: $IMAGE_ID=$IMAGE_REF"
+          fi
+          python3 -m scripts.ci.image.cli resolve "${resolve[@]}"
           test -s "$refs"
           cat "$refs"
 
-      # Always publish a PlanArtifact, including lint failures. Gate consumes
-      # contracts rather than raw shell exit codes.
       - name: plan
         id: publish
         if: always()
@@ -192,27 +200,17 @@ jobs:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
           IMAGE_OUTCOME: ${{ steps.runtime_image.outcome }}
           IMAGE_REFS_FILE: ${{ runner.temp }}/ci-image-refs
-          CHANGE_SCOPE: ${{ steps.changes.outputs.change_scope || 'code' }}
+          CHANGE_MODE: ${{ steps.changes.outputs.change_mode || 'code' }}
+          SCOPE: ${{ steps.changes.outputs.scope || 'pull_request' }}
+          CI_SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-plan"
-          if [ -n "$CI_SCOPE" ]; then
-            SCOPE="$CI_SCOPE"
-          elif [ "$CI_MODE" = full ]; then
-            SCOPE=nightly
-          else
-            SCOPE=pull_request
-          fi
-          SOURCE_SHA=$(git rev-parse HEAD)
-          SOURCE_REF=${CI_CHECKOUT_REF:-$GITHUB_REF}
           COMMON=(
             --root "$GITHUB_WORKSPACE"
             --scope "$SCOPE"
             --output "$RUNNER_TEMP/ci-plan/plan.json"
-            --source-repository "$GITHUB_REPOSITORY"
-            --source-ref "$SOURCE_REF"
-            --source-sha "$SOURCE_SHA"
-            --change-scope "$CHANGE_SCOPE"
+            --change-mode "$CHANGE_MODE"
           )
           if [ -n "$CI_TARGET_JOB" ]; then
             COMMON+=(--target-job "$CI_TARGET_JOB")
@@ -220,27 +218,23 @@ jobs:
           if [ -n "$CI_TARGETS" ]; then
             COMMON+=(--targets "$CI_TARGETS")
           fi
-          if [ -n "$CI_IMAGE_REF" ]; then
-            COMMON+=(--image "$CI_IMAGE_NAME")
+          if [ "$CHANGE_MODE" = code ] && [ -n "$CI_IMAGE_ID" ]; then
+            COMMON+=(--image "$CI_IMAGE_ID")
           fi
-          if [ "$CHANGE_SCOPE" = delegated ]; then
-            echo "Dockerfile PR is delegated to Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CHANGE_MODE" = image_only ] || [ "$CHANGE_MODE" = mixed ]; then
+            echo "Dockerfile PR is handled by Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
+          if [ "$CHANGE_MODE" = code ] && \
             [ "$LINT_OUTCOME" != success ]; then
-            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
-              --fail-code lint --fail-path scripts/ci/tools/lint.py \
-              --fail-message "lint failed"
+            echo "::error::lint failed"
             exit 1
           fi
-          if [ "$CHANGE_SCOPE" != docs_only ] && [ "$CHANGE_SCOPE" != delegated ] && \
+          if [ "$CHANGE_MODE" = code ] && \
             [ "$IMAGE_OUTCOME" != success ]; then
-            python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
-              --fail-code image-identity --fail-path scripts/ci/image \
-              --fail-message "cannot resolve runtime image digest"
+            echo "::error::cannot resolve runtime image digest"
             exit 1
           fi
-          if [ -f "$IMAGE_REFS_FILE" ]; then
+          if [ "$CHANGE_MODE" = code ] && [ -f "$IMAGE_REFS_FILE" ]; then
             while IFS= read -r image_ref; do
               if [ -n "$image_ref" ]; then
                 COMMON+=(--image-ref "$image_ref")
@@ -248,8 +242,8 @@ jobs:
             done < "$IMAGE_REFS_FILE"
           fi
           MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
-          if ! python3 -m scripts.ci.execution.producer.planner "${COMMON[@]}" \
-            --github-output "$MATRIX_OUTPUT"; then
+          if ! GITHUB_OUTPUT="$MATRIX_OUTPUT" \
+            python3 -m scripts.ci.execution.producer.cli plan "${COMMON[@]}"; then
             exit 1
           fi
           echo "Planner matrix outputs:"
@@ -489,7 +483,7 @@ jobs:
       - name: timing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 -m scripts.ci.execution.consumer.report timing
+        run: python3 -m scripts.ci.execution.finalization.timing
 
       - name: judge
         env:
@@ -505,7 +499,7 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
             exit 2
           fi
-          python3 -m scripts.ci.execution.consumer.gate \
+          python3 -m scripts.ci.execution.finalization.gate \
             --plan "$PLAN" \
             --results "$RESULTS" \
             --output "$DECISION" \

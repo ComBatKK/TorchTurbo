@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create content-addressed Python environments for CI jobs."""
+"""Create and manage content-addressed Python virtualenvs for CI jobs."""
 
 from __future__ import annotations
 
@@ -104,8 +104,8 @@ class VenvManager:
         # dependency changes.
         for relative in (
             Path("pyproject.toml"),
-            RUNTIME_DIR / "venv.py",
-            RUNTIME_DIR / "env.py",
+            RUNTIME_DIR / "venv_manager.py",
+            RUNTIME_DIR / "device.py",
         ):
             path = self.root / relative
             digest.update(f"file={relative.as_posix()}\n".encode())
@@ -146,7 +146,7 @@ class VenvManager:
         if self.device == "cpu":
             self._pip(venv, ["install", f"torch=={CPU_TORCH_VERSION}"])
         self._run(
-            [str(venv.python), str(self.root / RUNTIME_DIR / "env.py"),
+            [str(venv.python), str(self.root / RUNTIME_DIR / "device.py"),
              "probe", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,
@@ -164,7 +164,7 @@ class VenvManager:
         self._pip(venv, ["install", "--no-build-isolation", "--no-deps",
                          "-e", str(self.root)])
         self._run(
-            [str(venv.python), str(self.root / RUNTIME_DIR / "env.py"),
+            [str(venv.python), str(self.root / RUNTIME_DIR / "device.py"),
              "check", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,

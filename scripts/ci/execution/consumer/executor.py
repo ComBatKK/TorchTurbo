@@ -5,38 +5,32 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import shlex
-import signal
 import subprocess
 import sys
-import threading
 import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from ... import repository_root
-from ...contracts.artifacts import (
-    ContractError,
-    IntegrationEvidence,
+from ...contracts.base import ContractError, SCHEMA_VERSION
+from ...contracts.executor_contract import (
+    JOB_RESULT_FILENAME,
+    Failure,
+    JobResult,
+    TaskEvidence,
+    TaskResult,
+)
+from ...contracts.planner_contract import (
+    ExecutionPlan,
     IntegrationSpec,
     Job,
-    JobResult,
-    Plan,
-    PytestEvidence,
     PytestSpec,
-    SCHEMA_VERSION,
-    Step,
-    StepResult,
-    JOB_RESULT_FILENAME,
-    canonical_json,
-    digest,
-    load_plan_artifact,
-    write_json,
+    TestTask,
+    load_planner_output,
 )
-from .runtime.venv import Venv, VenvManager
+from ...tools.json_io import canonical_json, write_json
+from . import integration_job, pytest_job
+from .process import run_stream, timeout_budget
+from .runtime.venv_manager import Venv, VenvManager
 
 
 class ExecutorError(ValueError):
@@ -45,95 +39,93 @@ class ExecutorError(ValueError):
 
 PROBE_TIMEOUT_SECONDS = 300
 CLEANUP_TIMEOUT_SECONDS = 60
-TRANSIENT_INTEGRATION_DIRS = ("training", "initial_checkpoint", "tensorboard")
-RUNTIME_DIR = Path("scripts/ci/execution/consumer/runtime")
+DEVICE_SCRIPT = Path("scripts/ci/execution/consumer/runtime/device.py")
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-        "+00:00", "Z"
+def _task_result(
+    task: TestTask,
+    status: str,
+    exit_code: int,
+    *,
+    evidence: TaskEvidence | None = None,
+    failure: Failure | None = None,
+) -> TaskResult:
+    return TaskResult(
+        id=task.id,
+        status=status,
+        exit_code=exit_code,
+        evidence=evidence,
+        failure=failure,
     )
 
 
-def _load_ready_plan(path: Path) -> Plan:
+def _job_result(
+    plan: ExecutionPlan,
+    job: Job,
+    *,
+    status: str,
+    duration_seconds: int,
+    tasks: tuple[TaskResult, ...] = (),
+    skip_reason: str | None = None,
+    skip_message: str | None = None,
+    failure: Failure | None = None,
+    artifact_paths: dict[str, str] | None = None,
+) -> JobResult:
+    return JobResult(
+        schema_version=SCHEMA_VERSION,
+        plan_id=plan.plan_id,
+        job_id=job.id,
+        kind=job.kind,
+        status=status,
+        duration_seconds=duration_seconds,
+        runtime=job.runtime,
+        tasks=tasks,
+        skip_reason=skip_reason,
+        skip_message=skip_message,
+        failure=failure,
+        artifact_paths=artifact_paths or {},
+    )
+
+
+def _provisional_result(
+    plan: ExecutionPlan,
+    job: Job,
+    *,
+    log_path: Path,
+) -> JobResult:
+    return _job_result(
+        plan,
+        job,
+        status="infra_error",
+        duration_seconds=0,
+        failure=Failure(
+            code="executor-incomplete",
+            message="executor did not finalize JobResult",
+        ),
+        artifact_paths={"log": log_path.name} if log_path.is_file() else {},
+    )
+
+
+def _write_result(result: JobResult, output_dir: Path) -> None:
+    write_json(output_dir / JOB_RESULT_FILENAME, result.to_dict())
+
+
+def _load_ready_plan(path: Path) -> ExecutionPlan:
     try:
-        artifact = load_plan_artifact(path)
+        output = load_planner_output(path)
     except ContractError as exc:
         raise ExecutorError(str(exc)) from exc
-    if artifact.status != "ready" or artifact.plan is None:
-        details = "; ".join(issue.message for issue in artifact.errors)
-        raise ExecutorError(f"planner artifact is not ready: {details}")
-    return artifact.plan
+    if output.status != "ready" or output.plan is None:
+        details = "; ".join(issue.message for issue in output.errors)
+        raise ExecutorError(f"planner output is not ready: {details}")
+    return output.plan
 
 
-def _job(plan: Plan, job_id: str) -> Job:
+def _job(plan: ExecutionPlan, job_id: str) -> Job:
     for job in plan.jobs:
         if job.id == job_id:
             return job
     raise ExecutorError(f"job {job_id!r} is not in plan {plan.plan_id}")
-
-
-def _terminate_process_group(process: subprocess.Popen[str], sig: int) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        return
-
-
-def _run_stream(
-    command: list[str],
-    *,
-    cwd: Path,
-    environment: dict[str, str],
-    log_path: Path,
-    timeout_seconds: int,
-) -> tuple[int, bool]:
-    print("+ " + " ".join(command), flush=True)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timed_out = threading.Event()
-    with log_path.open("a", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-
-        def terminate() -> None:
-            timed_out.set()
-            _terminate_process_group(process, signal.SIGTERM)
-
-            def kill() -> None:
-                _terminate_process_group(process, signal.SIGKILL)
-
-            timer = threading.Timer(10, kill)
-            timer.daemon = True
-            timer.start()
-
-        timer = threading.Timer(timeout_seconds, terminate)
-        timer.daemon = True
-        timer.start()
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
-            rc = process.wait()
-        except KeyboardInterrupt:
-            _terminate_process_group(process, signal.SIGTERM)
-            process.wait()
-            raise
-        finally:
-            timer.cancel()
-    if timed_out.is_set():
-        return 124, True
-    return rc, False
 
 
 def _probe_environment(
@@ -145,10 +137,10 @@ def _probe_environment(
     log_path: Path,
     timeout_seconds: int,
 ) -> tuple[int, bool]:
-    return _run_stream(
+    return run_stream(
         [
             str(venv.python),
-            str(root / RUNTIME_DIR / "env.py"),
+            str(root / DEVICE_SCRIPT),
             "probe",
             "--device",
             job.runtime.device,
@@ -168,7 +160,7 @@ def _cleanup_environment(venv: Venv, root: Path, log_path: Path) -> None:
         result = subprocess.run(
             [
                 str(venv.python),
-                str(root / RUNTIME_DIR / "env.py"),
+                str(root / DEVICE_SCRIPT),
                 "cleanup",
             ],
             cwd=root,
@@ -191,19 +183,6 @@ def _cleanup_environment(venv: Venv, root: Path, log_path: Path) -> None:
         print(f"::warning::environment cleanup failed: {exc}", file=sys.stderr)
 
 
-def _prune_integration_artifacts(output_dir: Path) -> None:
-    """Drop transient model/event output before uploading CI artifacts."""
-    integration = output_dir / "integration"
-    if not integration.is_dir():
-        return
-    for name in TRANSIENT_INTEGRATION_DIRS:
-        for path in integration.glob(f"*/*/{name}"):
-            if not path.is_dir():
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            print(f"Pruned transient CI artifact: {path}", flush=True)
-
-
 def _prepare_environment(
     job: Job,
     *,
@@ -212,146 +191,89 @@ def _prepare_environment(
     venv_root: Path,
     log_path: Path,
     deadline: float,
-) -> tuple[Venv | None, str, dict[str, Any] | None]:
+) -> tuple[Venv | None, str, Failure | None]:
     """Install the planned venv and probe the planned runtime."""
     try:
         specs = {job.runtime.venv.name: job.runtime.venv}
         manager = VenvManager(root, venv_root, job.runtime.device, log_path, specs)
         venv = manager.ensure(job.runtime.venv.name)
-        probe_limit, probe_limited = _timeout_budget(deadline, PROBE_TIMEOUT_SECONDS)
+        probe_limit, probe_limited = timeout_budget(deadline, PROBE_TIMEOUT_SECONDS)
         if probe_limit == 0:
             return venv, "failed", _job_timeout_failure(job)
         probe_rc, probe_timeout = _probe_environment(
-            venv, job, root=root, output_dir=output_dir,
-            log_path=log_path, timeout_seconds=probe_limit,
+            venv,
+            job,
+            root=root,
+            output_dir=output_dir,
+            log_path=log_path,
+            timeout_seconds=probe_limit,
         )
         if probe_rc == 0:
             return venv, "passed", None
         if probe_timeout and probe_limited:
             return venv, "failed", _job_timeout_failure(job)
-        return venv, "infra_error", {
-            "code": "environment-probe-timeout" if probe_timeout else "environment-probe",
-            "message": f"environment probe failed with rc={probe_rc}",
-        }
+        return venv, "infra_error", Failure(
+            code="environment-probe-timeout" if probe_timeout else "environment-probe",
+            message=f"environment probe failed with rc={probe_rc}",
+        )
     except Exception as exc:  # noqa: BLE001 - every setup failure must produce a result
-        return None, "infra_error", {
-            "code": "environment-setup",
-            "message": f"{type(exc).__name__}: {exc}",
-        }
+        return None, "infra_error", Failure(
+            code="environment-setup",
+            message=f"{type(exc).__name__}: {exc}",
+        )
 
 
-def _timeout_budget(deadline: float, requested_seconds: int) -> tuple[int, bool]:
-    """Return the timeout allowed by both the step and the remaining job budget."""
-    remaining = max(0, int(deadline - time.monotonic()))
-    return min(requested_seconds, remaining), remaining < requested_seconds
-
-
-def _pytest_command(venv: Venv, spec: PytestSpec, junit: Path) -> list[str]:
-    args = shlex.split(os.environ.get("PYTEST_ARGS", "-v --durations=20"))
-    return [
-        str(venv.python),
-        "-m",
-        "pytest",
-        *args,
-        "-m",
-        spec.marker,
-        "--continue-on-collection-errors",
-        f"--junitxml={junit}",
-        *spec.files,
-    ]
-
-
-def _integration_command(
-    venv: Venv,
-    spec: IntegrationSpec,
-    job: Job,
-    step: Step,
-    *,
-    root: Path,
-    output_dir: Path,
-) -> list[str]:
-    return [
-        str(venv.python),
-        str(root / spec.runner.script),
-        "--suite",
-        spec.suite,
-        "--platform",
-        job.runtime.device,
-        "--ngpu",
-        str(step.ranks),
-        "--test_name",
-        spec.case_id,
-        "--skip-install",
-        "--forbid-update-golden",
-        "--output-dir",
-        str(output_dir / "integration"),
-        *spec.runner.args,
-    ]
-
-
-def _step_command(
+def _task_command(
     venv: Venv,
     job: Job,
-    step: Step,
+    task: TestTask,
     *,
     index: int,
     root: Path,
     output_dir: Path,
 ) -> tuple[list[str], dict[str, str], Path | None]:
-    if isinstance(step.spec, PytestSpec):
-        junit = output_dir / "junit" / f"step-{index:02d}.xml"
-        junit.parent.mkdir(parents=True, exist_ok=True)
-        return _pytest_command(venv, step.spec, junit), venv.environment(), junit
-    if isinstance(step.spec, IntegrationSpec):
+    if isinstance(task.spec, PytestSpec):
+        junit = pytest_job.report_path(output_dir, index)
         return (
-            _integration_command(
+            pytest_job.command(venv, task.spec, junit),
+            venv.environment(),
+            junit,
+        )
+    if isinstance(task.spec, IntegrationSpec):
+        return (
+            integration_job.command(
                 venv,
-                step.spec,
+                task.spec,
                 job,
-                step,
+                task,
                 root=root,
                 output_dir=output_dir,
             ),
             venv.environment(),
             None,
         )
-    raise ExecutorError(f"unsupported step spec for {step.id}")
+    raise ExecutorError(f"unsupported task spec for {task.id}")
 
 
-def _step_result(
-    step: Step,
-    status: str,
-    exit_code: int,
-    case_ids: tuple[str, ...] = (),
-) -> StepResult:
-    return StepResult(
-        id=step.id,
-        status=status,
-        exit_code=exit_code,
-        spec_digest=digest(step.spec.to_dict()),
-        case_ids=case_ids,
-    )
-
-
-def _step_failure(
+def _task_failure(
     job: Job,
-    step: Step,
+    task: TestTask,
     *,
     exit_code: int,
     timed_out: bool,
     deadline: float,
-) -> dict[str, Any]:
+) -> Failure:
     if timed_out and time.monotonic() >= deadline:
-        return _job_timeout_failure(job, step.id)
-    code = "step-timeout" if timed_out else "step-failed"
+        return _job_timeout_failure(job)
+    code = "task-timeout" if timed_out else "task-failed"
     message = (
-        f"step timed out after {step.timeout_minutes} minutes"
-        if timed_out else f"step exited with code {exit_code}"
+        f"task timed out after {task.timeout_minutes} minutes"
+        if timed_out else f"task exited with code {exit_code}"
     )
-    return {"code": code, "step_id": step.id, "message": message}
+    return Failure(code=code, message=message)
 
 
-def _execute_steps(
+def _execute_tasks(
     venv: Venv,
     job: Job,
     *,
@@ -359,29 +281,30 @@ def _execute_steps(
     output_dir: Path,
     log_path: Path,
     deadline: float,
-) -> tuple[str, dict[str, Any] | None, list[StepResult], list[Path], int]:
+) -> tuple[str, list[TaskResult], list[Path]]:
     status: str = "passed"
-    failure: dict[str, Any] | None = None
-    results: list[StepResult] = []
+    results: list[TaskResult] = []
     junit_paths: list[Path] = []
-    executed_files = 0
-    for index, step in enumerate(job.steps):
-        case_ids = (
-            (step.spec.case_id,) if isinstance(step.spec, IntegrationSpec) else ()
-        )
-        limit, _ = _timeout_budget(deadline, step.timeout_minutes * 60)
+    for index, task in enumerate(job.tasks):
+        limit, _ = timeout_budget(deadline, task.timeout_minutes * 60)
         if limit == 0:
-            results.append(_step_result(step, "failed", 124, case_ids))
-            return "failed", _job_timeout_failure(job, step.id), results, junit_paths, executed_files
-        step_started = time.monotonic()
+            results.append(_task_result(
+                task,
+                "failed",
+                124,
+                failure=_job_timeout_failure(job),
+            ))
+            return "failed", results, junit_paths
+        task_started = time.monotonic()
+        junit: Path | None = None
+        task_failure: Failure | None = None
         try:
-            command, environment, junit = _step_command(
-                venv, job, step, index=index, root=root, output_dir=output_dir
+            command, environment, junit = _task_command(
+                venv, job, task, index=index, root=root, output_dir=output_dir
             )
             if junit is not None:
                 junit_paths.append(junit)
-                executed_files += len(step.spec.files)
-            exit_code, timed_out = _run_stream(
+            exit_code, timed_out = run_stream(
                 command,
                 cwd=root,
                 environment=environment,
@@ -390,71 +313,51 @@ def _execute_steps(
             )
         except KeyboardInterrupt:
             status, exit_code = "cancelled", 130
-            failure = {"code": "cancelled", "step_id": step.id, "message": "cancelled"}
-        except Exception as exc:  # noqa: BLE001 - report step infrastructure failure
+            task_failure = Failure(code="cancelled", message="cancelled")
+        except Exception as exc:  # noqa: BLE001 - report task infrastructure failure
             status, exit_code, timed_out = "infra_error", 2, False
-            failure = {
-                "code": "step-setup",
-                "step_id": step.id,
-                "message": f"{type(exc).__name__}: {exc}",
-            }
-        step_status = status if status != "passed" else (
+            task_failure = Failure(
+                code="task-setup",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        task_status = status if status != "passed" else (
             "passed" if exit_code == 0 else "failed"
         )
-        results.append(_step_result(step, step_status, exit_code, case_ids))
         if status == "passed" and exit_code != 0:
             status = "failed"
-            failure = _step_failure(
-                job, step, exit_code=exit_code, timed_out=timed_out,
+            task_failure = _task_failure(
+                job,
+                task,
+                exit_code=exit_code,
+                timed_out=timed_out,
                 deadline=deadline,
             )
+        evidence = (
+            pytest_job.evidence(junit)
+            if junit is not None and junit.is_file()
+            else None
+        )
+        results.append(_task_result(
+            task,
+            task_status,
+            exit_code,
+            evidence=evidence,
+            failure=task_failure,
+        ))
         if status != "passed":
-            elapsed = int(time.monotonic() - step_started)
-            print(f"step {step.id} finished in {elapsed}s with status={step_status}", flush=True)
+            elapsed = int(time.monotonic() - task_started)
+            print(
+                f"task {task.id} finished in {elapsed}s with status={task_status}",
+                flush=True,
+            )
             break
-    return status, failure, results, junit_paths, executed_files
+    return status, results, junit_paths
 
 
-def _job_timeout_failure(job: Job, step_id: str = "") -> dict[str, Any]:
-    failure = {
-        "code": "job-timeout",
-        "message": f"job budget exhausted after {job.timeout_minutes} minutes",
-    }
-    if step_id:
-        failure["step_id"] = step_id
-    return failure
-
-
-def _junit_suites(path: Path) -> list[ET.Element]:
-    if not path.is_file():
-        return []
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError):
-        return []
-    return [root] if root.tag == "testsuite" else root.findall("testsuite")
-
-
-def _merge_junit(paths: list[Path], output: Path) -> None:
-    merged = ET.Element("testsuites")
-    for path in paths:
-        merged.extend(_junit_suites(path))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(merged).write(output, encoding="utf-8", xml_declaration=True)
-
-
-def _junit_evidence(path: Path, executed_files: int) -> PytestEvidence:
-    suites = _junit_suites(path)
-
-    def count(key: str) -> int:
-        return sum(int(suite.get(key, 0)) for suite in suites)
-
-    return PytestEvidence(
-        executed_files=executed_files,
-        tests_total=count("tests"),
-        tests_failed=count("failures"),
-        tests_errors=count("errors"),
-        tests_skipped=count("skipped"),
+def _job_timeout_failure(job: Job) -> Failure:
+    return Failure(
+        code="job-timeout",
+        message=f"job budget exhausted after {job.timeout_minutes} minutes",
     )
 
 
@@ -478,87 +381,14 @@ def _write_versions(venv: Venv, output: Path, root: Path) -> None:
     output.write_text(result.stdout.strip() + "\n", encoding="utf-8")
 
 
-def _evidence(
-    job: Job,
-    executed_files: int,
-    merged_junit: Path,
-) -> PytestEvidence | IntegrationEvidence:
-    if job.kind == "pytest":
-        return _junit_evidence(merged_junit, executed_files)
-    integration = [
-        step.spec for step in job.steps if isinstance(step.spec, IntegrationSpec)
-    ]
-    if len(integration) != 1:
-        raise ExecutorError("integration job must contain exactly one integration step")
-    spec = integration[0]
-    return IntegrationEvidence(suite=spec.suite, case_ids=(spec.case_id,))
-
-
-def _write_result(result: JobResult, output_dir: Path) -> None:
-    write_json(output_dir / JOB_RESULT_FILENAME, result.to_dict())
-
-
-def _new_result(
-    plan: Plan,
-    job: Job,
-    *,
-    status: str,
-    started_at: str,
-    finished_at: str,
-    duration_seconds: int,
-    items: PytestEvidence | IntegrationEvidence,
-    **values: Any,
-) -> JobResult:
-    values.setdefault("steps", ())
-    values.setdefault("artifacts", {})
-    return JobResult(
-        schema_version=SCHEMA_VERSION,
-        plan_id=plan.plan_id,
-        job_id=job.id,
-        kind=job.kind,
-        status=status,
-        started_at=started_at,
-        finished_at=finished_at,
-        duration_seconds=duration_seconds,
-        runtime=job.runtime,
-        items=items,
-        **values,
-    )
-
-
-def _provisional_result(
-    plan: Plan,
-    job: Job,
-    *,
-    started_at: str,
-    log_path: Path,
-    merged_junit: Path,
-) -> JobResult:
-    """Write a parseable result before execution can be killed externally."""
-    return _new_result(
-        plan,
-        job,
-        status="infra_error",
-        started_at=started_at,
-        finished_at=started_at,
-        duration_seconds=0,
-        items=_evidence(job, 0, merged_junit),
-        failure={
-            "code": "executor-incomplete",
-            "message": "executor did not finalize JobResult",
-        },
-        artifacts={"log": log_path.name} if log_path.is_file() else {},
-    )
-
-
 def execute(
-    plan: Plan,
+    plan: ExecutionPlan,
     job_id: str,
     *,
     output_dir: Path,
     root: Path | None = None,
 ) -> JobResult:
-    """Execute one Job from a ready Plan without reading CiConfig or TestFacts."""
+    """Execute one Job from a ready ExecutionPlan."""
     job = _job(plan, job_id)
     root = root or repository_root()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -569,22 +399,14 @@ def execute(
         "CI_VENV_ROOT", Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "turbo-ci-venv"
     ))
     log_path.write_text("", encoding="utf-8")
-    started_at = _now()
     started = time.monotonic()
     _write_result(
-        _provisional_result(
-            plan,
-            job,
-            started_at=started_at,
-            log_path=log_path,
-            merged_junit=merged_junit,
-        ),
+        _provisional_result(plan, job, log_path=log_path),
         output_dir,
     )
     deadline = started + job.timeout_minutes * 60
-    step_results: list[StepResult] = []
+    task_results: list[TaskResult] = []
     junit_paths: list[Path] = []
-    executed_files = 0
 
     venv, status, failure = _prepare_environment(
         job,
@@ -594,9 +416,8 @@ def execute(
         log_path=log_path,
         deadline=deadline,
     )
-
     if status == "passed" and venv is not None:
-        status, failure, step_results, junit_paths, executed_files = _execute_steps(
+        status, task_results, junit_paths = _execute_tasks(
             venv,
             job,
             root=root,
@@ -604,48 +425,42 @@ def execute(
             log_path=log_path,
             deadline=deadline,
         )
-
     if venv is not None and job.runtime.device == "npu":
         _cleanup_environment(venv, root, log_path)
 
-    _prune_integration_artifacts(output_dir)
-
-    _merge_junit(junit_paths, merged_junit)
+    integration_job.prune_artifacts(output_dir)
+    pytest_job.merge_reports(junit_paths, merged_junit)
     if venv is not None:
         try:
             _write_versions(venv, versions_path, root)
         except OSError as exc:
             print(f"::warning::could not write versions: {exc}", file=sys.stderr)
 
-    artifacts = {"log": log_path.name}
+    artifact_paths = {"log": log_path.name}
     if job.kind == "pytest":
-        artifacts["junit"] = merged_junit.name
+        artifact_paths["junit"] = merged_junit.name
     if job.kind == "integration" and (output_dir / "integration").is_dir():
-        artifacts["integration"] = "integration"
+        artifact_paths["integration"] = "integration"
     torch_before = output_dir / "torch-before.json"
     if torch_before.is_file():
-        artifacts["torch-before"] = torch_before.name
+        artifact_paths["torch-before"] = torch_before.name
     if versions_path.is_file():
-        artifacts["versions"] = versions_path.name
-    finished_at = _now()
-    result = _new_result(
+        artifact_paths["versions"] = versions_path.name
+    result = _job_result(
         plan,
         job,
         status=status,
-        started_at=started_at,
-        finished_at=finished_at,
         duration_seconds=int(time.monotonic() - started),
-        items=_evidence(job, executed_files, merged_junit),
-        steps=tuple(step_results),
+        tasks=tuple(task_results),
         failure=failure,
-        artifacts=artifacts,
+        artifact_paths=artifact_paths,
     )
     _write_result(result, output_dir)
     return result
 
 
 def record_skip(
-    plan: Plan,
+    plan: ExecutionPlan,
     job_id: str,
     reason: str,
     *,
@@ -657,15 +472,11 @@ def record_skip(
     if reason not in job.allowed_skip_reasons:
         raise ExecutorError(f"job {job.id!r} does not allow skip reason {reason!r}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = _now()
-    result = _new_result(
+    result = _job_result(
         plan,
         job,
         status="skipped",
-        started_at=timestamp,
-        finished_at=timestamp,
         duration_seconds=0,
-        items=_evidence(job, 0, output_dir / "pytest.xml"),
         skip_reason=reason,
         skip_message=message or reason,
     )
@@ -681,29 +492,43 @@ def render_summary(result: JobResult) -> str:
         f"- plan: `{result.plan_id}`",
         f"- duration: {result.duration_seconds}s",
     ]
-    if isinstance(result.items, PytestEvidence):
+    if result.kind == "pytest":
+        evidence = [
+            task.evidence
+            for task in result.tasks
+            if task.evidence is not None
+        ]
         lines.append(
-            f"- pytest: {result.items.tests_total} tests, "
-            f"{result.items.tests_failed} failed, {result.items.tests_errors} errors, "
-            f"{result.items.tests_skipped} skipped"
+            f"- pytest: {sum(item.tests_total for item in evidence)} tests, "
+            f"{sum(item.tests_failed for item in evidence)} failed, "
+            f"{sum(item.tests_errors for item in evidence)} errors, "
+            f"{sum(item.tests_skipped for item in evidence)} skipped"
         )
-    elif isinstance(result.items, IntegrationEvidence):
-        lines.append(
-            f"- integration {result.items.suite}: "
-            f"{', '.join(result.items.case_ids)}"
+    elif result.kind == "integration" and "integration" in result.artifact_paths:
+        lines.append(f"- integration: {result.artifact_paths['integration']}")
+    failure = result.failure
+    task_id = ""
+    if failure is None:
+        failed_task = next(
+            (task for task in result.tasks if task.failure is not None),
+            None,
         )
-    if result.failure:
-        step = f" ({result.failure['step_id']})" if result.failure.get("step_id") else ""
-        lines.append(
-            f"- failure: `{result.failure.get('code', 'unknown')}`{step}: "
-            f"{result.failure.get('message', '')}"
-        )
+        if failed_task is not None:
+            failure = failed_task.failure
+            task_id = failed_task.id
+    if failure is not None:
+        task = f" ({task_id})" if task_id else ""
+        lines.append(f"- failure: `{failure.code}`{task}: {failure.message}")
     return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", required=True, help="Plan or ready PlanArtifact JSON")
+    parser.add_argument(
+        "--plan",
+        required=True,
+        help="ExecutionPlan or ready PlannerOutput JSON",
+    )
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--output", default="", help="JobResult JSON path")
     parser.add_argument("--root", default=None)

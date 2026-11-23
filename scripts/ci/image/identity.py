@@ -1,117 +1,60 @@
-"""Compute immutable image identity from recipes and build inputs."""
+"""Compute the build identity and candidate reference for a container image."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..contracts.artifacts import canonical_json
-from .recipe import (
-    ImageError,
-    ImageSpec,
-    _git_has_file,
-    _git_names,
-    _read_file,
-    load_specs,
-)
+from ..tools.hashing import content_digest
+from .recipe import ImageError, ImageSpec, load_specs
 from .selection import select_named
-
-HASH_LENGTH = 12
 
 
 @dataclass(frozen=True)
 class ImagePlan:
     spec: ImageSpec
-    content_tag: str
+    build_input_hash: str
 
     @property
-    def name(self) -> str:
-        return self.spec.name
+    def image_id(self) -> str:
+        return self.spec.image_id
 
     @property
-    def content_ref(self) -> str:
-        return f"{self.spec.repository}:{self.content_tag}"
+    def candidate_tag(self) -> str:
+        suffix = f"-{self.build_input_hash.removeprefix('sha256:')[:12]}"
+        return self.spec.alias[: 128 - len(suffix)] + suffix
+
+    @property
+    def candidate_ref(self) -> str:
+        return f"{self.spec.repository}:{self.candidate_tag}"
 
 
-def _ignored(relative: str) -> bool:
-    parts = Path(relative).parts
-    return (
-        any(part in {".git", "__pycache__"} for part in parts)
-        or relative.endswith((".pyc", ".pyo"))
-        or relative.endswith(".DS_Store")
-    )
-
-
-def _identity_files(root: Path, spec: ImageSpec, revision: str | None) -> list[str]:
-    paths = {spec.dockerfile}
-    if revision is None:
-        context = root / spec.context
-        if not context.exists():
-            raise ImageError(f"build context does not exist: {spec.context}")
-        if context.is_dir():
-            for path in context.rglob("*"):
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(root).as_posix()
-                if not _ignored(relative):
-                    paths.add(relative)
-        else:
-            paths.add(spec.context)
-    else:
-        if not _git_has_file(root, revision, spec.context):
-            raise ImageError(
-                f"build context is absent at revision {revision}: {spec.context}"
-            )
-        paths.update(_git_names(root, revision, spec.context))
-        if not _git_has_file(root, revision, spec.dockerfile):
-            raise ImageError(
-                f"dockerfile is absent at revision {revision}: {spec.dockerfile}"
-            )
-    return sorted(path for path in paths if not _ignored(path))
-
-
-def identity_digest(root: Path, spec: ImageSpec, revision: str | None = None) -> str:
-    """Hash every input that changes the built candidate."""
-    files: dict[str, str] = {}
-    for relative in _identity_files(root, spec, revision):
-        files[relative] = hashlib.sha256(_read_file(root, relative, revision)).hexdigest()
-    payload = {
-        "schema_version": 1,
-        "dockerfile": spec.dockerfile,
-        "context": spec.context,
+def build_input_hash(root: Path, spec: ImageSpec) -> str:
+    """Hash the Dockerfile, platform and manual revision of one image."""
+    path = root / spec.dockerfile
+    try:
+        dockerfile = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ImageError(f"cannot read dockerfile {spec.dockerfile}: {exc}") from exc
+    return content_digest({
+        "dockerfile": dockerfile,
         "platform": spec.platform,
-        "build_args": dict(sorted(spec.build_args.items())),
         "revision": spec.revision,
-        "files": files,
-    }
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:HASH_LENGTH]
+    })
 
 
-def content_tag(root: Path, spec: ImageSpec, revision: str | None = None) -> str:
-    """Return the immutable candidate tag for a recipe."""
-    digest = identity_digest(root, spec, revision)
-    return f"{spec.version_prefix}{spec.version}-{spec.hardware}-c{digest}"
+def plan_image(root: Path, spec: ImageSpec) -> ImagePlan:
+    return ImagePlan(spec=spec, build_input_hash=build_input_hash(root, spec))
 
 
-def image_plans(
-    root: Path,
-    *,
-    names: str = "",
-    revision: str | None = None,
-) -> list[ImagePlan]:
-    """Build plans for selected images at a worktree or Git revision."""
-    specs = load_specs(root, revision)
-    selected = select_named(specs, names or "all")
-    return [
-        ImagePlan(spec=spec, content_tag=content_tag(root, spec, revision))
-        for spec in selected
-    ]
+def image_plans(root: Path, *, names: str = "") -> list[ImagePlan]:
+    """Return plans for all container images or a comma-separated selection."""
+    specs = select_named(load_specs(root), names or "all")
+    return [plan_image(root, spec) for spec in specs]
 
 
-def image_plan(root: Path, name: str, *, revision: str | None = None) -> ImagePlan:
-    """Build the single plan for a logical image name."""
-    plans = image_plans(root, names=name, revision=revision)
+def image_plan(root: Path, image_id: str) -> ImagePlan:
+    plans = image_plans(root, names=image_id)
     if len(plans) != 1:
-        raise ImageError(f"expected one image plan for {name!r}")
+        raise ImageError(f"expected one image plan for {image_id!r}")
     return plans[0]

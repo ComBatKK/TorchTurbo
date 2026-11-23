@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
-"""Derive test facts from pytest sources and integration suite manifests."""
+"""Derive test facts from pytest markers and integration suite manifests."""
 
 from __future__ import annotations
 
-import argparse
+import ast
 import json
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from ... import repository_root
-from . import scan as test_scan
-from .ci_config import CiConfig
-from ...contracts.artifacts import (
-    DEVICES,
-    SUITES,
-    Issue,
-    canonical_json,
-    digest,
-    file_digest,
-    write_json,
-)
+from .config import CiConfig
+from ...contracts.base import Diagnostic
+from ...contracts.planner_contract import DEVICES
+from ...tools.hashing import file_sha256
 
 PYTEST_ROOT = Path("tests/unit_tests")
 MANIFEST_SCHEMA_VERSION = 1
+DEVICE_MARKERS = frozenset({"cpu", "npu", "gpu"})
+MULTI_MARKERS = {"multi_npu": "npu", "multi_gpu": "gpu"}
+REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration")
+FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
+MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
 
 
 class FactsError(ValueError):
     """Raised when repository test facts are missing or inconsistent."""
 
-    def __init__(self, issues: Iterable[Issue]) -> None:
+    def __init__(self, issues: Iterable[Diagnostic]) -> None:
         self.issues = tuple(issues)
         super().__init__("; ".join(issue.message for issue in self.issues))
 
@@ -44,7 +41,6 @@ class PytestFact:
     model_families: tuple[str, ...]
     devices: tuple[str, ...]
     ranks_by_device: dict[str, int]
-    tags: tuple[str, ...]
     process_group: str
 
 
@@ -56,12 +52,8 @@ class IntegrationFact:
     platform: str
     targets: tuple[str, ...]
     ranks: int
-    compare: bool
-    update_golden: bool
-    config: str
-    golden: str
-    config_digest: str
-    golden_digest: str
+    config_sha256: str
+    golden_sha256: str
 
 
 @dataclass(frozen=True)
@@ -70,75 +62,231 @@ class TestFacts:
 
     pytest: tuple[PytestFact, ...]
     integration: tuple[IntegrationFact, ...]
-    registered_models: tuple[str, ...]
-    digest: str
-
-    def dump_payload(self) -> dict[str, Any]:
-        return {
-            "pytest": [asdict(item) for item in self.pytest],
-            "integration": [asdict(item) for item in self.integration],
-            "registered_models": list(self.registered_models),
-        }
-
-    def integration_for(self, suite: str) -> tuple[IntegrationFact, ...]:
-        return tuple(item for item in self.integration if item.suite == suite)
 
 
-def _issue(path: str, message: str, code: str = "invalid-test-facts") -> Issue:
-    return Issue(code=code, path=path, message=message)
+def _issue(path: str, message: str, code: str = "invalid-test-facts") -> Diagnostic:
+    return Diagnostic(code=code, location=path, message=message)
 
 
-def classify_suite(path: str, frameworks: Iterable[str], families: Iterable[str]) -> str:
-    """Classify a pytest file by responsibility, not by device or framework."""
+def test_parts(path: str) -> tuple[str, ...]:
+    parts = Path(path).parts
+    if parts[:2] == ("tests", "unit_tests"):
+        return parts[2:]
+    return parts[1:] if parts[:1] == ("tests",) else parts
+
+
+def classify_suite(
+    path: str, frameworks: Iterable[str], families: Iterable[str]
+) -> str:
     framework_set = set(frameworks)
     family_set = set(families)
-    parts = test_scan.test_parts(path)
+    parts = test_parts(path)
     if parts[:1] == ("adapters",) or framework_set:
         return "adapter"
     if parts[:1] == ("models",) and len(parts) >= 2:
         if len(parts) == 2 or parts[1] == "modules":
             return "core"
-        if len(parts) >= 3 and parts[1] not in test_scan.MODEL_PACKAGES:
+        if parts[1] not in MODEL_PACKAGES:
             return "model"
-    if family_set:
-        return "model"
-    return "core"
+    return "model" if family_set else "core"
 
 
-def _pytest_facts(root: Path, models: set[str]) -> tuple[list[PytestFact], list[Issue]]:
-    scanned, errors = test_scan.scan_tests(root, models)
-    issues = [_issue(error.path, error.message) for error in errors]
+def _marker_names(node: ast.AST) -> set[str]:
+    values = node.elts if isinstance(node, (ast.List, ast.Tuple, ast.Set)) else [node]
+    names: set[str] = set()
+    for value in values:
+        if isinstance(value, ast.Call):
+            value = value.func
+        if isinstance(value, ast.Attribute):
+            names.add(value.attr)
+    return names
+
+
+def _module_markers(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is not None and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in targets
+        ):
+            names |= _marker_names(value)
+    return names
+
+
+def _dotted_name(node: ast.AST) -> str:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _literal_int(call: ast.Call, name: str) -> int | None:
+    for keyword in call.keywords:
+        if keyword.arg == name and isinstance(keyword.value, ast.Constant):
+            value = keyword.value.value
+            return value if isinstance(value, int) else None
+    return None
+
+
+def _parametrized_ranks(tree: ast.AST) -> int:
+    required = 1
+    names = {"world_size", "nprocs", "num_processes", "rank_size"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _dotted_name(
+            node.func
+        ).rsplit(".", 1)[-1] != "parametrize" or len(node.args) < 2:
+            continue
+        try:
+            parameters = ast.literal_eval(node.args[0])
+            values = ast.literal_eval(node.args[1])
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(parameters, str):
+            parameters = [part.strip() for part in parameters.split(",")]
+        if not isinstance(parameters, (list, tuple)):
+            continue
+        indexes = [
+            index for index, name in enumerate(parameters)
+            if isinstance(name, str) and name in names
+        ]
+        if not indexes or not isinstance(values, (list, tuple)):
+            continue
+        for row in values:
+            row = row if isinstance(row, (list, tuple)) else (row,)
+            for index in indexes:
+                if index < len(row) and isinstance(row[index], int):
+                    required = max(required, row[index])
+    return required
+
+
+def _ranks(tree: ast.AST) -> int:
+    required = 1
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+            node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        if name not in {"spawn", "init_process_group", "require_npus"}:
+            continue
+        if name == "require_npus":
+            value = node.args[0] if node.args else None
+            size = value.value if isinstance(value, ast.Constant) else None
+        else:
+            size = _literal_int(
+                node, "world_size" if name == "init_process_group" else "nprocs"
+            )
+        required = max(required, size if isinstance(size, int) else 2)
+    return max(required, _parametrized_ranks(tree))
+
+
+def _imports(tree: ast.Module) -> tuple[set[str], set[str]]:
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    frameworks = {
+        FRAMEWORK_PACKAGES[name.split(".", 1)[0]]
+        for name in modules
+        if name.split(".", 1)[0] in FRAMEWORK_PACKAGES
+    }
+    return modules, frameworks
+
+
+def _process_group(path: str, families: set[str]) -> str:
+    parts = test_parts(path)
+    if parts[:1] == ("models",):
+        if len(parts) == 2:
+            return "layer:tests/models"
+        if len(parts) >= 3 and parts[1] not in MODEL_PACKAGES:
+            return f"family:{parts[1]}"
+    if families:
+        return "import:" + ",".join(sorted(families))
+    return f"layer:{'/'.join(Path(path).parts[:-1])}"
+
+
+def _pytest_facts(root: Path) -> tuple[list[PytestFact], list[Diagnostic]]:
     facts: list[PytestFact] = []
-    for path, fact in sorted(scanned.items()):
-        suite = classify_suite(path, fact.frameworks, fact.families)
-        if suite not in SUITES:
-            issues.append(_issue(path, f"unknown pytest suite {suite!r}"))
+    issues: list[Diagnostic] = []
+    for path in sorted((root / PYTEST_ROOT).rglob("test_*.py")):
+        rel = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError) as exc:
+            issues.append(_issue(rel, f"cannot parse test file: {exc}"))
+            continue
+        module_markers = _module_markers(tree)
+        devices: set[str] = set()
+        ranks: dict[str, int] = {}
+        tests = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+        ]
+        for test in tests:
+            markers = module_markers.copy()
+            for decorator in test.decorator_list:
+                markers |= _marker_names(decorator)
+            test_devices = markers & DEVICE_MARKERS
+            multi = {name for name in markers if name in MULTI_MARKERS}
+            test_devices |= {MULTI_MARKERS[name] for name in multi}
+            test_devices = test_devices or {"cpu"}
+            rank = max(_ranks(test), 2 if multi else 1)
+            devices |= test_devices
+            for device in test_devices:
+                ranks[device] = max(ranks.get(device, 1), rank)
+        if not tests:
+            continue
+        if len(devices) == 1:
+            device = next(iter(devices))
+            ranks[device] = max(ranks.get(device, 1), _ranks(tree))
+        modules, frameworks = _imports(tree)
+        families = {
+            name.split(".")[2] for name in modules
+            if name.startswith("torchturbo.models.")
+            and len(name.split(".")) > 2
+            and name.split(".")[2] not in MODEL_PACKAGES
+        }
+        parts = test_parts(rel)
+        if parts[:2] == ("adapters", "llamafactory_v0"):
+            frameworks.add("lf")
+        if parts[:2] == ("adapters", "msswift"):
+            frameworks.add("swift")
         facts.append(PytestFact(
-            path=path,
-            suite=suite,
-            frameworks=tuple(sorted(fact.frameworks)),
-            model_families=tuple(sorted(fact.families)),
-            devices=tuple(sorted(fact.devices)),
-            ranks_by_device={
-                device: fact.processes_for(device) for device in sorted(fact.devices)
-            },
-            tags=("integration",) if fact.integration else (),
-            process_group=fact.process,
+            path=rel,
+            suite=classify_suite(rel, frameworks, families),
+            frameworks=tuple(sorted(frameworks)),
+            model_families=tuple(sorted(families)),
+            devices=tuple(sorted(devices)),
+            ranks_by_device={device: ranks[device] for device in sorted(devices)},
+            process_group=_process_group(rel, families),
         ))
     return facts, issues
 
 
-def _manifest(root: Path, suite_name: str, runner: str) -> tuple[dict[str, Any] | None, Issue | None]:
-    command = [
-        sys.executable,
-        str(root / runner),
-        "--suite",
-        suite_name,
-        "--list-cases",
-        "--json",
-    ]
+def _manifest(
+    root: Path, suite_name: str, runner: str
+) -> tuple[dict[str, Any] | None, Diagnostic | None]:
     result = subprocess.run(
-        command,
+        [
+            sys.executable,
+            str(root / runner),
+            "--suite",
+            suite_name,
+            "--list-cases",
+            "--json",
+        ],
         cwd=root,
         capture_output=True,
         text=True,
@@ -169,7 +317,9 @@ def _manifest(root: Path, suite_name: str, runner: str) -> tuple[dict[str, Any] 
     return payload, None
 
 
-def _repo_file(root: Path, value: str, where: str, issues: list[Issue]) -> Path | None:
+def _repo_file(
+    root: Path, value: str, where: str, issues: list[Diagnostic]
+) -> Path | None:
     if not value:
         issues.append(_issue(where, "path is required"))
         return None
@@ -189,14 +339,45 @@ def _repo_file(root: Path, value: str, where: str, issues: list[Issue]) -> Path 
     return absolute
 
 
-def _integration_facts(
-    root: Path,
+def _targets(
+    item: dict[str, Any],
+    platform: str,
     config: CiConfig,
-) -> tuple[list[IntegrationFact], list[Issue]]:
-    issues: list[Issue] = []
+    where: str,
+    issues: list[Diagnostic],
+) -> tuple[str, ...]:
+    single = item.get("target")
+    multiple = item.get("targets")
+    if single is not None and multiple is not None:
+        issues.append(_issue(where, "declare target or targets, not both"))
+    if isinstance(single, str) and single:
+        values = (single,)
+    elif isinstance(multiple, list) and all(
+        isinstance(value, str) and value for value in multiple
+    ):
+        values = tuple(multiple)
+    else:
+        if multiple is not None:
+            issues.append(_issue(where, "targets must be non-empty strings"))
+        values = ()
+    for name in values:
+        target = config.targets.get(name)
+        if target is None:
+            issues.append(_issue(where, f"unknown target {name!r}"))
+        elif target.device != platform:
+            issues.append(
+                _issue(where, f"target {name!r} is for {target.device}, not {platform}")
+            )
+    return values
+
+
+def _integration_facts(
+    root: Path, config: CiConfig
+) -> tuple[list[IntegrationFact], list[Diagnostic]]:
+    issues: list[Diagnostic] = []
     facts: list[IntegrationFact] = []
-    seen: set[str] = set()
-    for suite_name, suite in sorted(config.integration.suites.items()):
+    seen: set[tuple[str, str]] = set()
+    for suite_name, suite in sorted(config.integration_areas.suites.items()):
         payload, error = _manifest(root, suite_name, suite.runner)
         if error is not None:
             issues.append(error)
@@ -226,115 +407,52 @@ def _integration_facts(
         for index, item in enumerate(cases):
             where = f"{suite.runner}.cases[{index}]"
             if not isinstance(item, dict):
-                issues.append(_issue(where, "case must be a mapping", "integration-manifest"))
+                issues.append(_issue(where, "case must be a mapping"))
                 continue
             case_id = item.get("case_id")
-            framework = item.get("framework")
-            platform = item.get("platform")
-            target = item.get("target")
-            targets_value = item.get("targets")
-            ranks = item.get("ranks")
-            compare = item.get("compare")
-            update_golden = item.get("update_golden")
-            config_path = item.get("config")
-            golden_path = item.get("golden")
             if not isinstance(case_id, str) or not case_id:
-                issues.append(_issue(f"{where}.case_id", "case_id is required", "integration-manifest"))
+                issues.append(_issue(f"{where}.case_id", "case_id is required"))
                 continue
-            if case_id in seen:
-                issues.append(_issue(f"{where}.case_id", f"duplicate case {case_id!r}", "integration-manifest"))
-            seen.add(case_id)
-            if not isinstance(framework, str) or not framework:
-                issues.append(_issue(f"{where}.framework", "framework is required", "integration-manifest"))
-                framework = ""
-            elif framework not in suite.framework_venvs:
+            key = (suite_name, case_id)
+            if key in seen:
+                issues.append(_issue(f"{where}.case_id", f"duplicate case {case_id!r}"))
+            seen.add(key)
+            framework = item.get("framework")
+            if framework not in suite.framework_venvs:
                 issues.append(_issue(
                     f"{where}.framework",
                     f"framework {framework!r} has no venv mapping",
-                    "unknown-integration-framework",
                 ))
-            if not isinstance(platform, str) or platform not in DEVICES:
-                issues.append(_issue(f"{where}.platform", "unknown platform", "integration-manifest"))
+                framework = ""
+            platform = item.get("platform")
+            if platform not in DEVICES:
+                issues.append(_issue(f"{where}.platform", "unknown platform"))
                 platform = ""
-            if target is not None and targets_value is not None:
-                issues.append(_issue(
-                    f"{where}.targets",
-                    "declare target or targets, not both",
-                    "integration-manifest",
-                ))
-            if target is not None and (not isinstance(target, str) or not target):
-                issues.append(_issue(
-                    f"{where}.target",
-                    "target must be a non-empty string",
-                    "integration-manifest",
-                ))
-            if targets_value is not None and (
-                not isinstance(targets_value, list)
-                or not all(isinstance(value, str) and value for value in targets_value)
-            ):
-                issues.append(_issue(
-                    f"{where}.targets",
-                    "targets must be a list of non-empty strings",
-                    "integration-manifest",
-                ))
-                targets_value = []
-            targets = (
-                (target,) if isinstance(target, str) and target
-                else tuple(targets_value or ())
-            )
-            if len(set(targets)) != len(targets):
-                issues.append(_issue(
-                    f"{where}.targets",
-                    "contains duplicates",
-                    "integration-manifest",
-                ))
-            for target_name in targets:
-                configured = config.targets.get(target_name)
-                if configured is None:
-                    issues.append(_issue(
-                        f"{where}.targets",
-                        f"unknown target {target_name!r}",
-                        "integration-manifest",
-                    ))
-                elif platform and configured.device != platform:
-                    issues.append(_issue(
-                        f"{where}.targets",
-                        f"target {target_name!r} is for {configured.device}, not {platform}",
-                        "integration-manifest",
-                    ))
+            elif not config.device_is_configured(platform):
+                issues.append(
+                    _issue(f"{where}.platform", f"no CI target for {platform!r}")
+                )
+            targets = _targets(
+                item, platform, config, f"{where}.targets", issues
+            ) if platform else ()
+            ranks = item.get("ranks")
             if not isinstance(ranks, int) or isinstance(ranks, bool) or ranks < 1:
-                issues.append(_issue(f"{where}.ranks", "ranks must be an integer >= 1", "integration-manifest"))
+                issues.append(_issue(f"{where}.ranks", "ranks must be an integer >= 1"))
                 ranks = 1
-            if not isinstance(compare, bool):
-                issues.append(_issue(f"{where}.compare", "compare must be a boolean", "integration-manifest"))
-                compare = False
-            if not isinstance(update_golden, bool):
-                issues.append(_issue(
-                    f"{where}.update_golden",
-                    "update_golden must be a boolean",
-                    "integration-manifest",
-                ))
-                update_golden = False
-            if update_golden:
-                issues.append(_issue(
-                    f"{where}.update_golden",
-                    "CI must not update golden values",
-                    "golden-update-forbidden",
-                ))
-            if not isinstance(config_path, str):
-                issues.append(_issue(f"{where}.config", "config path is required", "integration-manifest"))
-                config_path = ""
-            if not isinstance(golden_path, str):
-                issues.append(_issue(f"{where}.golden", "golden path is required", "integration-manifest"))
-                golden_path = ""
-            config_file = _repo_file(root, config_path, f"{where}.config", issues)
-            golden_file = _repo_file(root, golden_path, f"{where}.golden", issues)
-            if compare and golden_file is None:
-                issues.append(_issue(
-                    f"{where}.golden",
-                    "a compared case needs an existing golden file",
-                    "missing-golden",
-                ))
+            if item.get("compare") is not True:
+                issues.append(
+                    _issue(f"{where}.compare", "CI integration cases must compare")
+                )
+            if item.get("update_golden") is not False:
+                issues.append(
+                    _issue(f"{where}.update_golden", "CI must not update golden values")
+                )
+            config_file = _repo_file(
+                root, str(item.get("config") or ""), f"{where}.config", issues
+            )
+            golden_file = _repo_file(
+                root, str(item.get("golden") or ""), f"{where}.golden", issues
+            )
             facts.append(IntegrationFact(
                 suite=suite_name,
                 case_id=case_id,
@@ -342,87 +460,28 @@ def _integration_facts(
                 platform=platform,
                 targets=targets,
                 ranks=ranks,
-                compare=compare,
-                update_golden=update_golden,
-                config=config_path,
-                golden=golden_path,
-                config_digest=file_digest(config_file) if config_file is not None else "",
-                golden_digest=file_digest(golden_file) if golden_file is not None else "",
+                config_sha256=(
+                    file_sha256(config_file) if config_file is not None else ""
+                ),
+                golden_sha256=(
+                    file_sha256(golden_file) if golden_file is not None else ""
+                ),
             ))
     return facts, issues
 
 
 def load(root: Path, config: CiConfig) -> TestFacts:
-    """Scan pytest files and load every configured integration suite manifest."""
-    models = test_scan.registered_models(root)
-    pytest, pytest_issues = _pytest_facts(root, models)
+    """Load all configured pytest and integration facts."""
+    pytest, pytest_issues = _pytest_facts(root)
     integration, integration_issues = _integration_facts(root, config)
     issues = [*pytest_issues, *integration_issues]
     if not pytest:
-        issues.append(_issue(PYTEST_ROOT.as_posix(), "no pytest facts found", "empty-pytest"))
+        issues.append(_issue(PYTEST_ROOT.as_posix(), "no pytest facts found"))
     if issues:
         raise FactsError(issues)
-    facts = TestFacts(
-        pytest=tuple(pytest),
-        integration=tuple(sorted(integration, key=lambda item: (item.suite, item.case_id))),
-        registered_models=tuple(sorted(models)),
-        digest="",
-    )
     return TestFacts(
-        pytest=facts.pytest,
-        integration=facts.integration,
-        registered_models=facts.registered_models,
-        digest=digest(facts.dump_payload()),
+        pytest=tuple(pytest),
+        integration=tuple(
+            sorted(integration, key=lambda item: (item.suite, item.case_id))
+        ),
     )
-
-
-def counts(facts: TestFacts) -> dict[str, int]:
-    result = {suite: 0 for suite in SUITES}
-    for fact in facts.pytest:
-        result[fact.suite] += 1
-    result["total"] = len(facts.pytest)
-    result["integration"] = len(facts.integration)
-    return result
-
-
-def _render(issues: Iterable[Issue]) -> None:
-    for issue in issues:
-        print(f"{issue.path}: {issue.message}", file=sys.stderr)
-
-
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["check", "dump"])
-    parser.add_argument("--root", default=None)
-    parser.add_argument("--output", default="")
-    parser.add_argument("--name", default="")
-    args = parser.parse_args(argv)
-    root = Path(args.root).resolve() if args.root else repository_root()
-    from .ci_config import CiConfigError, load as load_config
-
-    try:
-        config = load_config(root)
-        facts = load(root, config)
-    except (CiConfigError, FactsError) as exc:
-        _render(exc.issues)
-        return 1
-    if args.command == "dump":
-        payload = facts.dump_payload()
-        if args.name:
-            payload = payload[args.name]
-        if args.output:
-            write_json(Path(args.output), payload)
-        else:
-            print(canonical_json(payload))
-        return 0
-    value = counts(facts)
-    print(
-        f"test facts OK ({value['total']} pytest files; core={value['core']} "
-        f"model={value['model']} adapter={value['adapter']}; "
-        f"integration={value['integration']})"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

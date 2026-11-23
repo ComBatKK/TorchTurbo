@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render non-blocking timing information for the CI job summary."""
+"""Render final execution timing for the GitHub job summary."""
 
 from __future__ import annotations
 
@@ -57,15 +57,9 @@ def timing() -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
-    if argv == ["timing"]:
-        return timing()
-    print(
-        "usage: python -m scripts.ci.execution.consumer.report timing",
-        file=sys.stderr,
-    )
-    return 2
+def main() -> int:
+    return timing()
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

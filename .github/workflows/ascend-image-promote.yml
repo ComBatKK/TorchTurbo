@@ -71,17 +71,17 @@ jobs:
           set -euo pipefail
           common=(--root "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT")
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            python3 -m scripts.ci.image plan --images "$IMAGES" "${common[@]}"
+            python3 -m scripts.ci.image.cli plan --images "$IMAGES" "${common[@]}"
           else
             changed="$RUNNER_TEMP/ci-changed-files.txt"
             git diff --name-only --diff-filter=AM --no-renames \
               "$BEFORE_SHA...HEAD" > "$changed"
-            python3 -m scripts.ci.image plan \
+            python3 -m scripts.ci.image.cli plan \
               --changed-files "$changed" "${common[@]}"
           fi
 
   promotions:
-    name: Ascend-Image-Promote (${{ matrix.image }})
+    name: Ascend-Image-Promote (${{ matrix.image_id }})
     needs: discover
     if: |
       needs.discover.result == 'success' &&
@@ -106,7 +106,7 @@ jobs:
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
       - name: check registry tooling
-        run: python3 -m scripts.ci.image check-envs
+        run: python3 -m scripts.ci.image.cli check-envs
 
       - name: log in to SWR
         env:
@@ -122,16 +122,16 @@ jobs:
       - name: promote validated candidate
         id: promote
         env:
-          IMAGE: ${{ matrix.image }}
+          IMAGE_ID: ${{ matrix.image_id }}
         run: |
-          python3 -m scripts.ci.image promote \
-            --image "$IMAGE" \
+          python3 -m scripts.ci.image.cli promote \
+            --image "$IMAGE_ID" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: summary
         if: always()
         env:
-          IMAGE: ${{ matrix.image }}
+          IMAGE_ID: ${{ matrix.image_id }}
           ALIAS: ${{ steps.promote.outputs.alias }}
           DIGEST: ${{ steps.promote.outputs.digest }}
         run: |
@@ -140,7 +140,7 @@ jobs:
             echo ''
             echo '| field | value |'
             echo '|---|---|'
-            echo "| image | \`${IMAGE}\` |"
+            echo "| image | \`${IMAGE_ID}\` |"
             echo "| alias | \`${ALIAS:-missing}\` |"
             echo "| digest | \`${DIGEST:-missing}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
