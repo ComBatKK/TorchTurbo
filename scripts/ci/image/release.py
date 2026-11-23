@@ -138,7 +138,7 @@ def resolve_images(
     results: list[ImageResult] = []
     source_sha = _source_sha(root)
     for plan in plans:
-        reference = refs.get(plan.image_id, plan.candidate_ref)
+        reference = refs.get(plan.image_id, plan.spec.publish_ref)
         repository, manifest = _manifest_for_reference(reference, registries)
         results.append(_result(
             plan,

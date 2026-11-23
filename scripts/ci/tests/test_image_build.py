@@ -112,6 +112,29 @@ def test_resolve_images_returns_immutable_refs(
     assert results[0].build.built is False
 
 
+def test_resolve_images_defaults_to_published_alias(
+    repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested: list[str] = []
+
+    class DigestRegistry:
+        def __init__(self, repository: str) -> None:
+            self.repository = repository
+
+        def require(self, reference: str) -> Manifest:
+            requested.append(reference)
+            return _manifest(reference)
+
+    monkeypatch.setattr(release, "Registry", DigestRegistry)
+    results = resolve_images(repo_root, names="npu-a3-cann90")
+
+    assert requested == ["cann9.0.0-a3-base"]
+    assert format_refs(results) == (
+        "npu-a3-cann90="
+        f"swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu@{DIGEST}\n"
+    )
+
+
 def test_existing_candidate_does_not_build(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
