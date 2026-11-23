@@ -8,7 +8,7 @@ from pathlib import Path
 from ..tools.hashing import content_digest
 from ..tools.json_io import JsonDecodeError, decode, read_json
 from .base import Contract, ContractError, Diagnostic, GitSource, SCHEMA_VERSION
-from .image_contract import ImageBinding
+from .image_contract import ResolvedImage
 
 SUITES = ("core", "model", "adapter")
 JOB_KINDS = ("pytest", "integration")
@@ -33,7 +33,7 @@ class Runtime(Contract):
     target: str
     ranks: int
     runner: str
-    image: ImageBinding
+    image: ResolvedImage
     venv: VenvSpec
 
 

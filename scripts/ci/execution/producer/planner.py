@@ -452,8 +452,8 @@ def build(
         if not selection.image.ref:
             issues.append(_issue(
                 f"resources.images.{selection.image.name}.ref",
-                "missing ImageBinding for container image",
-                "missing-image-binding",
+                "missing ResolvedImage for container image",
+                "missing-resolved-image",
             ))
     if issues:
         raise PlanError(issues)
@@ -502,7 +502,11 @@ def build(
 
 
 def requested_images(
-    config: CiConfig, scope_name: str, *, image_override: str = ""
+    config: CiConfig,
+    scope_name: str,
+    *,
+    image_override: str = "",
+    targets: str = "",
 ) -> tuple[str, ...]:
     """Return the container image IDs selected by a scope."""
     try:
@@ -511,6 +515,12 @@ def requested_images(
         raise PlanError(exc.issues) from exc
     issues: list[Diagnostic] = []
     selections = _selections(config, scope, image_override, issues)
+    target_values = set(_values(targets))
+    if target_values:
+        selections = tuple(
+            selection for selection in selections
+            if selection.image.target in target_values
+        )
     if issues:
         raise PlanError(issues)
     return tuple(sorted({

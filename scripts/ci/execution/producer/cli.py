@@ -12,6 +12,9 @@ from typing import Iterable
 from ... import repository_root
 from ...contracts.base import Diagnostic, GitSource
 from ...contracts.planner_contract import CHANGE_MODES, PlannerOutput
+from ...image.build_image import resolve_image
+from ...image.image_config import ImageError
+from ...image.registry import RegistryError
 from ...tools.json_io import canonical_json, write_json
 from .config import CiConfigError, load as load_config
 from .facts import FactsError, load as load_facts
@@ -33,10 +36,6 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--target-job", default="")
     plan.add_argument("--targets", default="")
 
-    images = commands.add_parser("images")
-    images.add_argument("--root", default="")
-    images.add_argument("--scope", default="pull_request")
-    images.add_argument("--image", default="")
     return parser
 
 
@@ -100,16 +99,6 @@ def _fail_plan(
     return 1
 
 
-def _images(args: argparse.Namespace) -> int:
-    config = load_config(_root(args.root))
-    images = ",".join(
-        requested_images(config, args.scope, image_override=args.image)
-    )
-    _append_github_output({"images": images})
-    print(images)
-    return 0
-
-
 def _plan(args: argparse.Namespace, source: GitSource) -> int:
     if args.target_job and args.targets:
         raise PlanError([Diagnostic(
@@ -118,7 +107,26 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
             message="--target-job cannot be combined with --targets",
         )])
     root = _root(args.root)
-    config = load_config(root, image_refs=_image_refs(args.image_ref))
+    image_refs = _image_refs(args.image_ref)
+    config = load_config(root)
+    if args.change_mode == "code":
+        for image_id in requested_images(
+            config,
+            args.scope,
+            image_override=args.image,
+            targets=args.targets,
+        ):
+            if image_id in image_refs:
+                continue
+            try:
+                image_refs[image_id] = resolve_image(root, image_id).ref
+            except (ImageError, RegistryError) as exc:
+                raise PlanError([Diagnostic(
+                    code="image-resolution",
+                    location=f"resources.images.{image_id}.ref",
+                    message=str(exc),
+                )]) from exc
+    config = load_config(root, image_refs=image_refs)
     facts = load_facts(root, config)
     output = planner_output_for(
         config,
@@ -143,24 +151,17 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command == "images":
-        try:
-            return _images(args)
-        except (CiConfigError, PlanError) as exc:
-            _print_diagnostics(exc.issues)
-            return 1
-
     source = _source(_root(args.root))
     try:
         return _plan(args, source)
+    except (CiConfigError, FactsError, PlanError) as exc:
+        return _fail_plan(args, source, exc.issues)
     except ValueError as exc:
         return _fail_plan(args, source, [Diagnostic(
             code="invalid-cli",
             location="plan",
             message=str(exc),
         )])
-    except (CiConfigError, FactsError, PlanError) as exc:
-        return _fail_plan(args, source, exc.issues)
 
 
 if __name__ == "__main__":

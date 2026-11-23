@@ -28,7 +28,7 @@ def test_image_workflows_use_only_the_black_box_contract(repo_root: Path) -> Non
     ):
         dumped = yaml.safe_dump(_workflow(repo_root, name))
         assert "content_tag" not in dumped
-        assert "image_plan" not in dumped
+        assert "get_image_plan" not in dumped
         assert "scripts/ci/image/images.yml" not in dumped
         for command in (
             "compute-image-refs",
@@ -40,7 +40,7 @@ def test_image_workflows_use_only_the_black_box_contract(repo_root: Path) -> Non
             assert command not in dumped
 
 
-def test_normal_pr_workflow_resolves_runtime_images_at_head(repo_root: Path) -> None:
+def test_normal_pr_workflow_plans_runtime_images(repo_root: Path) -> None:
     document = _workflow(repo_root, "ascend-pr.yml")
     jobs = document["jobs"]
     dumped = yaml.safe_dump(document)
@@ -65,8 +65,8 @@ def test_normal_pr_workflow_resolves_runtime_images_at_head(repo_root: Path) -> 
         "classify changes"
     )
     assert step_names.index("lint") > step_names.index("install CI dependencies")
-    assert step_names.index("resolve runtime images") > step_names.index("lint")
-    assert step_names.index("plan") > step_names.index("resolve runtime images")
+    assert step_names.index("plan") > step_names.index("lint")
+    assert "resolve runtime images" not in step_names
 
     classify = _step(jobs["plan"], "changes")
     assert "scripts.ci.tools.change_kind" in classify["run"]
@@ -74,20 +74,15 @@ def test_normal_pr_workflow_resolves_runtime_images_at_head(repo_root: Path) -> 
     assert "change_mode=$kind" in classify["run"]
     assert "delegated" not in classify["run"]
 
-    identity = _step(jobs["plan"], "runtime_image")
-    assert "steps.lint.outcome == 'success'" in identity["if"]
-    assert "scripts.ci.image.cli resolve" in identity["run"]
-    assert "scripts.ci.execution.producer.cli images" in identity["run"]
-    assert "--revision" not in identity["run"]
-    assert "github.event.pull_request.base.sha" not in yaml.safe_dump(identity)
-
     publish = _step(jobs["plan"], "publish")
     assert "--image-ref" in publish["run"]
-    assert "ci-image-refs" in publish["env"]["IMAGE_REFS_FILE"]
     assert 'COMMON+=(--image "$CI_IMAGE_ID")' in publish["run"]
+    assert 'COMMON+=(--image-ref "$CI_IMAGE_ID=$CI_IMAGE_REF")' in publish["run"]
     assert "--fail-code" not in publish["run"]
     assert 'echo "::error::lint failed"' in publish["run"]
-    assert 'echo "::error::cannot resolve runtime image digest"' in publish["run"]
+    assert "ci-image-refs" not in dumped
+    assert "scripts.ci.image.cli resolve" not in dumped
+    assert "scripts.ci.execution.producer.cli images" not in dumped
 
 
 def test_image_pr_separates_change_kind_image_selection_and_cpu_preflight(
@@ -153,9 +148,9 @@ def test_image_pipeline_builds_one_candidate_and_reuses_pr_scope(
         "${{ inputs.checkout_ref"
     )
     assert "scripts.ci.image.cli build" in dumped
-    assert "scripts.ci.image.cli check-envs" in dumped
     assert "scripts.ci.image.cli resolve" not in dumped
     assert "scripts.ci.image.cli promote " not in dumped
+    assert "scripts.ci.image.cli check-envs" not in dumped
     assert "scripts.ci.tools.lint" not in dumped
     assert "docker/login-action@v3" in dumped
     assert "docker/setup-buildx-action@v3" in dumped
@@ -211,7 +206,7 @@ def test_image_promote_selects_affected_images_and_fans_out(repo_root: Path) -> 
     assert '--image "$IMAGE_ID"' in promote["run"]
     assert "scripts.ci.image.cli promote" in promote["run"]
     assert "scripts.ci.image.cli resolve" not in yaml.safe_dump(promotions)
-    assert "scripts.ci.image.cli check-envs" in yaml.safe_dump(promotions)
+    assert "scripts.ci.image.cli check-envs" not in yaml.safe_dump(promotions)
     assert set(gate["needs"]) == {"discover", "promotions"}
 
 
@@ -220,7 +215,7 @@ def test_ci_yaml_uses_one_environment_inline_model(repo_root: Path) -> None:
         (repo_root / "scripts/ci/config/ci.yml").read_text(encoding="utf-8")
     )
 
-    assert document["schema_version"] == 5
+    assert "schema_version" not in document
     assert list(document["scopes"]) == ["pull_request", "nightly"]
     assert "environments" not in document
     assert "lanes" not in document["resources"]

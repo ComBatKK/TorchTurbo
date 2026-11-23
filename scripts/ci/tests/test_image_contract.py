@@ -4,7 +4,7 @@ import pytest
 
 from scripts.ci.contracts.base import ContractError
 from scripts.ci.contracts.image_contract import (
-    ImageBinding,
+    ResolvedImage,
     ImageBuildResult,
 )
 
@@ -12,8 +12,8 @@ DIGEST = "sha256:" + "a" * 64
 REF = f"registry.example/team/image@{DIGEST}"
 
 
-def _container_binding() -> ImageBinding:
-    return ImageBinding(
+def _container_image() -> ResolvedImage:
+    return ResolvedImage(
         image_id="npu-a3-cann90",
         target="npu-a3",
         kind="container",
@@ -21,11 +21,11 @@ def _container_binding() -> ImageBinding:
     )
 
 
-def test_container_binding_derives_digest_from_ref() -> None:
-    binding = _container_binding()
+def test_container_image_derives_digest_from_ref() -> None:
+    image = _container_image()
 
-    assert binding.digest == DIGEST
-    assert binding.to_dict() == {
+    assert image.digest == DIGEST
+    assert image.to_dict() == {
         "image_id": "npu-a3-cann90",
         "target": "npu-a3",
         "kind": "container",
@@ -33,15 +33,15 @@ def test_container_binding_derives_digest_from_ref() -> None:
     }
 
 
-def test_host_binding_has_no_digest() -> None:
-    binding = ImageBinding(
+def test_host_image_has_no_digest() -> None:
+    image = ResolvedImage(
         image_id="cpu-python311",
         target="cpu",
         kind="host",
         ref="python:3.11",
     )
 
-    assert binding.digest == ""
+    assert image.digest == ""
 
 
 @pytest.mark.parametrize(
@@ -55,7 +55,7 @@ def test_host_binding_has_no_digest() -> None:
         ("ref", "registry.example/team/image@sha256:short"),
     ],
 )
-def test_binding_rejects_invalid_fields(field: str, value: str) -> None:
+def test_resolved_image_rejects_invalid_fields(field: str, value: str) -> None:
     values = {
         "image_id": "npu-a3-cann90",
         "target": "npu-a3",
@@ -65,35 +65,35 @@ def test_binding_rejects_invalid_fields(field: str, value: str) -> None:
     values[field] = value
 
     with pytest.raises(ContractError):
-        ImageBinding(**values)
+        ResolvedImage(**values)
 
 
-def test_build_result_serializes_nested_binding() -> None:
+def test_build_result_serializes_nested_image() -> None:
     result = ImageBuildResult(
-        binding=_container_binding(),
-        source_sha="e6c7a8a44ca4",
-        build_input_hash=DIGEST,
+        image=_container_image(),
+        git_commit_sha="e6c7a8a44ca4",
+        content_hash=DIGEST,
         platform="linux/arm64",
         built=True,
     )
 
-    assert result.to_dict()["binding"]["ref"] == REF
-    assert result.to_dict()["build_input_hash"] == DIGEST
+    assert result.to_dict()["image"]["ref"] == REF
+    assert result.to_dict()["content_hash"] == DIGEST
 
 
-def test_build_result_requires_container_binding() -> None:
-    host = ImageBinding(
+def test_build_result_requires_container_image() -> None:
+    host = ResolvedImage(
         image_id="cpu-python311",
         target="cpu",
         kind="host",
         ref="python:3.11",
     )
 
-    with pytest.raises(ContractError, match="container binding"):
+    with pytest.raises(ContractError, match="container image"):
         ImageBuildResult(
-            binding=host,
-            source_sha="e6c7a8a44ca4",
-            build_input_hash=DIGEST,
+            image=host,
+            git_commit_sha="e6c7a8a44ca4",
+            content_hash=DIGEST,
             platform="linux/arm64",
             built=True,
         )
@@ -102,17 +102,17 @@ def test_build_result_requires_container_binding() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("source_sha", ""),
-        ("build_input_hash", "sha256:short"),
+        ("git_commit_sha", ""),
+        ("content_hash", "sha256:short"),
         ("platform", ""),
         ("built", 1),
     ],
 )
 def test_build_result_rejects_invalid_fields(field: str, value: object) -> None:
     values: dict[str, object] = {
-        "binding": _container_binding(),
-        "source_sha": "e6c7a8a44ca4",
-        "build_input_hash": DIGEST,
+        "image": _container_image(),
+        "git_commit_sha": "e6c7a8a44ca4",
+        "content_hash": DIGEST,
         "platform": "linux/arm64",
         "built": True,
     }

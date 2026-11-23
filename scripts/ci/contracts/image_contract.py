@@ -23,13 +23,13 @@ def _require_sha256_digest(value: object, field: str) -> None:
 
 
 @dataclass(frozen=True)
-class ImageBinding(Contract):
+class ResolvedImage(Contract):
     """An immutable image reference ready for the execution domain."""
 
     image_id: str  # Logical image ID, for example npu-a3-cann90.
     target: str    # Hardware target, for example npu-a3.
     kind: str      # Runtime kind: host or container.
-    ref: str       # Executable reference; containers are digest-pinned.
+    ref: str       # Executable ref: repository + sha256 digest for containers.
 
     def __post_init__(self) -> None:
         _require_non_empty_text(self.image_id, "image_id")
@@ -57,19 +57,19 @@ class ImageBinding(Contract):
 class ImageBuildResult(Contract):
     """Facts produced by building or reusing a container image."""
 
-    binding: ImageBinding  # Immutable image binding produced by the build.
-    source_sha: str        # Git commit used as the build source.
-    build_input_hash: str  # Full sha256 of Dockerfile, platform, and revision.
+    image: ResolvedImage    # Immutable image produced by the build.
+    git_commit_sha: str    # Git commit used as the build source.
+    content_hash: str      # Full sha256 of Dockerfile, platform, and revision.
     platform: str          # Build platform, for example linux/arm64.
     built: bool            # True when the image was built; False when reused.
 
     def __post_init__(self) -> None:
-        if not isinstance(self.binding, ImageBinding):
-            raise ContractError("binding must be an ImageBinding")
-        if self.binding.kind != "container":
-            raise ContractError("ImageBuildResult requires a container binding")
-        _require_non_empty_text(self.source_sha, "source_sha")
-        _require_sha256_digest(self.build_input_hash, "build_input_hash")
+        if not isinstance(self.image, ResolvedImage):
+            raise ContractError("image must be a ResolvedImage")
+        if self.image.kind != "container":
+            raise ContractError("ImageBuildResult requires a container image")
+        _require_non_empty_text(self.git_commit_sha, "git_commit_sha")
+        _require_sha256_digest(self.content_hash, "content_hash")
         _require_non_empty_text(self.platform, "platform")
         if not isinstance(self.built, bool):
             raise ContractError("built must be a boolean")

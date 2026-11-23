@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ci.contracts.base import Diagnostic
+from scripts.ci.contracts.image_contract import ResolvedImage
 from scripts.ci.contracts.planner_contract import (
     ExecutionPlan,
     IntegrationSpec,
@@ -15,6 +16,7 @@ from scripts.ci.contracts.planner_contract import (
     plan_digest,
 )
 from scripts.ci.execution.producer.cli import main
+from scripts.ci.execution.producer import cli as producer_cli
 from scripts.ci.execution.producer.config import (
     CiConfig,
     CiImage,
@@ -225,6 +227,7 @@ def test_requested_images_only_returns_container_bindings(config: CiConfig) -> N
     assert requested_images(
         config, "pull_request", image_override="npu-a3-cann90"
     ) == ("npu-a3-cann90",)
+    assert requested_images(config, "pull_request", targets="cpu") == ()
 
 
 def test_missing_container_binding_fails(
@@ -232,7 +235,7 @@ def test_missing_container_binding_fails(
 ) -> None:
     image = replace(config.images["npu-a3-cann90"], ref="")
     unbound = replace(config, images={**config.images, image.name: image})
-    with pytest.raises(PlanError, match="missing ImageBinding"):
+    with pytest.raises(PlanError, match="missing ResolvedImage"):
         build(unbound, facts, "pull_request", source)
 
 
@@ -557,7 +560,7 @@ def test_tampered_change_mode_is_rejected(
     assert broken.to_dict() != expected.to_dict()
 
 
-def test_cli_uses_scope_and_writes_matrix(
+def test_cli_uses_override_and_writes_matrix(
     tmp_path: Path, config: CiConfig, monkeypatch
 ) -> None:
     output = tmp_path / "plan.json"
@@ -586,14 +589,30 @@ def test_cli_uses_scope_and_writes_matrix(
     assert "container_job_count=2" in matrix.read_text(encoding="utf-8")
 
 
-def test_cli_lists_container_image_requests(
-    tmp_path: Path, config: CiConfig, monkeypatch
+def test_cli_resolves_container_images_inside_plan(
+    tmp_path: Path, repo_root: Path, monkeypatch
 ) -> None:
-    github_output = tmp_path / "github-output"
-    monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+    output = tmp_path / "plan.json"
+    calls: list[str] = []
+
+    def resolve(root, image_id):
+        calls.append(image_id)
+        return ResolvedImage(
+            image_id=image_id,
+            target="npu-a3",
+            kind="container",
+            ref=REF,
+        )
+
+    monkeypatch.setattr(producer_cli, "resolve_image", resolve)
     assert main([
-        "images",
-        "--root", str(config.root),
+        "plan",
+        "--root", str(repo_root),
         "--scope", "pull_request",
+        "--targets", "npu-a3",
+        "--output", str(output),
     ]) == 0
-    assert "images=npu-a3-cann90" in github_output.read_text(encoding="utf-8")
+    loaded_output = load_planner_output(output)
+    assert loaded_output.plan is not None
+    assert calls == ["npu-a3-cann90"]
+    assert {job.runtime.image.ref for job in loaded_output.plan.jobs} == {REF}

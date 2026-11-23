@@ -4,17 +4,23 @@ from pathlib import Path
 
 import pytest
 
-from scripts.ci.image import release
-from scripts.ci.image.identity import image_plan
-from scripts.ci.image.registry import DOCKER_V2, Manifest, RegistryError, verify_manifest
-from scripts.ci.image.release import (
+from scripts.ci.image import build_image as image_build
+from scripts.ci.image.registry import (
+    DOCKER_V2,
+    Manifest,
+    Registry,
+    RegistryError,
+    verify_manifest,
+)
+from scripts.ci.image.build_image import (
     BuildError,
     build_command,
-    ensure_image,
-    format_refs,
+    get_or_build_image,
+    get_image_plan,
     max_jobs,
-    resolve_images,
-    temporary_build_dockerfile,
+    resolve_image,
+    resolved_image_for_content_tag,
+    patch_dockerfile,
 )
 
 DIGEST = "sha256:" + "a" * 64
@@ -24,19 +30,19 @@ BUILT_DIGEST = "sha256:" + "b" * 64
 class FakeRegistry:
     def __init__(self, manifests: dict[str, Manifest]) -> None:
         self.manifests = manifests
-        self.promotions: list[tuple[str, str]] = []
+        self.alias_updates: list[tuple[str, str]] = []
 
-    def manifest(self, reference: str) -> Manifest | None:
+    def find_manifest(self, reference: str) -> Manifest | None:
         return self.manifests.get(reference)
 
-    def require(self, reference: str) -> Manifest:
-        value = self.manifest(reference)
+    def require_manifest(self, reference: str) -> Manifest:
+        value = self.find_manifest(reference)
         if value is None:
             raise RegistryError(f"missing {reference}")
         return value
 
-    def promote(self, alias: str, digest: str) -> None:
-        self.promotions.append((alias, digest))
+    def promote_to_alias(self, alias: str, digest: str) -> None:
+        self.alias_updates.append((alias, digest))
         self.manifests[alias] = _manifest(alias, digest)
 
 
@@ -48,24 +54,24 @@ def _manifest(
     return Manifest(reference=reference, digest=digest, media_type=media_type, raw={})
 
 
-def test_build_command_uses_candidate_tag_and_ci_build_args(repo_root: Path) -> None:
-    plan = image_plan(repo_root, "npu-a3-cann90")
-    command = build_command(plan, should_push=True, use_cache=False, jobs=4)
+def test_build_command_uses_content_tag_and_ci_build_args(repo_root: Path) -> None:
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    command = build_command(plan, use_cache=False, jobs=4)
 
     assert "--tag" in command
-    assert plan.candidate_ref in command
-    assert plan.spec.publish_ref not in command
+    assert plan.content_ref in command
+    assert f"{plan.spec.repository}:{plan.spec.alias}" not in command
     assert "--output=type=image,push=true,oci-mediatypes=false" in command
     assert "--build-arg=MAX_JOBS=4" in command
     assert "--build-arg=GIT_HTTP_USER_AGENT=git/2.56.1" in command
     assert command[-1] == "docker/npu"
 
 
-def test_temporary_dockerfile_injects_git_user_agent(repo_root: Path) -> None:
-    plan = image_plan(repo_root, "npu-a3-cann90")
-    dockerfile, temporary = temporary_build_dockerfile(plan, repo_root)
+def test_patch_dockerfile_injects_git_user_agent(repo_root: Path) -> None:
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    dockerfile, temporary = patch_dockerfile(plan, repo_root)
     try:
-        text = Path(dockerfile).read_text(encoding="utf-8")
+        text = dockerfile.read_text(encoding="utf-8")
         assert text.count("ARG GIT_HTTP_USER_AGENT") == text.count("FROM ")
         assert text.count("ENV GIT_HTTP_USER_AGENT=${GIT_HTTP_USER_AGENT}") == (
             text.count("FROM ")
@@ -81,120 +87,115 @@ def test_max_jobs_respects_memory_limit() -> None:
     assert max_jobs("6", cores=1, mem_gb=1) == 6
 
 
+def test_max_jobs_rejects_invalid_value() -> None:
+    with pytest.raises(BuildError, match="invalid max jobs"):
+        max_jobs("invalid")
+
+
 def test_verify_manifest_rejects_oci() -> None:
-    with pytest.raises(RegistryError, match="Docker v2s2"):
+    with pytest.raises(RegistryError, match="Docker v2 manifest"):
         verify_manifest(
             _manifest("x", media_type="application/vnd.oci.image.manifest.v1+json")
         )
 
 
-def test_resolve_images_returns_immutable_refs(
+def test_registry_rejects_repository_without_path() -> None:
+    with pytest.raises(RegistryError, match="invalid repository"):
+        Registry("registry.example")
+
+
+def test_registry_promote_rejects_invalid_digest() -> None:
+    registry = Registry("registry.example/team/image")
+
+    with pytest.raises(RegistryError, match="sha256"):
+        registry.promote_to_alias("stable", "latest")
+
+
+def test_content_tag_uses_the_current_content_hash(repo_root: Path) -> None:
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    short_hash = plan.content_hash.removeprefix("sha256:")[:12]
+
+    assert plan.content_tag == f"cann9.0.0-a3-{short_hash}"
+
+
+def test_resolved_image_for_content_tag_resolves_an_immutable_ref(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class DigestRegistry:
-        def __init__(self, repository: str) -> None:
-            self.repository = repository
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    registry = FakeRegistry({plan.content_tag: _manifest(plan.content_tag)})
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
 
-        def require(self, reference: str) -> Manifest:
-            return _manifest(reference)
+    image = resolved_image_for_content_tag(plan, plan.content_tag)
 
-    monkeypatch.setattr(release, "Registry", DigestRegistry)
-    results = resolve_images(
-        repo_root,
-        names="npu-a3-cann90",
-        overrides={"npu-a3-cann90": "registry.example/team/image:candidate"},
-    )
-
-    assert format_refs(results) == (
-        f"npu-a3-cann90=registry.example/team/image@{DIGEST}\n"
-    )
-    assert results[0].build.binding.kind == "container"
-    assert results[0].build.built is False
+    assert image.image_id == "npu-a3-cann90"
+    assert image.ref == f"{plan.spec.repository}@{DIGEST}"
 
 
-def test_resolve_images_defaults_to_published_alias(
+def test_resolve_image_uses_the_temporary_content_tag(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requested: list[str] = []
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    registry = FakeRegistry({"cann9.0.0-a3-c18fa86defbe1": _manifest("pinned")})
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
 
-    class DigestRegistry:
-        def __init__(self, repository: str) -> None:
-            self.repository = repository
+    image = resolve_image(repo_root, "npu-a3-cann90")
 
-        def require(self, reference: str) -> Manifest:
-            requested.append(reference)
-            return _manifest(reference)
-
-    monkeypatch.setattr(release, "Registry", DigestRegistry)
-    results = resolve_images(repo_root, names="npu-a3-cann90")
-
-    assert requested == ["cann9.0.0-a3-base"]
-    assert format_refs(results) == (
-        "npu-a3-cann90="
-        f"swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu@{DIGEST}\n"
-    )
+    assert image.digest == DIGEST
+    assert image.ref == f"{plan.spec.repository}@{DIGEST}"
 
 
-def test_existing_candidate_does_not_build(
+def test_existing_content_image_does_not_build(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan = image_plan(repo_root, "npu-a3-cann90")
-    registry = FakeRegistry({plan.candidate_tag: _manifest(plan.candidate_tag)})
-    monkeypatch.setattr(release, "Registry", lambda repository: registry)
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    registry = FakeRegistry({plan.content_tag: _manifest(plan.content_tag)})
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
 
     def fail_build(*args, **kwargs):
         raise AssertionError("build should not run")
 
-    monkeypatch.setattr(release, "build_candidate_image", fail_build)
-    result = ensure_image(repo_root, "npu-a3-cann90")
+    monkeypatch.setattr(image_build, "build_image", fail_build)
+    result = get_or_build_image(repo_root, "npu-a3-cann90")
 
-    assert result.built is False
-    assert result.digest == DIGEST
-    assert result.build.build_input_hash == plan.build_input_hash
-
-
-def test_build_without_push_and_missing_candidate_fails(
-    repo_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(release, "Registry", lambda repository: FakeRegistry({}))
-    with pytest.raises(BuildError, match="pushing is disabled"):
-        ensure_image(repo_root, "npu-a3-cann90", should_push=False)
+    assert result.build.built is False
+    assert result.build.image.digest == DIGEST
+    assert result.build.content_hash == plan.content_hash
 
 
-def test_missing_candidate_is_built_and_verified(
+def test_missing_content_image_is_built_and_verified(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifests: dict[str, Manifest] = {}
     registry = FakeRegistry(manifests)
-    monkeypatch.setattr(release, "Registry", lambda repository: registry)
-    monkeypatch.setattr(release, "check_envs", lambda: [])
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
+    monkeypatch.setattr(image_build, "check_build_environment", lambda: [])
 
     def build(plan, root, **kwargs):
-        manifests[plan.candidate_tag] = _manifest(plan.candidate_tag, BUILT_DIGEST)
-        return BUILT_DIGEST, 7
+        manifests[plan.content_tag] = _manifest(plan.content_tag, BUILT_DIGEST)
+        return 7
 
-    monkeypatch.setattr(release, "build_candidate_image", build)
-    result = ensure_image(repo_root, "npu-a3-cann90")
+    monkeypatch.setattr(image_build, "build_image", build)
+    result = get_or_build_image(repo_root, "npu-a3-cann90")
 
-    assert result.built is True
-    assert result.digest == BUILT_DIGEST
+    assert result.build.built is True
+    assert result.build.image.digest == BUILT_DIGEST
     assert result.elapsed_seconds == 7
-    assert result.build.source_sha
+    assert result.build.git_commit_sha
 
 
-def test_promote_requires_the_tested_candidate(
+def test_promote_requires_the_tested_content_image(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan = image_plan(repo_root, "npu-a3-cann90")
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
     registry = FakeRegistry({
-        plan.candidate_tag: _manifest(plan.candidate_tag, BUILT_DIGEST),
+        plan.content_tag: _manifest(plan.content_tag, BUILT_DIGEST),
     })
-    monkeypatch.setattr(release, "Registry", lambda repository: registry)
-    monkeypatch.setattr(release, "check_envs", lambda: [])
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
+    monkeypatch.setattr(image_build, "check_build_environment", lambda: [])
 
-    result = release.promote_image(repo_root, "npu-a3-cann90")
+    result = image_build.promote_image(repo_root, "npu-a3-cann90")
 
     assert result.promoted is True
     assert result.alias == plan.spec.alias
-    assert registry.promotions == [(plan.spec.alias, BUILT_DIGEST)]
-    assert result.ref == f"{plan.spec.repository}@{BUILT_DIGEST}"
+    assert registry.alias_updates == [(plan.spec.alias, BUILT_DIGEST)]
+    assert result.build.image.ref == f"{plan.spec.repository}@{BUILT_DIGEST}"

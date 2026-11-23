@@ -37,5 +37,5 @@ def test_only_dockerfiles_are_image_inputs() -> None:
     assert not is_dockerfile_path("docker/npu/setup.sh")
     assert not is_dockerfile_path("docker/npu/README.md")
     assert not is_dockerfile_path("scripts/ci/config/ci.yml")
-    assert not is_dockerfile_path("scripts/ci/image/selection.py")
+    assert not is_dockerfile_path("scripts/ci/image/select_images.py")
     assert not is_dockerfile_path("src/model.py")

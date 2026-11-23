@@ -157,49 +157,11 @@ jobs:
           set -uo pipefail
           python3 -m scripts.ci.tools.lint
 
-      - name: resolve runtime images
-        id: runtime_image
-        if: |
-          steps.lint.outcome == 'success' &&
-          steps.changes.outputs.change_mode == 'code'
-        env:
-          SCOPE: ${{ steps.changes.outputs.scope }}
-          IMAGE_ID: ${{ inputs.image_id || '' }}
-          IMAGE_REF: ${{ inputs.image_ref || '' }}
-        run: |
-          set -euo pipefail
-          if [ -n "$IMAGE_REF" ] && [ -z "$IMAGE_ID" ]; then
-            echo "::error::image_ref requires image_id"
-            exit 1
-          fi
-          refs="$RUNNER_TEMP/ci-image-refs"
-          list=(--scope "$SCOPE")
-          if [ -n "$IMAGE_ID" ]; then
-            list+=(--image "$IMAGE_ID")
-          fi
-          images=$(python3 -m scripts.ci.execution.producer.cli images \
-            --root "$GITHUB_WORKSPACE" "${list[@]}")
-          if [ -z "$images" ]; then
-            : > "$refs"
-            echo "no container images selected by $SCOPE"
-            exit 0
-          fi
-          resolve=(--images "$images" --output "$refs")
-          if [ -n "$IMAGE_REF" ]; then
-            resolve+=(--image-ref "$IMAGE_ID=$IMAGE_REF")
-            echo "using caller image: $IMAGE_ID=$IMAGE_REF"
-          fi
-          python3 -m scripts.ci.image.cli resolve "${resolve[@]}"
-          test -s "$refs"
-          cat "$refs"
-
       - name: plan
         id: publish
         if: always()
         env:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
-          IMAGE_OUTCOME: ${{ steps.runtime_image.outcome }}
-          IMAGE_REFS_FILE: ${{ runner.temp }}/ci-image-refs
           CHANGE_MODE: ${{ steps.changes.outputs.change_mode || 'code' }}
           SCOPE: ${{ steps.changes.outputs.scope || 'pull_request' }}
           CI_SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
@@ -220,6 +182,9 @@ jobs:
           fi
           if [ "$CHANGE_MODE" = code ] && [ -n "$CI_IMAGE_ID" ]; then
             COMMON+=(--image "$CI_IMAGE_ID")
+            if [ -n "$CI_IMAGE_REF" ]; then
+              COMMON+=(--image-ref "$CI_IMAGE_ID=$CI_IMAGE_REF")
+            fi
           fi
           if [ "$CHANGE_MODE" = image_only ] || [ "$CHANGE_MODE" = mixed ]; then
             echo "Dockerfile PR is handled by Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
@@ -228,18 +193,6 @@ jobs:
             [ "$LINT_OUTCOME" != success ]; then
             echo "::error::lint failed"
             exit 1
-          fi
-          if [ "$CHANGE_MODE" = code ] && \
-            [ "$IMAGE_OUTCOME" != success ]; then
-            echo "::error::cannot resolve runtime image digest"
-            exit 1
-          fi
-          if [ "$CHANGE_MODE" = code ] && [ -f "$IMAGE_REFS_FILE" ]; then
-            while IFS= read -r image_ref; do
-              if [ -n "$image_ref" ]; then
-                COMMON+=(--image-ref "$image_ref")
-              fi
-            done < "$IMAGE_REFS_FILE"
           fi
           MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
           if ! GITHUB_OUTPUT="$MATRIX_OUTPUT" \

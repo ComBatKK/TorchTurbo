@@ -19,8 +19,8 @@ Job          = TestArea × Environment × Venv
 - Environment 运行时派生，不在 YAML 中物化。
 - 不增加 `environments`、`lanes`、`image_pr`。
 - Scope 选择 TestArea 和 image。
-- Image PR 复用 `pull_request`，候选镜像由 binding 注入。
-- 镜像域和执行域只交换 `ImageBinding` 和 `ImageBuildResult`。
+- Image PR 复用 `pull_request`，候选镜像由 ResolvedImage 注入。
+- 镜像域和执行域只交换 `ResolvedImage` 和 `ImageBuildResult`。
 
 固定顺序：
 
@@ -44,7 +44,7 @@ Job          = TestArea × Environment × Venv
 Scope
   -> TestArea[]
   -> unique image_id[]
-  -> ImageBinding[]
+  -> ResolvedImage[]
   -> Environment
   -> Job / ExecutionPlan
   -> Executor / Gate
@@ -56,7 +56,7 @@ Image PR：
 changed Dockerfiles
   -> image select
   -> ImageBuildResult[]
-  -> candidate ImageBinding
+  -> candidate ResolvedImage
   -> pull_request 中同 target 的 TestArea[]
   -> Job / ExecutionPlan
 ```
@@ -77,7 +77,7 @@ contracts/executor_contract.py
   load_job_result / validation
 
 contracts/image_contract.py
-  ImageBinding / ImageBuildResult
+  ResolvedImage / ImageBuildResult
 
 execution/producer/config.py
   CiConfig / load
@@ -112,7 +112,7 @@ Job        -> JobResult  -> TaskResult[] / Failure
 - 契约层不构造 ExecutionPlan。
 - ExecutionPlan 和 PlannerOutput 只由 producer 构造。
 - Executor 和 Gate 消费 PlannerOutput、JobResult。
-- 执行域只使用 `ImageBinding`，不再维护 `ImageRef`。
+- 执行域只使用 `ResolvedImage`，不再维护 `ImageRef`。
 
 ## 2. Step 1：跨域契约
 
@@ -125,7 +125,7 @@ scripts/ci/tests/test_image_contract.py
 
 ```python
 @dataclass(frozen=True)
-class ImageBinding:
+class ResolvedImage:
     image_id: str  # 逻辑镜像 ID，例如 npu-a3-cann90
     target: str    # 镜像所属硬件 target
     kind: str      # host | container
@@ -134,9 +134,9 @@ class ImageBinding:
 
 @dataclass(frozen=True)
 class ImageBuildResult:
-    binding: ImageBinding  # 构建或复用后的不可变绑定
-    source_sha: str        # 构建代码对应的 Git commit
-    build_input_hash: str  # Dockerfile + platform + revision 的完整 SHA-256
+    image: ResolvedImage    # 构建或复用后的不可变镜像
+    git_commit_sha: str    # 构建代码对应的 Git commit
+    content_hash: str      # Dockerfile + platform + revision 的完整 SHA-256
     platform: str          # 构建平台，例如 linux/arm64
     built: bool            # 是否实际执行了构建
 ```
@@ -244,19 +244,18 @@ rank_capacity >= test.ranks
 target + rank_capacity 重复 -> 配置失败
 ```
 
-ImageBinding：
+ResolvedImage：
 
-- Planner 按 `image_id` 查找 binding。
-- 缺失 binding 直接失败。
-- `binding.target` 必须与 image 定义和 Scope target 一致。
+- Planner 按 `image_id` 查找 ResolvedImage。
+- 缺失 ResolvedImage 直接失败。
+- `image.target` 必须与 image 定义和 Scope target 一致。
 - 最终 Job 的 `image.ref` 必须是 digest。
 
 Image PR candidate：
 
 ```text
-binding = ImageBuildResult.binding
-areas = pull_request 中 binding.target 对应的 TestArea 并集
-plan = Planner(areas, candidate_binding=binding)
+image = ImageBuildResult.image
+areas = pull_request 中 image.target 对应的 TestArea 并集
 ```
 
 规则：
@@ -271,17 +270,17 @@ plan = Planner(areas, candidate_binding=binding)
 - `pull_request` 7 Job。
 - `nightly` 12 Job。
 - 普通 PR 只解析实际使用的 image。
-- 未知 image、缺失 binding、target 不匹配、无 runner 都明确失败。
+- 未知 image、缺失 ResolvedImage、target 不匹配、无 runner 都明确失败。
 
 ## 5. Step 4：镜像域
 
 文件：
 
 ```text
-scripts/ci/image/recipe.py
-scripts/ci/image/selection.py
-scripts/ci/image/identity.py
-scripts/ci/image/release.py
+scripts/ci/image/image_config.py
+scripts/ci/image/select_images.py
+scripts/ci/image/build_image.py
+scripts/ci/image/registry.py
 scripts/ci/image/cli.py
 ```
 
@@ -304,7 +303,7 @@ npu-a3-cann90:
 规则：
 
 - 基础镜像只来自 Dockerfile 的 `FROM`。
-- `publish.ref` 是候选镜像发布位置，不是基础镜像。
+- `publish.ref` 是 promote 后的外部 alias，不参与普通 PR 解析。
 - context 从 Dockerfile 父目录派生。
 - context 从 Dockerfile 父目录派生，但 hash 只包含该 Dockerfile。
 - 一个 image 对应一个 Dockerfile。
@@ -314,10 +313,11 @@ npu-a3-cann90:
 构建身份：
 
 ```text
-build_input_hash = sha256(Dockerfile + platform + revision)
+content_hash = sha256(Dockerfile + platform + revision)
 ```
 
-- `candidate_tag` 只存在镜像域内部。
+- `content tag = cann9.0.0-a3-<hash>` 只存在镜像域内部。
+- `content tag` 通过 registry 解析为 digest。
 - `ci_build_args` 传给构建，但不进入 hash。
 - platform/revision 变化使用手动镜像构建，不改变自动触发规则。
 
@@ -333,13 +333,14 @@ build_input_hash = sha256(Dockerfile + platform + revision)
 
 ```text
 classify changes
-  -> Planner 产出 image requests
-  -> image resolve at HEAD
-  -> Planner 接收 ImageBinding[]
+  -> Planner 读取 scopes 和 image_id
+  -> 计算 content tag
+  -> 解析 digest
+  -> 绑定 ResolvedImage
   -> publish PlannerOutput
 ```
 
-必须删除 base revision 镜像解析。缺失 binding 直接失败。
+Plan 内部完成镜像解析。缺失 content image 直接失败。
 
 Image PR：
 
@@ -401,7 +402,7 @@ python3 -m scripts.ci.tools.lint
 | 代码 + Dockerfile | 普通 PR mixed；Image PR CPU preflight + 候选测试 |
 | 未映射 Dockerfile | 配置失败 |
 | 候选 target 无 PR 测试 | 配置失败 |
-| 缺少 ImageBinding | 配置失败 |
+| 缺少 ResolvedImage | 配置失败 |
 
 完成标准：
 

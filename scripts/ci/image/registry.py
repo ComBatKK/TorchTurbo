@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -11,14 +12,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
-ACCEPT = (
-    "application/vnd.docker.distribution.manifest.v2+json, "
-    "application/vnd.docker.distribution.manifest.list.v2+json, "
-    "application/vnd.oci.image.manifest.v1+json, "
-    "application/vnd.oci.image.index.v1+json"
-)
 DOCKER_V2 = "application/vnd.docker.distribution.manifest.v2+json"
 DOCKER_LIST_V2 = "application/vnd.docker.distribution.manifest.list.v2+json"
+SUPPORTED_MANIFEST_TYPES = (DOCKER_V2, DOCKER_LIST_V2)
+MANIFEST_ACCEPT = ", ".join(SUPPORTED_MANIFEST_TYPES)
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class RegistryError(RuntimeError):
@@ -34,10 +32,10 @@ class Manifest:
 
 
 def verify_manifest(manifest: Manifest) -> None:
-    if manifest.media_type not in {DOCKER_V2, DOCKER_LIST_V2}:
+    if manifest.media_type not in SUPPORTED_MANIFEST_TYPES:
         raise RegistryError(
             "registry returned unsupported manifest media type "
-            f"{manifest.media_type!r}; expected Docker v2s2"
+            f"{manifest.media_type!r}; expected Docker v2 manifest or manifest list"
         )
 
 
@@ -49,14 +47,17 @@ class Registry:
         token_fetcher: Callable[[str, str], str] | None = None,
         timeout: int = 30,
     ) -> None:
+        host, separator, repo_path = repository.partition("/")
+        if not separator or not host or not repo_path:
+            raise RegistryError(f"invalid repository: {repository!r}")
         self.repository = repository
-        self.host = repository.split("/", 1)[0]
-        self.repo_path = repository.split("/", 1)[1] if "/" in repository else repository
+        self.host = host
+        self.repo_path = repo_path
         self.timeout = timeout
-        self._token_fetcher = token_fetcher or self._anonymous_token
+        self._token_fetcher = token_fetcher or self._swr_token
         self._token: str | None = None
 
-    def _anonymous_token(self, host: str, repo: str) -> str:
+    def _swr_token(self, host: str, repo: str) -> str:
         url = (
             f"https://{host}/swr/auth/v2/registry/auth/"
             f"?service=dockyard&scope=repository:{repo}:pull"
@@ -67,19 +68,19 @@ class Registry:
         except (urllib.error.URLError, ValueError, OSError):
             return ""
 
-    def token(self) -> str:
+    def _ensure_token(self) -> str:
         if self._token is None:
             self._token = self._token_fetcher(self.host, self.repo_path)
         return self._token
 
-    def manifest(self, reference: str) -> Manifest | None:
-        token = self.token()
+    def find_manifest(self, reference: str) -> Manifest | None:
+        token = self._ensure_token()
         if not token:
             raise RegistryError(f"cannot obtain registry token for {self.repository}")
         encoded = urllib.parse.quote(reference, safe=":")
         request = urllib.request.Request(
             f"https://{self.host}/v2/{self.repo_path}/manifests/{encoded}",
-            headers={"Authorization": f"Bearer {token}", "Accept": ACCEPT},
+            headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT},
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -104,21 +105,21 @@ class Registry:
             digest = "sha256:" + hashlib.sha256(body).hexdigest()
         return Manifest(reference=reference, digest=digest, media_type=media_type, raw=raw)
 
-    def require(self, reference: str) -> Manifest:
-        manifest = self.manifest(reference)
+    def require_manifest(self, reference: str) -> Manifest:
+        manifest = self.find_manifest(reference)
         if manifest is None:
             raise RegistryError(f"registry reference does not exist: {reference}")
         return manifest
 
-    def promote(
+    def promote_to_alias(
         self,
         alias: str,
         digest: str,
-        *,
-        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
-        if not digest.startswith("sha256:"):
-            raise RegistryError(f"promote requires a sha256 digest, got {digest!r}")
+        if not _SHA256_DIGEST.fullmatch(digest):
+            raise RegistryError(
+                f"promote requires sha256:<64 lowercase hex>, got {digest!r}"
+            )
         command = [
             "docker",
             "buildx",
@@ -128,7 +129,7 @@ class Registry:
             f"{self.repository}:{alias}",
             f"{self.repository}@{digest}",
         ]
-        result = run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise RegistryError(f"promote failed: {detail}")

@@ -20,7 +20,7 @@ def test_classify_changes_handles_docs_code_and_image_changes() -> None:
     assert classify_changes(["docker/npu/Dockerfile_aarch64"]) == ChangeKind.IMAGE_ONLY
     assert classify_changes(["docker/npu/setup.sh"]) == ChangeKind.CODE
     assert classify_changes(["scripts/ci/config/ci.yml"]) == ChangeKind.CODE
-    assert classify_changes(["scripts/ci/image/selection.py"]) == ChangeKind.CODE
+    assert classify_changes(["scripts/ci/image/select_images.py"]) == ChangeKind.CODE
     assert classify_changes([
         "docker/npu/Dockerfile_aarch64",
         "docs/design.md",

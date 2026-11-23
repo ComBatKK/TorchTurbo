@@ -80,7 +80,7 @@ contracts/executor_contract.py
   JobResult / TaskResult / TaskEvidence / Failure / validation
 
 contracts/image_contract.py
-  ImageBinding / ImageBuildResult
+  ResolvedImage / ImageBuildResult
 
 execution/producer/config.py
   CiConfig / load
@@ -116,7 +116,7 @@ Job        -> JobResult  -> TaskResult[] / Failure
 约束：
 
 - `contracts` 只定义和校验数据，不构造 ExecutionPlan。
-- `Runtime.image` 直接使用 `ImageBinding`，不存在执行域镜像模型。
+- `Runtime.image` 直接使用 `ResolvedImage`，不存在执行域镜像模型。
 - `contracts` 不 import `execution` 或 `image`。
 - `ExecutionPlan.plan_id` 是内容摘要，不手工赋值。
 
@@ -136,8 +136,6 @@ Gate 通过 `jobs` 和 `JobResult` 校验实际覆盖。
 ## 3. 配置文件结构
 
 ```yaml
-schema_version: 5
-
 resources:
   targets:
     cpu:
@@ -432,18 +430,19 @@ TestArea ranks 不超过 runner rank_capacity
 Scope
   -> TestArea 选择
   -> image_id 集合
-  -> image resolve at HEAD
-  -> ImageBinding 集合
-  -> Planner
+  -> content tag: cann9.0.0-a3-<hash>
+  -> registry digest
+  -> ResolvedImage
   -> PlannerOutput
 ```
 
 规则：
 
-- 只解析 Scope 实际使用的 image。
-- 使用 HEAD 中的 image 配置，不使用 base revision。
-- 缺失 binding、未知 image、target 不匹配都直接失败。
-- binding 必须来自镜像域，Planner 不自行推断镜像。
+- 普通 PR 不接收 image 参数，由 Plan 内部解析。
+- 只解析 Scope 选中的 container image。
+- 使用 HEAD 中的 Dockerfile、platform 和 revision 计算 content tag。
+- content tag 不存在、未知 image、target 不匹配都直接失败。
+- stable alias 不参与普通 PR 解析。
 - 最终 ExecutionPlan 中的 container image 必须是 digest-pinned ref。
 
 ## 8. Image PR
@@ -465,7 +464,7 @@ changed Dockerfiles
   -> image select
   -> image build / reuse
   -> ImageBuildResult[]
-  -> candidate ImageBinding
+  -> candidate ResolvedImage
   -> pull_request Scope 中同 target 的 TestArea
   -> Planner
   -> Executor / Gate
@@ -476,9 +475,9 @@ changed Dockerfiles
 ```text
 test_areas = union(
   pull_request 中选择的 TestArea
-  where selected_image.target == binding.target
+  where selected_image.target == image.target
 )
-image = binding
+image = ResolvedImage
 ```
 
 规则：
@@ -529,18 +528,20 @@ kind: container
 多个 image 共用 Dockerfile  -> 配置失败
 ```
 
-构建 context 由 Dockerfile 父目录派生；`build_input_hash` 只包含该 Dockerfile，不扫描 context 中的其他文件。
+构建 context 由 Dockerfile 父目录派生；`content_hash` 只包含该 Dockerfile，不扫描 context 中的其他文件。
 
 ### 9.3 构建身份
 
 ```text
-build_input_hash = sha256(Dockerfile + platform + revision)
+content_hash = sha256(Dockerfile + platform + revision)
 ```
 
 规则：
 
-- `candidate_tag` 是镜像域内部查找键，不进入跨域契约。
-- `ci_build_args` 传给构建，但不进入 `build_input_hash`。
+- `content_tag = cann9.0.0-a3-<hash>` 是镜像域内部查找键，不进入跨域契约。
+- `content tag -> manifest digest` 必须由 registry 解析。
+- stable alias 只用于外部发布或展示，不参与 CI 主链路。
+- `ci_build_args` 传给构建，但不进入 `content_hash`。
 - `GIT_HTTP_USER_AGENT` 保留在 `ci_build_args`，用于 GitCode clone workaround。
 - `MAX_JOBS` 是构建控制参数，不进入 hash。
 - platform 或 revision 改变不会自动触发 PR 构建，使用手动镜像构建流程。
@@ -550,14 +551,14 @@ build_input_hash = sha256(Dockerfile + platform + revision)
 ```json
 {
   "schema_version": 1,
-  "binding": {
+  "image": {
     "image_id": "npu-a3-cann90",
     "target": "npu-a3",
     "kind": "container",
     "ref": "registry/repo@sha256:..."
   },
-  "source_sha": "...",
-  "build_input_hash": "sha256:...",
+  "git_commit_sha": "...",
+  "content_hash": "sha256:...",
   "platform": "linux/arm64",
   "built": true
 }
@@ -567,7 +568,7 @@ build_input_hash = sha256(Dockerfile + platform + revision)
 
 ```python
 @dataclass(frozen=True)
-class ImageBinding:
+class ResolvedImage:
     image_id: str  # 逻辑镜像 ID，例如 npu-a3-cann90
     target: str    # 镜像所属硬件 target
     kind: str      # host | container
@@ -576,18 +577,18 @@ class ImageBinding:
 
 @dataclass(frozen=True)
 class ImageBuildResult:
-    binding: ImageBinding  # 构建或复用后的不可变绑定
-    source_sha: str        # 构建代码对应的 Git commit
-    build_input_hash: str  # Dockerfile + platform + revision 的完整 SHA-256
+    image: ResolvedImage    # 构建或复用后的不可变镜像
+    git_commit_sha: str    # 构建代码对应的 Git commit
+    content_hash: str      # Dockerfile + platform + revision 的完整 SHA-256
     platform: str          # 构建平台，例如 linux/arm64
     built: bool            # 是否实际执行了构建
 ```
 
 约束：
 
-- `ImageBinding` 是执行域唯一可消费的镜像结果。
+- `ResolvedImage` 是执行域唯一可消费的镜像结果。
 - `ImageBuildResult` 只用于构建链路，不直接进入 Runtime。
-- `ImageBinding.digest` 从 `ref` 派生，不单独保存。
+- `ResolvedImage.digest` 从 `ref` 派生，不单独保存。
 - 执行域不得 import `scripts.ci.image`。
 - 镜像域不得 import `scripts.ci.execution`。
 
@@ -686,9 +687,9 @@ image_pr Scope
 - 删除 Dockerfile 不构建。
 - 未映射 Dockerfile 配置失败。
 - context 只包含 Dockerfile。
-- `build_input_hash = sha256(Dockerfile + platform + revision)`。
+- `content_hash = sha256(Dockerfile + platform + revision)`。
 - `ci_build_args` 不进入 hash。
-- 缺失 ImageBinding、target 不匹配、无 runner 均明确失败。
+- 缺失 ResolvedImage、target 不匹配、无 runner 均明确失败。
 - 同一 target 多个 image 时 Job ID 唯一。
 - A5/GPU 只通过 target、image、runner 和 Scope 扩展。
 - Candidate 复用同一个 Planner、Executor、Gate。

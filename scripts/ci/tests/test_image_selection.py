@@ -5,18 +5,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts.ci.image.selection import (
-    SelectionError,
-    matrix_payload,
-    select_images,
-)
+from scripts.ci.image.select_images import ImageSelectionError, select_images
 
 
 def _write_two_image_repo(root: Path) -> Path:
     config = root / "scripts/ci/config/ci.yml"
     config.parent.mkdir(parents=True)
     document = {
-        "schema_version": 5,
         "resources": {
             "targets": {
                 "npu-a3": {"device": "npu", "hardware": "a3"},
@@ -66,19 +61,12 @@ def test_changed_files_select_only_mapped_images(tmp_path: Path) -> None:
     )
 
     assert [item.image_id for item in selected] == ["npu-a3-cann90"]
-    assert matrix_payload(selected) == {
-        "include": [{
-            "image_id": "npu-a3-cann90",
-            "target": "npu-a3",
-            "device": "npu",
-            "hardware": "a3",
-        }]
-    }
+    assert selected[0].target == "npu-a3"
 
 
 def test_changed_images_reject_unmapped_dockerfile(tmp_path: Path) -> None:
     _write_two_image_repo(tmp_path)
-    with pytest.raises(SelectionError, match="not mapped"):
+    with pytest.raises(ImageSelectionError, match="not mapped"):
         select_images(tmp_path, changed_files=["docker/other/Dockerfile_unknown"])
 
 
@@ -91,15 +79,15 @@ def test_non_dockerfile_changes_select_no_images(tmp_path: Path) -> None:
 
 def test_named_images_can_select_all_or_explicit_ids(tmp_path: Path) -> None:
     _write_two_image_repo(tmp_path)
-    assert [item.image_id for item in select_images(tmp_path, names="all")] == [
+    assert [item.image_id for item in select_images(tmp_path, image_ids="all")] == [
         "npu-a3-cann90", "npu-a5-cann90"
     ]
     assert [
         item.image_id
-        for item in select_images(tmp_path, names="npu-a5-cann90")
+        for item in select_images(tmp_path, image_ids="npu-a5-cann90")
     ] == ["npu-a5-cann90"]
-    with pytest.raises(SelectionError, match="unknown image ID"):
-        select_images(tmp_path, names="missing")
+    with pytest.raises(ImageSelectionError, match="unknown image ID"):
+        select_images(tmp_path, image_ids="missing")
 
 
 def test_multiple_changed_dockerfiles_produce_multiple_images(tmp_path: Path) -> None:

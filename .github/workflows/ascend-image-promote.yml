@@ -105,9 +105,6 @@ jobs:
       - name: install CI dependencies
         run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
 
-      - name: check registry tooling
-        run: python3 -m scripts.ci.image.cli check-envs
-
       - name: log in to SWR
         env:
           SWR_USER: ${{ secrets.SWR_USERNAME }}

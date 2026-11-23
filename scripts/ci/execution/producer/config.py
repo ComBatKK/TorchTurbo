@@ -10,11 +10,10 @@ from typing import Any, Iterable
 import yaml
 
 from ...contracts.base import Diagnostic
-from ...contracts.image_contract import ImageBinding
+from ...contracts.image_contract import ResolvedImage
 from ...contracts.planner_contract import DEVICES, SUITES, VenvSpec
 
 CONFIG_PATH = Path("scripts/ci/config/ci.yml")
-SCHEMA_VERSION = 5
 SCOPES = ("pull_request", "nightly")
 
 
@@ -40,8 +39,8 @@ class CiImage:
     kind: str
     ref: str
 
-    def as_ref(self) -> ImageBinding:
-        return ImageBinding(
+    def as_ref(self) -> ResolvedImage:
+        return ResolvedImage(
             image_id=self.name,
             target=self.target,
             kind=self.kind,
@@ -128,7 +127,6 @@ class Scope:
 
 @dataclass(frozen=True)
 class CiConfig:
-    schema_version: int
     root: Path
     targets: dict[str, CiTarget]
     images: dict[str, CiImage]
@@ -620,12 +618,8 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
     except (OSError, ValueError) as exc:
         raise CiConfigError([_issue(CONFIG_PATH.as_posix(), str(exc))]) from exc
     document = _row(
-        document, "ci", {"schema_version", "resources", "test_areas", "scopes"}, issues
+        document, "ci", {"resources", "test_areas", "scopes"}, issues
     )
-    if document.get("schema_version") != SCHEMA_VERSION:
-        issues.append(_issue(
-            "schema_version", f"expected {SCHEMA_VERSION}", "unsupported-schema"
-        ))
     resources = _row(
         document.get("resources"),
         "resources",
@@ -649,7 +643,6 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
     if issues:
         raise CiConfigError(issues)
     return CiConfig(
-        schema_version=SCHEMA_VERSION,
         root=root,
         targets=targets,
         images=images,
