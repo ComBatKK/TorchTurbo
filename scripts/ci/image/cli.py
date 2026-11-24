@@ -13,7 +13,7 @@ from ..tools.cli import (
     repository_path,
     write_json_output,
 )
-from .build_image import BuildError, get_or_build_image, promote_image
+from .build_image import BuildError, get_or_build_image, promote_image, sync_alias
 from .image_config import ImageError
 from .select_images import ImageSelectionError, select_images
 from .registry import RegistryError
@@ -81,6 +81,27 @@ def cmd_promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_aliases(args: argparse.Namespace) -> int:
+    root = repository_path(args.root)
+    try:
+        specs = select_images(root, image_ids=args.images)
+    except ImageError as exc:
+        print(f"::warning::cannot select images: {exc}", file=sys.stderr)
+        return 0 if args.best_effort else 2
+    failed = 0
+    for spec in specs:
+        try:
+            result = sync_alias(root, spec.image_id)
+        except (ImageError, RegistryError, BuildError) as exc:
+            failed += 1
+            print(f"::warning::{spec.image_id}: {exc}", file=sys.stderr)
+            continue
+        print(f"{spec.image_id}: alias {result.alias}={result.image.digest}")
+    if failed and not args.best_effort:
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = common_parser()
 
@@ -102,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     promote = commands.add_parser("promote", parents=[common])
     promote.add_argument("--image", required=True)
     promote.set_defaults(handler=cmd_promote)
+
+    sync = commands.add_parser("sync-aliases", parents=[common])
+    sync.add_argument("--images", default="all")
+    sync.add_argument("--best-effort", action="store_true")
+    sync.set_defaults(handler=cmd_sync_aliases)
     return parser
 
 

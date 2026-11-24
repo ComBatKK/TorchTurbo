@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.ci.image import build_image as image_build
+from scripts.ci.image import cli as image_cli
 from scripts.ci.image.registry import (
     DOCKER_V2,
     Manifest,
@@ -197,3 +199,58 @@ def test_promote_requires_the_tested_content_image(
     assert result.alias == plan.spec.alias
     assert registry.alias_updates == [(plan.spec.alias, BUILT_DIGEST)]
     assert result.image.ref == f"{plan.spec.repository}@{BUILT_DIGEST}"
+
+
+def test_sync_alias_keeps_a_matching_alias(
+    repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    registry = FakeRegistry({
+        plan.content_tag: _manifest(plan.content_tag, DIGEST),
+        plan.spec.alias: _manifest(plan.spec.alias, DIGEST),
+    })
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
+
+    result = image_build.sync_alias(repo_root, "npu-a3-cann90")
+
+    assert result.alias == plan.spec.alias
+    assert result.image.digest == DIGEST
+    assert registry.alias_updates == []
+
+
+def test_sync_alias_repairs_a_stale_alias(
+    repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = get_image_plan(repo_root, "npu-a3-cann90")
+    stale = "sha256:" + "c" * 64
+    registry = FakeRegistry({
+        plan.content_tag: _manifest(plan.content_tag, BUILT_DIGEST),
+        plan.spec.alias: _manifest(plan.spec.alias, stale),
+    })
+    monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
+    monkeypatch.setattr(image_build, "check_build_environment", lambda: None)
+
+    result = image_build.sync_alias(repo_root, "npu-a3-cann90")
+
+    assert registry.alias_updates == [(plan.spec.alias, BUILT_DIGEST)]
+    assert result.image.digest == BUILT_DIGEST
+
+
+def test_sync_aliases_best_effort_warns_without_failing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        image_cli,
+        "select_images",
+        lambda root, image_ids: [SimpleNamespace(image_id="npu-a3-cann90")],
+    )
+
+    def fail(root: Path, image_id: str):
+        raise RegistryError("registry unavailable")
+
+    monkeypatch.setattr(image_cli, "sync_alias", fail)
+
+    assert image_cli.main([
+        "sync-aliases", "--images", "all", "--best-effort",
+    ]) == 0
+    assert "registry unavailable" in capsys.readouterr().err

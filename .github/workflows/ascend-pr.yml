@@ -47,37 +47,6 @@ on:
         required: false
         default: ''
         type: string
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'pr = core pytest + two integration guards; full = nightly scope'
-        required: true
-        default: 'pr'
-        type: choice
-        options:
-          - pr
-          - full
-      target_job:
-        description: 'optional Plan job id(s), comma-separated; empty runs the full mode'
-        required: false
-        default: ''
-        type: string
-      image_ref:
-        description: 'optional explicit image ref; empty derives the SHA content refs'
-        required: false
-        default: ''
-        type: string
-      image_id:
-        description: 'logical image ID paired with image_ref'
-        required: false
-        default: ''
-        type: string
-      targets:
-        description: 'optional target slice, for example cpu or npu-a3'
-        required: false
-        default: ''
-        type: string
-
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -102,10 +71,10 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      cpu_jobs: ${{ steps.publish.outputs.cpu_jobs || '[]' }}
-      cpu_job_count: ${{ steps.publish.outputs.cpu_job_count || '0' }}
-      container_jobs: ${{ steps.publish.outputs.container_jobs || '[]' }}
-      container_job_count: ${{ steps.publish.outputs.container_job_count || '0' }}
+      cpu_jobs: ${{ steps.plan.outputs.cpu_jobs || '[]' }}
+      cpu_job_count: ${{ steps.plan.outputs.cpu_job_count || '0' }}
+      container_jobs: ${{ steps.plan.outputs.container_jobs || '[]' }}
+      container_job_count: ${{ steps.plan.outputs.container_job_count || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,32 +90,28 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-          CI_SCOPE: ${{ inputs.scope || '' }}
-          CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
         run: |
           set -euo pipefail
           kind=code
           if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ]; then
-            changed="$RUNNER_TEMP/ci-changed-files.txt"
-            git diff --name-only --diff-filter=AM --no-renames \
-              "$BASE_SHA...HEAD" > "$changed"
-            kind=$(python3 -m scripts.ci.tools.changed_files --changed-files "$changed")
+            kind=$(git diff --name-only --diff-filter=AM --no-renames \
+              "$BASE_SHA...HEAD" | \
+              python3 -m scripts.ci.tools.changed_files)
           fi
-          change_mode=$kind
-          if [ -n "$CI_SCOPE" ]; then
-            scope=$CI_SCOPE
-          elif [ "$CI_MODE" = full ]; then
-            scope=nightly
-          else
-            scope=pull_request
+
+          scope=$CI_SCOPE
+          if [ -z "$scope" ]; then
+            [ "$CI_MODE" = full ] && scope=nightly || scope=pull_request
           fi
-          printf 'change_mode=%s\nscope=%s\n' "$change_mode" "$scope" >> "$GITHUB_OUTPUT"
-          echo "kind=$kind; change mode=$change_mode; plan scope=$scope" >> "$GITHUB_STEP_SUMMARY"
+
+          printf 'change_mode=%s\nscope=%s\n' "$kind" "$scope" >> "$GITHUB_OUTPUT"
+          printf 'kind=%s; plan scope=%s\n' "$kind" "$scope" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: install CI dependencies
         run: |
           python3 -m pip install --quiet --disable-pip-version-check \
-            -r requirements-lint.txt
+            -r scripts/ci/config/requirements-lint.txt
 
       - name: lint
         id: lint
@@ -157,8 +122,8 @@ jobs:
           set -uo pipefail
           python3 -m scripts.ci.tools.lint
 
-      - name: plan
-        id: publish
+      - name: generate test plan
+        id: plan
         if: always()
         env:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
@@ -166,42 +131,33 @@ jobs:
           SCOPE: ${{ steps.changes.outputs.scope || 'pull_request' }}
           CI_SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
         run: |
-          set -uo pipefail
-          mkdir -p "$RUNNER_TEMP/ci-plan"
-          COMMON=(
-            --root "$GITHUB_WORKSPACE"
+          set -euo pipefail
+          ARGS=(
             --scope "$SCOPE"
             --output "$RUNNER_TEMP/ci-plan/plan.json"
             --change-mode "$CHANGE_MODE"
+            --target-job "$CI_TARGET_JOB"
+            --targets "$CI_TARGETS"
           )
-          if [ -n "$CI_TARGET_JOB" ]; then
-            COMMON+=(--target-job "$CI_TARGET_JOB")
-          fi
-          if [ -n "$CI_TARGETS" ]; then
-            COMMON+=(--targets "$CI_TARGETS")
-          fi
+
           if [ "$CHANGE_MODE" = code ] && [ -n "$CI_IMAGE_ID" ]; then
-            COMMON+=(--image "$CI_IMAGE_ID")
-            if [ -n "$CI_IMAGE_REF" ]; then
-              COMMON+=(--image-ref "$CI_IMAGE_ID=$CI_IMAGE_REF")
-            fi
+            ARGS+=(--image "$CI_IMAGE_ID")
+            [ -z "$CI_IMAGE_REF" ] || \
+              ARGS+=(--image-ref "$CI_IMAGE_ID=$CI_IMAGE_REF")
           fi
-          if [ "$CHANGE_MODE" = image_only ] || [ "$CHANGE_MODE" = mixed ]; then
-            echo "Dockerfile PR is handled by Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          if [ "$CHANGE_MODE" = code ] && \
-            [ "$LINT_OUTCOME" != success ]; then
+
+          case "$CHANGE_MODE" in
+            image_only|mixed) echo "Dockerfile PR is handled by Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+          if [ "$CHANGE_MODE" = code ] && [ "$LINT_OUTCOME" != success ]; then
             echo "::error::lint failed"
             exit 1
           fi
-          MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
-          if ! GITHUB_OUTPUT="$MATRIX_OUTPUT" \
-            python3 -m scripts.ci.execution.producer.cli plan "${COMMON[@]}"; then
-            exit 1
-          fi
-          echo "Planner matrix outputs:"
-          cat "$MATRIX_OUTPUT"
-          cat "$MATRIX_OUTPUT" >> "$GITHUB_OUTPUT"
+
+          python3 -m scripts.ci.execution.producer.cli plan \
+            "${ARGS[@]}" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: upload plan
         if: always()
@@ -213,7 +169,7 @@ jobs:
           retention-days: 7
 
   cpu:
-    name: Ascend-PR-CPU (${{ matrix.job_id }})
+    name: CPU (${{ matrix.display_name }})
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
@@ -225,13 +181,11 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.cpu_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -252,7 +206,7 @@ jobs:
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
           CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
         run: |
-          set +e
+          set -euo pipefail
           result_root="$RUNNER_TEMP/ci-result"
           mkdir -p "$result_root"
           python3 -m scripts.ci.execution.consumer.executor \
@@ -260,21 +214,6 @@ jobs:
             --job-id "${{ matrix.job_id }}" \
             --output "$result_root/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
-          rc=$?
-          printf '%s\n' "$rc" > "$result_root/executor.exit_code"
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning::executor exited with code $rc; result upload will still run"
-          fi
-          exit "$rc"
-
-      - name: verify result
-        if: always()
-        run: |
-          result="$RUNNER_TEMP/ci-result/job-result.json"
-          if [ ! -s "$result" ]; then
-            echo "::error::executor exited without writing $result"
-            exit 1
-          fi
 
       - name: upload result
         if: always()
@@ -282,39 +221,11 @@ jobs:
         with:
           name: ci-result-${{ matrix.job_id }}
           path: ${{ runner.temp }}/ci-result
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
-      - name: enforce result
-        if: always()
-        run: |
-          set -euo pipefail
-          result_root="$RUNNER_TEMP/ci-result"
-          result="$result_root/job-result.json"
-          if [ ! -s "$result" ]; then
-            echo "::error::executor exited without writing $result"
-            exit 1
-          fi
-          status=$(python3 -c \
-            'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' \
-            "$result")
-          rc=$(cat "$result_root/executor.exit_code" 2>/dev/null || true)
-          rc=${rc:-missing}
-          echo "executor exit code: $rc; result status: $status"
-          case "$status" in
-            passed|skipped) ;;
-            *)
-              echo "::error::CI job result is $status"
-              exit 1
-              ;;
-          esac
-          if [ "$rc" != 0 ]; then
-            echo "::error::executor exited with code $rc"
-            exit 1
-          fi
-
-  container:
-    name: Ascend-PR-Container (${{ matrix.job_id }})
+  accelerator:
+    name: Accelerator (${{ matrix.display_name }})
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
@@ -329,13 +240,11 @@ jobs:
     container:
       image: ${{ matrix.image_ref }}
       options: ${{ matrix.container_options }}
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -347,7 +256,7 @@ jobs:
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
           CI_VENV_ROOT: /tmp/turbo-ci-venv
         run: |
-          set +e
+          set -euo pipefail
           result_root="$RUNNER_TEMP/ci-result"
           mkdir -p "$result_root"
           python3 -m scripts.ci.execution.consumer.executor \
@@ -355,21 +264,6 @@ jobs:
             --job-id "${{ matrix.job_id }}" \
             --output "$result_root/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
-          rc=$?
-          printf '%s\n' "$rc" > "$result_root/executor.exit_code"
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning::executor exited with code $rc; result upload will still run"
-          fi
-          exit "$rc"
-
-      - name: verify result
-        if: always()
-        run: |
-          result="$RUNNER_TEMP/ci-result/job-result.json"
-          if [ ! -s "$result" ]; then
-            echo "::error::executor exited without writing $result"
-            exit 1
-          fi
 
       - name: upload result
         if: always()
@@ -377,75 +271,39 @@ jobs:
         with:
           name: ci-result-${{ matrix.job_id }}
           path: ${{ runner.temp }}/ci-result
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
-      - name: enforce result
-        if: always()
-        run: |
-          set -euo pipefail
-          result_root="$RUNNER_TEMP/ci-result"
-          result="$result_root/job-result.json"
-          if [ ! -s "$result" ]; then
-            echo "::error::executor exited without writing $result"
-            exit 1
-          fi
-          status=$(python3 -c \
-            'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' \
-            "$result")
-          rc=$(cat "$result_root/executor.exit_code" 2>/dev/null || true)
-          rc=${rc:-missing}
-          echo "executor exit code: $rc; result status: $status"
-          case "$status" in
-            passed|skipped) ;;
-            *)
-              echo "::error::CI job result is $status"
-              exit 1
-              ;;
-          esac
-          if [ "$rc" != 0 ]; then
-            echo "::error::executor exited with code $rc"
-            exit 1
-          fi
-
   gate:
-    name: Ascend-PR-Gate
-    needs: [plan, cpu, container]
-    if: ${{ always() }}
+    name: Gate
+    needs: [plan, cpu, accelerator]
+    if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: download plan
-        if: always()
+      - name: download artifacts
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ci-plan
-          path: ${{ runner.temp }}/ci-plan
-
-      - name: download results
-        if: always()
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ci-result-*
-          path: ${{ runner.temp }}/ci-results
+          pattern: ci-*
+          path: ${{ runner.temp }}/ci-artifacts
 
       - name: timing
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 -m scripts.ci.execution.finalization.timing
 
       - name: judge
         env:
-          PLAN: ${{ runner.temp }}/ci-plan/plan.json
-          RESULTS: ${{ runner.temp }}/ci-results
+          PLAN: ${{ runner.temp }}/ci-artifacts/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-artifacts
           DECISION: ${{ runner.temp }}/ci-decision/decision.json
         run: |
-          set -uo pipefail
-          mkdir -p "$RESULTS" "$(dirname "$DECISION")"
+          set -euo pipefail
+          mkdir -p "$RESULTS"
           if [ ! -f "$PLAN" ]; then
             echo "::error::missing ci-plan artifact"
             printf '## CI Gate: failed\n\n- missing-plan: ci-plan artifact is missing\n' \

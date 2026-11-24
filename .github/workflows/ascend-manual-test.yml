@@ -1,5 +1,5 @@
-name: Ascend-Manual-CI
-run-name: Ascend-Manual-CI ${{ inputs.target_job }} ${{ github.ref_name }}
+name: Ascend-Manual-Test
+run-name: Ascend-Manual-Test ${{ inputs.mode }} ${{ inputs.target_job }} ${{ github.ref_name }}
 
 # Debug one exact job through the normal CI graph. Manual runs use the same
 # CiConfig/TestFacts -> Plan -> Executor -> Gate pipeline as PR and nightly, but
@@ -53,7 +53,7 @@ permissions:
 
 jobs:
   manual:
-    name: Ascend-Manual (${{ inputs.target_job }})
+    name: Manual test (${{ inputs.target_job }})
     uses: ./.github/workflows/ascend-pr.yml
     with:
       mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}

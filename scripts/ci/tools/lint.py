@@ -28,8 +28,9 @@ ACTIONLINT_VERSION = "1.7.12"
 HADOLINT_VERSION = "2.15.1"
 SHELLCHECK_VERSION = "0.11.0"
 # ruff and PyYAML are not self-bootstrapped; their pinned versions live in
-# requirements-lint.txt alone, so this file cannot drift from the workflow.
-REQUIREMENTS = "requirements-lint.txt"
+# scripts/ci/config/requirements-lint.txt alone, so this file cannot drift
+# from the workflow.
+REQUIREMENTS = "scripts/ci/config/requirements-lint.txt"
 
 # These are build-policy choices, not accidental lint debt.
 HADOLINT_IGNORES = ("DL3041", "DL3042", "DL3003", "DL3059")
@@ -271,7 +272,9 @@ BUILTIN_MARKERS = frozenset({
 
 def _yaml_document(path: Path) -> dict:
     if yaml is None:
-        raise RuntimeError("PyYAML is not installed (pip install -r requirements-lint.txt)")
+        raise RuntimeError(
+            f"PyYAML is not installed (pip install -r {REQUIREMENTS})"
+        )
 
     class UniqueKeyLoader(yaml.SafeLoader):
         pass

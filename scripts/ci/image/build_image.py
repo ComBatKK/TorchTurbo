@@ -277,3 +277,20 @@ def promote_image(root: Path, image_id: str) -> ImageBuildResult:
         )
 
     return _image_outcome(plan, alias_image, built=False, alias=plan.spec.alias)
+
+
+def sync_alias(root: Path, image_id: str) -> ImageBuildResult:
+    """Point the stable alias at the current content image when they differ."""
+    plan = get_image_plan(root, image_id)
+    registry = Registry(plan.spec.repository)
+    content_image = _resolved_image_from_manifest(
+        plan, registry.require_manifest(plan.content_tag)
+    )
+    alias_manifest = registry.find_manifest(plan.spec.alias)
+    if alias_manifest is not None:
+        alias_image = _resolved_image_from_manifest(plan, alias_manifest)
+        if alias_image.digest == content_image.digest:
+            return _image_outcome(
+                plan, alias_image, built=False, alias=plan.spec.alias
+            )
+    return promote_image(root, image_id)

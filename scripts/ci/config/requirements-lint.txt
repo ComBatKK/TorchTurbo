@@ -5,11 +5,11 @@
 # shellcheck, actionlint, and hadolint download themselves into
 # TORCHTURBO_LINT_TOOLS (default /tmp/torchturbo-lint-tools).
 #
-# This file is the single source of truth for those versions. Neither
-# `.github/workflows/ci-pr.yml` nor the lint modules repeat them.
+# This file is the single source of truth for those versions. Neither the
+# workflows nor the lint modules repeat them.
 #
-#     python3 -m pip install -r requirements-lint.txt
-#     python3 scripts/ci/lint_select/lint_check.py
+#     python3 -m pip install -r scripts/ci/config/requirements-lint.txt
+#     python3 -m scripts.ci.tools.lint
 
 ruff==0.6.9
 PyYAML==6.0.3

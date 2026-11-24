@@ -23,12 +23,13 @@ lint -> Planner -> PlannerOutput -> Executor -> JobResult -> Gate
 - Pull requests run all core pytest plus the two lightweight CPU/NPU integration
   cases; nightly runs all pytest suites and all integration cases.
 - `.github/workflows/ascend-pr.yml` is the main PR and reusable workflow entry.
-- `.github/workflows/ascend-manual.yml` reduces the normal Plan to one exact job.
+- `.github/workflows/ascend-manual-test.yml` reduces the normal Plan to one exact job.
+- `.github/workflows/ascend-manual-image.yml` is the manual image build/reuse entry.
 - `.github/workflows/ascend-nightly.yml` reuses the main workflow with the
   nightly scope.
 - `.github/workflows/ascend-image-pr.yml` maps changed Dockerfiles to logical images and
   runs one independent `build -> tests` pipeline per affected image.
 - `.github/workflows/ascend-image-promote.yml` reuses the validated candidate per affected
   image and promotes its alias.
-- `.github/workflows/ascend-image-pipeline.yml` is the reusable single-image validation or
-  promotion unit.
+- `.github/workflows/ascend-image-pipeline.yml` is the reusable single-image build and
+  validation unit.

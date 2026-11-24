@@ -12,6 +12,7 @@ from scripts.ci.execution.consumer import integration_job
 from scripts.ci.execution.consumer import pytest_job
 from scripts.ci.execution.consumer.runtime import device_probe
 from scripts.ci.contracts.executor_contract import (
+    Failure,
     load_job_result,
 )
 from scripts.ci.contracts.planner_contract import IntegrationSpec, PytestSpec
@@ -401,3 +402,27 @@ def test_cli_record_skip_writes_result_file(tmp_path: Path, pr_plan) -> None:
     assert result.skip_message == "NPU maintenance window"
     assert (output_path.parent / "job-result.json").is_file()
     assert "## CI Job: skipped" in summary_path.read_text(encoding="utf-8")
+
+
+def test_cli_failed_result_returns_nonzero(
+    tmp_path: Path, monkeypatch, pr_plan
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    output_path = tmp_path / "artifacts" / "job-result.json"
+    job = next(item for item in pr_plan.jobs if item.kind == "pytest")
+    write_json(plan_path, build_planner_output(plan=pr_plan).to_dict())
+    failed = executor._job_result(
+        pr_plan,
+        job,
+        status="failed",
+        duration_seconds=0,
+        failure=Failure(code="test-failed", message="test failed"),
+    )
+    monkeypatch.setattr(executor, "execute_job", lambda *args, **kwargs: failed)
+
+    assert executor.main([
+        "--plan", str(plan_path),
+        "--job-id", job.id,
+        "--output", str(output_path),
+    ]) == 1
+    assert load_job_result(output_path).status == "failed"

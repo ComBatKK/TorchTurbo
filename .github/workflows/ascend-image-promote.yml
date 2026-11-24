@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: image-promote-${{ github.sha }}
+  group: image-promote
   cancel-in-progress: false
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
           python-version: '3.11'
 
       - name: install CI dependencies
-        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
 
       - name: select affected images
         id: select
@@ -103,7 +103,7 @@ jobs:
           python-version: '3.11'
 
       - name: install CI dependencies
-        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
 
       - name: log in to SWR
         env:

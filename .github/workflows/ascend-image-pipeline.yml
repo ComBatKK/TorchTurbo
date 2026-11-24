@@ -5,7 +5,8 @@ run-name: Candidate ${{ inputs.image_id }}
 # matrix so different images run independently without global barriers.
 # Candidate tests consume the immutable image digest and intentionally do not
 # reuse the complete PR workflow: the image path already ran lint and owns only
-# the build -> test-plan -> NPU -> gate lifecycle.
+# the build -> test-plan -> NPU -> gate lifecycle. Manual entry lives in
+# ascend-manual-image.yml.
 
 on:
   workflow_call:
@@ -50,44 +51,6 @@ on:
       SWR_PASSWORD:
         required: false
 
-  workflow_dispatch:
-    inputs:
-      image_id:
-        description: 'Logical image ID'
-        required: true
-        default: 'npu-a3-cann90'
-        type: string
-      target:
-        description: 'Target slice used by tests; required when run_tests is true'
-        required: false
-        default: ''
-        type: string
-      checkout_ref:
-        description: 'Git ref to build; empty uses the dispatched SHA'
-        required: false
-        default: ''
-        type: string
-      max_jobs:
-        description: 'MAX_JOBS passed to the image builder'
-        required: false
-        default: 'auto'
-        type: string
-      use_cache:
-        description: 'Use the GitHub Actions build cache'
-        required: false
-        default: true
-        type: boolean
-      runner:
-        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
-        required: false
-        default: ''
-        type: string
-      run_tests:
-        description: 'Run candidate tests after building or reusing the image'
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   contents: read
   actions: read
@@ -117,7 +80,7 @@ jobs:
           python-version: '3.11'
 
       - name: install CI dependencies
-        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
 
       - name: log in to SWR
         uses: docker/login-action@v3
@@ -156,23 +119,22 @@ jobs:
           set -euo pipefail
           : "${TARGETS:?target is required when run_tests is true}"
           : "${IMAGE_REF:?build did not publish an image ref}"
-          mkdir -p "$RUNNER_TEMP/ci-plan"
-          matrix="$RUNNER_TEMP/ci-matrix-output"
-          GITHUB_OUTPUT="$matrix" python3 -m scripts.ci.execution.producer.cli plan \
+
+          python3 -m scripts.ci.execution.producer.cli plan \
             --root "$GITHUB_WORKSPACE" \
             --scope pull_request \
             --change-mode code \
             --targets "$TARGETS" \
             --image "$IMAGE_ID" \
             --image-ref "$IMAGE_ID=$IMAGE_REF" \
-            --output "$RUNNER_TEMP/ci-plan/plan.json"
-          cat "$matrix"
-          count=$(sed -n 's/^container_job_count=//p' "$matrix" | tail -n 1)
+            --output "$RUNNER_TEMP/ci-plan/plan.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+          count=$(sed -n 's/^container_job_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
           if [ "${count:-0}" -lt 1 ]; then
             echo "::error::candidate tests produced no container jobs"
             exit 1
           fi
-          cat "$matrix" >> "$GITHUB_OUTPUT"
 
       - name: upload test plan
         if: always() && inputs.run_tests
@@ -199,14 +161,8 @@ jobs:
           DIGEST: ${{ steps.result.outputs.digest }}
           BUILT: ${{ steps.result.outputs.built }}
         run: |
-          {
-            echo '## Image CI'
-            echo ''
-            echo '| field | value |'
-            echo '|---|---|'
-            echo "| digest | \`${DIGEST:-missing}\` |"
-            echo "| built | \`${BUILT:-unknown}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf "## Image CI\n\n| field | value |\n|---|---|\n| digest | \`%s\` |\n| built | \`%s\` |\n" \
+            "${DIGEST:-missing}" "${BUILT:-unknown}" >> "$GITHUB_STEP_SUMMARY"
 
   container-tests:
     name: Container (${{ matrix.display_name }})
