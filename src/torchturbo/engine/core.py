@@ -258,6 +258,7 @@ class TorchTurboEngine:
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
             overrides=self.config.ops.overrides,
+            plugins=self.config.ops.plugins,
         )
 
         # These are set by setup()
