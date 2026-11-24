@@ -14,13 +14,14 @@ from scripts.ci.contracts.base import GitSource  # noqa: E402
 from scripts.ci.execution.producer.config import (  # noqa: E402
     CiConfig,
     Scope,
-    load as load_config,
+    bind_image_refs,
+    load_config,
 )
 from scripts.ci.execution.producer.facts import (  # noqa: E402
     TestFacts,
-    load as load_facts,
+    load_facts,
 )
-from scripts.ci.execution.producer.planner import build, source_for  # noqa: E402
+from scripts.ci.execution.producer.planner import build_plan, source_for  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -36,7 +37,7 @@ def config() -> CiConfig:
         for name, image in unbound.images.items()
         if image.kind == "container"
     }
-    return load_config(ROOT, image_refs=bindings)
+    return bind_image_refs(unbound, bindings)
 
 
 @pytest.fixture(scope="session")
@@ -66,9 +67,9 @@ def nightly_scope(config: CiConfig) -> Scope:
 
 @pytest.fixture(scope="session")
 def pr_plan(config: CiConfig, facts: TestFacts, source: GitSource):
-    return build(config, facts, "pull_request", source)
+    return build_plan(config, facts, "pull_request", source)
 
 
 @pytest.fixture(scope="session")
 def nightly_plan(config: CiConfig, facts: TestFacts, source: GitSource):
-    return build(config, facts, "nightly", source)
+    return build_plan(config, facts, "nightly", source)

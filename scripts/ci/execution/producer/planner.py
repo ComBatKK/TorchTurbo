@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
-from ...contracts.base import Diagnostic, GitSource, SCHEMA_VERSION
+from ...contracts.base import Diagnostic, DiagnosticError, GitSource, SCHEMA_VERSION
 from ...contracts.planner_contract import (
     CHANGE_MODES,
     SUITES,
@@ -29,16 +29,13 @@ from .config import (
     CiRunner,
     CiTarget,
     Scope,
+    area_selected,
 )
 from .facts import IntegrationFact, PytestFact, TestFacts
 
 
-class PlanError(ValueError):
+class PlanError(DiagnosticError):
     """Raised when selected work cannot be compiled into a valid plan."""
-
-    def __init__(self, issues: Iterable[Diagnostic]) -> None:
-        self.issues = tuple(issues)
-        super().__init__("; ".join(issue.message for issue in self.issues))
 
 
 @dataclass(frozen=True)
@@ -46,15 +43,6 @@ class ImageSelection:
     index: int
     image: CiImage
     test_areas: tuple[str, ...] | None
-
-    def selects_pytest(self, suite: str) -> bool:
-        return self._selects(f"pytest/{suite}")
-
-    def selects_integration(self, suite: str, case_id: str) -> bool:
-        return self._selects(f"integration/{suite}/{case_id}")
-
-    def _selects(self, area_id: str) -> bool:
-        return self.test_areas is None or area_id in self.test_areas
 
 
 @dataclass
@@ -178,7 +166,10 @@ def _pytest_jobs(
     groups: dict[tuple[str, ...], _PytestGroup] = {}
     selected_suites = {
         suite for suite in SUITES
-        if any(selection.selects_pytest(suite) for selection in selections)
+        if any(
+            area_selected(selection.test_areas, f"pytest/{suite}")
+            for selection in selections
+        )
     }
     suites_with_files = {
         fact.suite for fact in facts.pytest if fact.suite in selected_suites
@@ -187,7 +178,7 @@ def _pytest_jobs(
     for selection in selections:
         target = config.target_for(selection.image.target)
         for fact in facts.pytest:
-            if not selection.selects_pytest(fact.suite):
+            if not area_selected(selection.test_areas, f"pytest/{fact.suite}"):
                 continue
             if target.device not in fact.devices:
                 continue
@@ -329,7 +320,7 @@ def _integration_jobs(
         selected[selection.index] = chosen
 
     available_suites = {case.suite for case in facts.integration}
-    for suite_name in config.integration_areas.suites:
+    for suite_name in config.integration_suites:
         if suite_name not in available_suites and any(
             selection.test_areas is None for selection in selections
         ):
@@ -416,7 +407,7 @@ def _integration_jobs(
     return jobs
 
 
-def build(
+def build_plan(
     config: CiConfig,
     facts: TestFacts,
     ci_type: str,
@@ -628,7 +619,7 @@ def planner_output_for(
     if config is None or facts is None or values:
         return build_planner_output(errors=values)
     try:
-        plan = build(
+        plan = build_plan(
             config,
             facts,
             ci_type,

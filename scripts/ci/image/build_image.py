@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -142,7 +141,7 @@ def resolved_image_for_content_tag(
     )
 
 
-def check_build_environment() -> list[str]:
+def check_build_environment() -> None:
     """Check whether the Docker build environment is usable."""
     if not shutil.which("docker"):
         raise BuildError("docker is not available")
@@ -156,11 +155,6 @@ def check_build_environment() -> list[str]:
     buildx = subprocess.run(["docker", "buildx", "version"], capture_output=True, text=True)
     if buildx.returncode != 0:
         raise BuildError("docker buildx is not available")
-    return [
-        f"host={platform.node()} arch={platform.machine()}",
-        version.stdout.strip(),
-        buildx.stdout.strip(),
-    ]
 
 
 def max_jobs(

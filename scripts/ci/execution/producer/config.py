@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 import yaml
 
-from ...contracts.base import Diagnostic
+from ...contracts.base import Diagnostic, DiagnosticError
 from ...contracts.image_contract import ResolvedImage
 from ...contracts.planner_contract import DEVICES, SUITES, VenvSpec
 
@@ -17,12 +17,8 @@ CONFIG_PATH = Path("scripts/ci/config/ci.yml")
 SCOPES = ("pull_request", "nightly")
 
 
-class CiConfigError(ValueError):
+class CiConfigError(DiagnosticError):
     """Raised when CI configuration or a cross-reference is invalid."""
-
-    def __init__(self, issues: Iterable[Diagnostic]) -> None:
-        self.issues = tuple(issues)
-        super().__init__("; ".join(issue.message for issue in self.issues))
 
 
 @dataclass(frozen=True)
@@ -100,23 +96,19 @@ class IntegrationSuite:
 
 
 @dataclass(frozen=True)
-class IntegrationAreas:
-    suites: dict[str, IntegrationSuite]
-
-
-@dataclass(frozen=True)
 class ScopeSelection:
     image: str
     test_areas: tuple[str, ...] | None
 
     def selects_pytest(self, suite: str) -> bool:
-        return self._selects(f"pytest/{suite}")
+        return area_selected(self.test_areas, f"pytest/{suite}")
 
     def selects_integration(self, suite: str, case_id: str) -> bool:
-        return self._selects(f"integration/{suite}/{case_id}")
+        return area_selected(self.test_areas, f"integration/{suite}/{case_id}")
 
-    def _selects(self, area_id: str) -> bool:
-        return self.test_areas is None or area_id in self.test_areas
+
+def area_selected(test_areas: tuple[str, ...] | None, area_id: str) -> bool:
+    return test_areas is None or area_id in test_areas
 
 
 @dataclass(frozen=True)
@@ -133,7 +125,7 @@ class CiConfig:
     venvs: dict[str, VenvSpec]
     runners: tuple[CiRunner, ...]
     pytest_areas: PytestAreas
-    integration_areas: IntegrationAreas
+    integration_suites: dict[str, IntegrationSuite]
     scopes: dict[str, Scope]
 
     def target_for(self, name: str) -> CiTarget:
@@ -176,7 +168,7 @@ class CiConfig:
         return any(target.device == device for target in self.targets.values())
 
     def integration_suite(self, name: str) -> IntegrationSuite:
-        suite = self.integration_areas.suites.get(name)
+        suite = self.integration_suites.get(name)
         if suite is None:
             raise CiConfigError([_issue(name, f"unknown integration suite {name!r}")])
         return suite
@@ -297,7 +289,6 @@ def _load_targets(raw: Any, issues: list[Diagnostic]) -> dict[str, CiTarget]:
 def _load_images(
     raw: Any,
     targets: dict[str, CiTarget],
-    image_refs: dict[str, str],
     issues: list[Diagnostic],
 ) -> dict[str, CiImage]:
     images: dict[str, CiImage] = {}
@@ -306,23 +297,40 @@ def _load_images(
         row = _row(value, path, {"target", "kind", "ref", "build", "publish"}, issues)
         target = str(row.get("target") or "")
         kind = str(row.get("kind") or "")
-        ref = str(image_refs.get(name) or row.get("ref") or "")
+        ref = str(row.get("ref") or "")
         if target not in targets:
             issues.append(_issue(f"{path}.target", "unknown target"))
         if kind not in {"host", "container"}:
             issues.append(_issue(f"{path}.kind", "must be host or container"))
         if kind == "container" and row.get("ref"):
             issues.append(_issue(f"{path}.ref", "container ref belongs to the image domain"))
-        if kind == "container" and ref:
-            _, separator, digest = ref.rpartition("@")
-            if not separator or not digest.startswith("sha256:"):
-                issues.append(_issue(f"{path}.ref", "must be digest-pinned"))
         if kind == "host" and not ref:
             issues.append(_issue(f"{path}.ref", "image ref is required"))
         images[name] = CiImage(name, target, kind, ref)
-    for name in sorted(set(image_refs) - set(images)):
-        issues.append(_issue(f"resources.images.{name}", "no image definition"))
     return images
+
+
+def bind_image_refs(config: CiConfig, refs: dict[str, str]) -> CiConfig:
+    """Return a config with runtime image refs replaced by pinned values."""
+    if not refs:
+        return config
+    issues: list[Diagnostic] = []
+    images: dict[str, CiImage] = {}
+    for name, image in config.images.items():
+        ref = str(refs.get(name) or image.ref)
+        if image.kind == "container" and ref:
+            _, separator, digest = ref.rpartition("@")
+            if not separator or not digest.startswith("sha256:"):
+                issues.append(_issue(
+                    f"resources.images.{name}.ref",
+                    "must be digest-pinned",
+                ))
+        images[name] = replace(image, ref=ref)
+    for name in sorted(set(refs) - set(images)):
+        issues.append(_issue(f"resources.images.{name}", "no image definition"))
+    if issues:
+        raise CiConfigError(issues)
+    return replace(config, images=images)
 
 
 def _load_venvs(
@@ -481,7 +489,7 @@ def _load_pytest(
 
 def _load_integration(
     raw: Any, venvs: dict[str, VenvSpec], root: Path, issues: list[Diagnostic]
-) -> IntegrationAreas:
+) -> dict[str, IntegrationSuite]:
     row = _row(raw, "test_areas.integration", {"suites"}, issues)
     suites: dict[str, IntegrationSuite] = {}
     for name, value in _map(
@@ -540,7 +548,7 @@ def _load_integration(
             framework_venvs={key: str(venv) for key, venv in frameworks.items()},
             overrides=overrides,
         )
-    return IntegrationAreas(suites=suites)
+    return suites
 
 
 def _test_areas(
@@ -609,7 +617,7 @@ def _load_scopes(
     return scopes
 
 
-def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
+def load_config(root: Path) -> CiConfig:
     """Load ci.yml and validate all configuration-local cross references."""
     issues: list[Diagnostic] = []
     path = root / CONFIG_PATH
@@ -627,18 +635,18 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
         issues,
     )
     targets = _load_targets(resources.get("targets"), issues)
-    images = _load_images(resources.get("images"), targets, image_refs or {}, issues)
+    images = _load_images(resources.get("images"), targets, issues)
     venvs = _load_venvs(resources.get("venvs"), root, issues)
     runners = _load_runners(resources.get("runners"), targets, issues)
     test_areas = _row(
         document.get("test_areas"), "test_areas", {"pytest", "integration"}, issues
     )
     pytest_areas = _load_pytest(test_areas.get("pytest"), venvs, root, issues)
-    integration_areas = _load_integration(
+    integration_suites = _load_integration(
         test_areas.get("integration"), venvs, root, issues
     )
     scopes = _load_scopes(
-        document.get("scopes"), images, set(integration_areas.suites), issues
+        document.get("scopes"), images, set(integration_suites), issues
     )
     if issues:
         raise CiConfigError(issues)
@@ -649,6 +657,6 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> CiConfig:
         venvs=venvs,
         runners=runners,
         pytest_areas=pytest_areas,
-        integration_areas=integration_areas,
+        integration_suites=integration_suites,
         scopes=scopes,
     )

@@ -13,7 +13,7 @@ from scripts.ci.execution.producer.config import (
     CiTarget,
     ScopeSelection,
     _load_scopes,
-    load,
+    bind_image_refs,
 )
 from scripts.ci.execution.producer.facts import TestFacts
 
@@ -44,7 +44,7 @@ def test_config_resources(config: CiConfig) -> None:
     assert config.pytest_areas.step_timeout_minutes == {
         "cpu": 40, "npu": 90, "gpu": 90,
     }
-    suite = config.integration_areas.suites["base_suite"]
+    suite = config.integration_suites["base_suite"]
     assert suite.job_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
     assert suite.step_timeout_minutes == {"cpu": 40, "npu": 90, "gpu": 90}
 
@@ -123,7 +123,7 @@ def test_scope_test_areas_are_validated(config: CiConfig) -> None:
             }],
         },
         config.images,
-        set(config.integration_areas.suites),
+        set(config.integration_suites),
         issues,
     )
 
@@ -229,12 +229,9 @@ def test_unknown_scope_is_rejected(config: CiConfig) -> None:
 
 def test_image_overrides_must_reference_defined_digest_pinned_images(config: CiConfig) -> None:
     with pytest.raises(CiConfigError, match="no image definition"):
-        load(config.root, image_refs={"missing": DIGEST_REF})
+        bind_image_refs(config, {"missing": DIGEST_REF})
     with pytest.raises(CiConfigError, match="digest-pinned"):
-        load(
-            config.root,
-            image_refs={"npu-a3-cann90": "registry.example/team/image:tag"},
-        )
+        bind_image_refs(config, {"npu-a3-cann90": "registry.example/team/image:tag"})
 
 
 def test_facts_snapshot(facts: TestFacts) -> None:

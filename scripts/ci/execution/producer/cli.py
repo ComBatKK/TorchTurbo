@@ -9,15 +9,15 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-from ... import repository_root
 from ...contracts.base import Diagnostic, GitSource
 from ...contracts.planner_contract import CHANGE_MODES, PlannerOutput
 from ...image.build_image import resolve_image
 from ...image.image_config import ImageError
 from ...image.registry import RegistryError
+from ...tools.cli import append_github_output, repository_path
 from ...tools.json_io import canonical_json, write_json
-from .config import CiConfigError, load as load_config
-from .facts import FactsError, load as load_facts
+from .config import CiConfigError, bind_image_refs, load_config
+from .facts import FactsError, load_facts
 from .matrix import github_outputs
 from .planner import PlanError, planner_output_for, requested_images, source_for
 
@@ -37,10 +37,6 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--targets", default="")
 
     return parser
-
-
-def _root(value: str) -> Path:
-    return Path(value).resolve() if value else repository_root()
 
 
 def _image_refs(values: list[str]) -> dict[str, str]:
@@ -65,17 +61,6 @@ def _source(root: Path) -> GitSource:
 def _print_diagnostics(issues: Iterable[Diagnostic]) -> None:
     for issue in issues:
         print(f"{issue.location}: {issue.message}", file=sys.stderr)
-
-
-def _append_github_output(values: dict[str, str]) -> None:
-    path = os.environ.get("GITHUB_OUTPUT", "")
-    if not path:
-        return
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as output:
-        for key, value in values.items():
-            output.write(f"{key}={value}\n")
 
 
 def _write_output(args: argparse.Namespace, output: PlannerOutput) -> None:
@@ -106,7 +91,7 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
             location="selection",
             message="--target-job cannot be combined with --targets",
         )])
-    root = _root(args.root)
+    root = repository_path(args.root)
     image_refs = _image_refs(args.image_ref)
     config = load_config(root)
     if args.change_mode == "code":
@@ -126,7 +111,7 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
                     location=f"resources.images.{image_id}.ref",
                     message=str(exc),
                 )]) from exc
-    config = load_config(root, image_refs=image_refs)
+    config = bind_image_refs(config, image_refs)
     facts = load_facts(root, config)
     output = planner_output_for(
         config,
@@ -142,7 +127,7 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
     if output.status != "ready" or output.plan is None:
         _print_diagnostics(output.errors)
         return 1
-    _append_github_output(github_outputs(output.plan, config))
+    append_github_output(github_outputs(output.plan, config))
     if not args.output and not os.environ.get("GITHUB_OUTPUT"):
         print(canonical_json(output.plan.to_dict()))
     return 0
@@ -151,7 +136,7 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    source = _source(_root(args.root))
+    source = _source(repository_path(args.root))
     try:
         return _plan(args, source)
     except (CiConfigError, FactsError, PlanError) as exc:

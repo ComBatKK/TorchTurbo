@@ -11,9 +11,9 @@ from scripts.ci.contracts.executor_contract import (
 )
 from scripts.ci.contracts.planner_contract import PytestSpec
 from scripts.ci.execution.finalization import gate
-from scripts.ci.execution.finalization.gate import decide, decide_planner_output
+from scripts.ci.execution.finalization.gate import decide_plan, decide_planner_output
 from scripts.ci.execution.producer.planner import (
-    build,
+    build_plan,
     build_execution_plan,
     build_planner_output,
 )
@@ -77,7 +77,7 @@ def _plan_with_allowed_skip(plan, job_id: str, reason: str):
 
 
 def test_all_jobs_pass(pr_plan) -> None:
-    decision = decide(pr_plan, _results(pr_plan))
+    decision = decide_plan(pr_plan, _results(pr_plan))
     assert decision.status == "passed"
     assert decision.summary["expected_jobs"] == 7
     assert decision.summary["passed"] == 7
@@ -85,8 +85,8 @@ def test_all_jobs_pass(pr_plan) -> None:
 
 
 def test_docs_only_plan_passes_without_results(config, facts, source) -> None:
-    plan = build(config, facts, "pull_request", source, change_mode="docs_only")
-    decision = decide(plan, [])
+    plan = build_plan(config, facts, "pull_request", source, change_mode="docs_only")
+    decision = decide_plan(plan, [])
     assert decision.status == "passed"
     assert decision.summary == {
         "expected_jobs": 0,
@@ -101,7 +101,7 @@ def test_docs_only_plan_passes_without_results(config, facts, source) -> None:
 
 
 def test_missing_result_fails(pr_plan) -> None:
-    decision = decide(pr_plan, _results(pr_plan)[:-1])
+    decision = decide_plan(pr_plan, _results(pr_plan)[:-1])
     assert decision.status == "failed"
     assert "missing-result" in {failure["code"] for failure in decision.failures}
 
@@ -121,7 +121,7 @@ def test_incomplete_executor_result_is_infra_error(pr_plan) -> None:
             message="executor did not finalize JobResult",
         ),
     )
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     codes = {failure["code"] for failure in decision.failures}
     assert decision.status == "failed"
     assert "job-infra_error" in codes
@@ -132,7 +132,7 @@ def test_incomplete_executor_result_is_infra_error(pr_plan) -> None:
 def test_duplicate_result_fails(pr_plan) -> None:
     results = _results(pr_plan)
     results.append(results[0])
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     assert decision.status == "failed"
     assert "duplicate-result" in {failure["code"] for failure in decision.failures}
 
@@ -141,7 +141,7 @@ def test_extra_result_fails(pr_plan) -> None:
     results = _results(pr_plan)
     foreign = replace(results[0], job_id="unexpected-job")
     results.append(foreign)
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     assert "unexpected-result" in {failure["code"] for failure in decision.failures}
 
 
@@ -158,10 +158,10 @@ def test_skip_reason_must_be_allowed(pr_plan) -> None:
         skip_reason="maintenance",
         skip_message="window",
     )
-    assert decide(allowed, results).status == "passed"
+    assert decide_plan(allowed, results).status == "passed"
 
     results[index] = replace(results[index], skip_reason="free-form")
-    decision = decide(allowed, results)
+    decision = decide_plan(allowed, results)
     assert decision.status == "failed"
     assert "skip-reason" in {failure["code"] for failure in decision.failures}
 
@@ -181,7 +181,7 @@ def test_pytest_without_tests_fails(pr_plan) -> None:
         results[index],
         tasks=tasks,
     )
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     assert "pytest-no-tests" in {failure["code"] for failure in decision.failures}
 
 
@@ -200,7 +200,7 @@ def test_pytest_failures_fail(pr_plan) -> None:
         results[index],
         tasks=tasks,
     )
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     assert "pytest-failures" in {failure["code"] for failure in decision.failures}
 
 
@@ -211,7 +211,7 @@ def test_integration_without_artifact_fails(pr_plan) -> None:
         results[index],
         artifact_paths={},
     )
-    decision = decide(pr_plan, results)
+    decision = decide_plan(pr_plan, results)
     assert "integration-artifact" in {failure["code"] for failure in decision.failures}
 
 
@@ -250,7 +250,7 @@ def test_same_pytest_file_on_distinct_targets_is_allowed(pr_plan) -> None:
         git_source=pr_plan.git_source,
         jobs=jobs,
     )
-    decision = decide(plan, _results(plan))
+    decision = decide_plan(plan, _results(plan))
     assert decision.status == "passed"
     assert "duplicate-route" not in {failure["code"] for failure in decision.failures}
 

@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import sys
 from enum import Enum
-from pathlib import Path
 from typing import Iterable
 
+from .cli import read_lines
 from .repo_paths import is_dockerfile_path, is_docs_path
 
 
@@ -40,12 +40,6 @@ def classify_changes(paths: Iterable[str]) -> ChangeKind:
     return ChangeKind.CODE if has_code else ChangeKind.DOCS_ONLY
 
 
-def _read_paths(path: str) -> list[str]:
-    if path == "-":
-        return sys.stdin.read().splitlines()
-    return Path(path).read_text(encoding="utf-8").splitlines()
-
-
 def main(argv: list[str] | None = None) -> int:
     """Print one change kind for workflow consumption."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -56,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        paths = _read_paths(args.changed_files)
+        paths = read_lines(args.changed_files)
     except OSError as exc:
         print(f"cannot read changed-file list: {exc}", file=sys.stderr)
         return 2

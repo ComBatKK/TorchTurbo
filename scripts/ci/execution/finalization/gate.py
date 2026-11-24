@@ -13,14 +13,12 @@ from typing import Any, Iterable
 from ...contracts.base import Contract, ContractError, SCHEMA_VERSION
 from ...contracts.executor_contract import (
     JOB_RESULT_FILENAME,
-    JOB_STATUSES,
     JobResult,
+    TaskResult,
     load_job_result,
 )
 from ...contracts.planner_contract import (
-    SUITES,
     ExecutionPlan,
-    IntegrationSpec,
     Job,
     PlannerOutput,
     PytestSpec,
@@ -59,55 +57,98 @@ def _failure(
 
 def _plan_failures(plan: ExecutionPlan) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    job_ids: set[str] = set()
-    task_ids: set[str] = set()
     test_routes: set[tuple[str, str, str]] = set()
-    integration_routes: set[tuple[str, str, str]] = set()
     for job in plan.jobs:
-        if job.id in job_ids:
-            failures.append(_failure("duplicate-job", "duplicate job id", job_id=job.id))
-        job_ids.add(job.id)
-        if not job.tasks:
-            failures.append(_failure("empty-job", "job has no tasks", job_id=job.id))
-        if job.kind == "integration" and len(job.tasks) != 1:
-            failures.append(_failure(
-                "integration-tasks",
-                "integration job must contain exactly one task",
-                job_id=job.id,
-            ))
         for task in job.tasks:
-            if task.id in task_ids:
-                failures.append(_failure("duplicate-task", "duplicate task id", task_id=task.id))
-            task_ids.add(task.id)
-            if isinstance(task.spec, PytestSpec):
-                if task.spec.suite not in SUITES:
-                    failures.append(_failure("pytest-suite", "unknown pytest suite", task_id=task.id))
-                    continue
-                for path in task.spec.test_files:
-                    route = (path, job.runtime.target, job.runtime.device)
-                    if route in test_routes:
-                        failures.append(_failure("duplicate-route", f"duplicate route {route}", task_id=task.id))
-                    test_routes.add(route)
-            elif isinstance(task.spec, IntegrationSpec):
-                if task.ranks != job.runtime.ranks:
+            if not isinstance(task.spec, PytestSpec):
+                continue
+            for path in task.spec.test_files:
+                route = (path, job.runtime.target, job.runtime.device)
+                if route in test_routes:
                     failures.append(_failure(
-                        "integration-ranks",
-                        "integration task ranks differ from job runtime",
-                        job_id=job.id,
+                        "duplicate-route",
+                        f"duplicate route {route}",
                         task_id=task.id,
                     ))
-                route = (
-                    task.spec.suite,
-                    task.spec.case_id,
-                    job.runtime.target,
-                )
-                if route in integration_routes:
-                    failures.append(_failure(
-                        "duplicate-integration-case",
-                        f"duplicate integration case {route}",
-                        task_id=task.id,
-                    ))
-                integration_routes.add(route)
+                test_routes.add(route)
+    return failures
+
+
+def _task_results(
+    job: Job, result: JobResult
+) -> tuple[dict[str, TaskResult], set[str], list[dict[str, Any]]]:
+    failures: list[dict[str, Any]] = []
+    expected = {task.id for task in job.tasks}
+    actual: dict[str, TaskResult] = {}
+    for task in result.tasks:
+        if task.id in actual:
+            failures.append(_failure(
+                "duplicate-task-result",
+                "duplicate task result",
+                job_id=job.id,
+                task_id=task.id,
+            ))
+        elif task.id not in expected:
+            failures.append(_failure(
+                "unknown-task-result",
+                "task result is not in plan",
+                job_id=job.id,
+                task_id=task.id,
+            ))
+        actual[task.id] = task
+    return actual, expected, failures
+
+
+def _passed_failures(
+    job: Job,
+    result: JobResult,
+    actual: dict[str, TaskResult],
+    expected: set[str],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    if set(actual) != expected:
+        failures.append(_failure(
+            "result-tasks",
+            "passed result does not cover all planned tasks",
+            job_id=job.id,
+        ))
+    if any(task.status != "passed" or task.exit_code != 0 for task in actual.values()):
+        failures.append(_failure(
+            "result-task-status",
+            "passed job has a non-passing task",
+            job_id=job.id,
+        ))
+    if job.kind == "pytest":
+        for task in actual.values():
+            evidence = task.evidence
+            if evidence is None:
+                failures.append(_failure(
+                    "pytest-no-evidence",
+                    "pytest task has no execution evidence",
+                    job_id=job.id,
+                    task_id=task.id,
+                ))
+                continue
+            if evidence.tests_total == 0:
+                failures.append(_failure(
+                    "pytest-no-tests",
+                    "pytest collected no tests",
+                    job_id=job.id,
+                    task_id=task.id,
+                ))
+            if evidence.tests_failed or evidence.tests_errors:
+                failures.append(_failure(
+                    "pytest-failures",
+                    "pytest evidence contains failures or errors",
+                    job_id=job.id,
+                    task_id=task.id,
+                ))
+    elif job.kind == "integration" and not result.artifact_paths.get("integration"):
+        failures.append(_failure(
+            "integration-artifact",
+            "integration result has no artifact directory",
+            job_id=job.id,
+        ))
     return failures
 
 
@@ -121,80 +162,12 @@ def _result_failures(
         failures.append(_failure("result-kind", "result kind differs from Plan", job_id=job.id))
     if result.runtime.to_dict() != job.runtime.to_dict():
         failures.append(_failure("result-runtime", "result runtime differs from Plan", job_id=job.id))
-    if result.status not in JOB_STATUSES:
-        failures.append(_failure("result-status", f"unknown status {result.status!r}", job_id=job.id))
-        return failures
-
-    expected_tasks = {task.id for task in job.tasks}
-    seen_tasks: set[str] = set()
-    for task in result.tasks:
-        if task.id in seen_tasks:
-            failures.append(_failure(
-                "duplicate-task-result",
-                "duplicate task result",
-                job_id=job.id,
-                task_id=task.id,
-            ))
-        seen_tasks.add(task.id)
-        if task.id not in expected_tasks:
-            failures.append(_failure(
-                "unknown-task-result",
-                "task result is not in plan",
-                job_id=job.id,
-                task_id=task.id,
-            ))
+    actual, expected, task_failures = _task_results(job, result)
+    failures.extend(task_failures)
     if result.status == "passed":
-        if result.skip_reason is not None:
-            failures.append(_failure("unexpected-skip", "passed result has a skip reason", job_id=job.id))
-        if seen_tasks != expected_tasks:
-            failures.append(_failure(
-                "result-tasks",
-                "passed result does not cover all planned tasks",
-                job_id=job.id,
-            ))
-        if any(task.status != "passed" or task.exit_code != 0 for task in result.tasks):
-            failures.append(_failure(
-                "result-task-status",
-                "passed job has a non-passing task",
-                job_id=job.id,
-            ))
-        if job.kind == "pytest":
-            for task in result.tasks:
-                if task.evidence is None:
-                    failures.append(_failure(
-                        "pytest-no-evidence",
-                        "pytest task has no execution evidence",
-                        job_id=job.id,
-                        task_id=task.id,
-                    ))
-                    continue
-                if task.evidence.tests_total == 0:
-                    failures.append(_failure(
-                        "pytest-no-tests",
-                        "pytest collected no tests",
-                        job_id=job.id,
-                        task_id=task.id,
-                    ))
-                if task.evidence.tests_failed or task.evidence.tests_errors:
-                    failures.append(_failure(
-                        "pytest-failures",
-                        "pytest evidence contains failures or errors",
-                        job_id=job.id,
-                        task_id=task.id,
-                    ))
-        elif job.kind == "integration":
-            if not result.artifact_paths.get("integration"):
-                failures.append(_failure(
-                    "integration-artifact",
-                    "integration result has no artifact directory",
-                    job_id=job.id,
-                ))
-        else:
-            failures.append(_failure("result-evidence", "result evidence type is invalid", job_id=job.id))
+        failures.extend(_passed_failures(job, result, actual, expected))
     elif result.status == "skipped":
-        if result.skip_reason is None:
-            failures.append(_failure("skip-reason", "skipped result has no reason", job_id=job.id))
-        elif result.skip_reason not in job.allowed_skip_reasons:
+        if result.skip_reason not in job.allowed_skip_reasons:
             failures.append(_failure("skip-reason", "skip reason is not allowed by Plan", job_id=job.id))
         if result.tasks:
             failures.append(_failure(
@@ -222,7 +195,7 @@ def _check(identifier: str, failures: Iterable[dict[str, Any]], detail: str = ""
     return value
 
 
-def decide(
+def decide_plan(
     plan: ExecutionPlan, results: list[JobResult]
 ) -> GateDecision:
     """Judge one ExecutionPlan and its JobResults."""
@@ -312,7 +285,7 @@ def decide(
 def decide_planner_output(output: PlannerOutput) -> GateDecision:
     """Turn a failed PlannerOutput into a failed GateDecision."""
     if output.status == "ready" and output.plan is not None:
-        return decide(output.plan, [])
+        return decide_plan(output.plan, [])
     failures = tuple(
         _failure(
             f"planner-output-{issue.code}",
@@ -404,7 +377,7 @@ def main(argv: list[str]) -> int:
         else:
             if output.plan is None:
                 raise ContractError("ready planner output has no plan")
-            decision = decide(
+            decision = decide_plan(
                 output.plan,
                 _load_results(Path(args.results) if args.results else None),
             )

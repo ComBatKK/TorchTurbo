@@ -297,6 +297,7 @@ def _execute_tasks(
             return "failed", results, junit_paths
         task_started = time.monotonic()
         junit: Path | None = None
+        task_status = "passed"
         task_failure: Failure | None = None
         try:
             command, environment, junit = _task_command(
@@ -311,26 +312,23 @@ def _execute_tasks(
                 log_path=log_path,
                 timeout_seconds=limit,
             )
+            if exit_code != 0:
+                task_status = "failed"
+                task_failure = _task_failure(
+                    job,
+                    task,
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    deadline=deadline,
+                )
         except KeyboardInterrupt:
-            status, exit_code = "cancelled", 130
+            task_status, exit_code = "cancelled", 130
             task_failure = Failure(code="cancelled", message="cancelled")
         except Exception as exc:  # noqa: BLE001 - report task infrastructure failure
-            status, exit_code, timed_out = "infra_error", 2, False
+            task_status, exit_code = "infra_error", 2
             task_failure = Failure(
                 code="task-setup",
                 message=f"{type(exc).__name__}: {exc}",
-            )
-        task_status = status if status != "passed" else (
-            "passed" if exit_code == 0 else "failed"
-        )
-        if status == "passed" and exit_code != 0:
-            status = "failed"
-            task_failure = _task_failure(
-                job,
-                task,
-                exit_code=exit_code,
-                timed_out=timed_out,
-                deadline=deadline,
             )
         evidence = (
             pytest_job.evidence(junit)
@@ -344,7 +342,8 @@ def _execute_tasks(
             evidence=evidence,
             failure=task_failure,
         ))
-        if status != "passed":
+        if task_status != "passed":
+            status = task_status
             elapsed = int(time.monotonic() - task_started)
             print(
                 f"task {task.id} finished in {elapsed}s with status={task_status}",
@@ -381,7 +380,7 @@ def _write_versions(venv: Venv, output: Path, root: Path) -> None:
     output.write_text(result.stdout.strip() + "\n", encoding="utf-8")
 
 
-def execute(
+def execute_job(
     plan: ExecutionPlan,
     job_id: str,
     *,
@@ -558,7 +557,7 @@ def main(argv: list[str]) -> int:
                 message=args.skip_message,
             )
         else:
-            result = execute(plan, args.job_id, output_dir=output_dir, root=root)
+            result = execute_job(plan, args.job_id, output_dir=output_dir, root=root)
     except (ContractError, ExecutorError, OSError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 2

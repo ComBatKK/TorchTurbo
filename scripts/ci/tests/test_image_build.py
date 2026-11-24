@@ -168,7 +168,7 @@ def test_missing_content_image_is_built_and_verified(
     manifests: dict[str, Manifest] = {}
     registry = FakeRegistry(manifests)
     monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
-    monkeypatch.setattr(image_build, "check_build_environment", lambda: [])
+    monkeypatch.setattr(image_build, "check_build_environment", lambda: None)
 
     def build(plan, root, **kwargs):
         manifests[plan.content_tag] = _manifest(plan.content_tag, BUILT_DIGEST)
@@ -191,7 +191,7 @@ def test_promote_requires_the_tested_content_image(
         plan.content_tag: _manifest(plan.content_tag, BUILT_DIGEST),
     })
     monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
-    monkeypatch.setattr(image_build, "check_build_environment", lambda: [])
+    monkeypatch.setattr(image_build, "check_build_environment", lambda: None)
 
     result = image_build.promote_image(repo_root, "npu-a3-cann90")
 

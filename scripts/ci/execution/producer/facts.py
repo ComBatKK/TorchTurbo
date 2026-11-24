@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import CiConfig
-from ...contracts.base import Diagnostic
+from ...contracts.base import Diagnostic, DiagnosticError
 from ...contracts.planner_contract import DEVICES
 from ...tools.hashing import file_sha256
 
@@ -25,12 +25,8 @@ FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
 MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
 
 
-class FactsError(ValueError):
+class FactsError(DiagnosticError):
     """Raised when repository test facts are missing or inconsistent."""
-
-    def __init__(self, issues: Iterable[Diagnostic]) -> None:
-        self.issues = tuple(issues)
-        super().__init__("; ".join(issue.message for issue in self.issues))
 
 
 @dataclass(frozen=True)
@@ -377,7 +373,7 @@ def _integration_facts(
     issues: list[Diagnostic] = []
     facts: list[IntegrationFact] = []
     seen: set[tuple[str, str]] = set()
-    for suite_name, suite in sorted(config.integration_areas.suites.items()):
+    for suite_name, suite in sorted(config.integration_suites.items()):
         payload, error = _manifest(root, suite_name, suite.runner)
         if error is not None:
             issues.append(error)
@@ -470,7 +466,7 @@ def _integration_facts(
     return facts, issues
 
 
-def load(root: Path, config: CiConfig) -> TestFacts:
+def load_facts(root: Path, config: CiConfig) -> TestFacts:
     """Load all configured pytest and integration facts."""
     pytest, pytest_issues = _pytest_facts(root)
     integration, integration_issues = _integration_facts(root, config)

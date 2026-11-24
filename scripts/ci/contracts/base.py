@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Iterable
 
 SCHEMA_VERSION = 21
 
@@ -31,3 +31,11 @@ class GitSource(Contract):
     repository: str  # Repository name or remote URL
     git_ref: str     # Git branch, tag, or pull-request ref
     commit_sha: str  # Exact Git commit SHA
+
+
+class DiagnosticError(ValueError):
+    """Raised when a CI step reports one or more structured diagnostics."""
+
+    def __init__(self, issues: Iterable[Diagnostic]) -> None:
+        self.issues = tuple(issues)
+        super().__init__("; ".join(issue.message for issue in self.issues))

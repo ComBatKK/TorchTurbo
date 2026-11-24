@@ -440,11 +440,11 @@ def _check_planner_v2(
 def check_config() -> list[Problem]:
     """Validate ci.yml and every test fact derived from the repository."""
     from ..image.image_config import ImageError, load_specs
-    from ..execution.producer.config import CiConfigError, load
-    from ..execution.producer.facts import FactsError, load as load_facts
+    from ..execution.producer.config import CiConfigError, load_config
+    from ..execution.producer.facts import FactsError, load_facts
 
     try:
-        config = load(ROOT)
+        config = load_config(ROOT)
         load_facts(ROOT, config)
         load_specs(ROOT)
     except (CiConfigError, FactsError) as exc:

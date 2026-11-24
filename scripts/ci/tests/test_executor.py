@@ -84,7 +84,7 @@ def test_execute_pytest_job_writes_passing_result(
 
     monkeypatch.setattr(executor, "run_stream", fake_run)
     output_dir = tmp_path / "result"
-    result = executor.execute(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
+    result = executor.execute_job(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
 
     assert result.status == "passed"
     assert result.job_id == job.id
@@ -121,7 +121,7 @@ def test_execute_integration_job_writes_evidence(
 
     monkeypatch.setattr(executor, "run_stream", fake_run)
     output_dir = tmp_path / "result"
-    result = executor.execute(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
+    result = executor.execute_job(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
     spec = job.tasks[0].spec
     assert isinstance(spec, IntegrationSpec)
     assert result.status == "passed"
@@ -154,7 +154,7 @@ def test_execute_leaves_provisional_result_if_terminated(
 
     monkeypatch.setattr(executor, "run_stream", fake_run)
     with pytest.raises(SystemExit, match="137"):
-        executor.execute(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
+        executor.execute_job(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
 
     assert observed == [("infra_error", "executor-incomplete")]
     result = load_job_result(output_dir / "job-result.json")
@@ -175,7 +175,9 @@ def test_execute_stops_after_first_failed_step(tmp_path: Path, monkeypatch, pr_p
         return 1, False
 
     monkeypatch.setattr(executor, "run_stream", fake_run)
-    result = executor.execute(pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path)
+    result = executor.execute_job(
+        pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path
+    )
 
     assert calls == 1
     assert result.status == "failed"
@@ -190,7 +192,9 @@ def test_execute_records_timeout(tmp_path: Path, monkeypatch, pr_plan) -> None:
     job = next(item for item in pr_plan.jobs if item.kind == "pytest")
     _patch_execution(monkeypatch, tmp_path, job)
     monkeypatch.setattr(executor, "run_stream", lambda *args, **kwargs: (124, True))
-    result = executor.execute(pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path)
+    result = executor.execute_job(
+        pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path
+    )
 
     assert result.status == "failed"
     assert result.failure is None
@@ -210,7 +214,9 @@ def test_environment_failure_still_writes_result(tmp_path: Path, monkeypatch, pr
             raise RuntimeError("venv install failed")
 
     monkeypatch.setattr(executor, "VenvManager", FakeManager)
-    result = executor.execute(pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path)
+    result = executor.execute_job(
+        pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path
+    )
 
     assert result.status == "infra_error"
     assert result.failure is not None
@@ -280,7 +286,9 @@ def test_npu_job_cleans_up_environment(tmp_path: Path, monkeypatch, pr_plan) -> 
         return 0, False
 
     monkeypatch.setattr(executor, "run_stream", fake_run)
-    result = executor.execute(pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path)
+    result = executor.execute_job(
+        pr_plan, job.id, output_dir=tmp_path / "result", root=tmp_path
+    )
 
     assert result.status == "passed"
     assert len(cleanup_calls) == 1

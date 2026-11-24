@@ -27,7 +27,7 @@ from scripts.ci.execution.producer.config import (
 from scripts.ci.execution.producer.facts import TestFacts
 from scripts.ci.execution.producer.planner import (
     PlanError,
-    build,
+    build_plan,
     planner_output_for,
     requested_images,
 )
@@ -95,7 +95,7 @@ def test_pull_request_scope(
 def test_docs_only_scope_has_no_jobs(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
-    plan = build(config, facts, "pull_request", source, change_mode="docs_only")
+    plan = build_plan(config, facts, "pull_request", source, change_mode="docs_only")
     assert plan.jobs == ()
     assert plan.change_mode == "docs_only"
     _assert_matches(plan, config, facts)
@@ -112,7 +112,7 @@ def test_docs_only_scope_has_no_jobs(
 def test_non_code_change_modes_have_no_jobs(
     config: CiConfig, facts: TestFacts, source, change_mode: str
 ) -> None:
-    plan = build(config, facts, "pull_request", source, change_mode=change_mode)
+    plan = build_plan(config, facts, "pull_request", source, change_mode=change_mode)
     assert plan.jobs == ()
     assert plan.change_mode == change_mode
     _assert_matches(plan, config, facts)
@@ -236,7 +236,7 @@ def test_missing_container_binding_fails(
     image = replace(config.images["npu-a3-cann90"], ref="")
     unbound = replace(config, images={**config.images, image.name: image})
     with pytest.raises(PlanError, match="missing ResolvedImage"):
-        build(unbound, facts, "pull_request", source)
+        build_plan(unbound, facts, "pull_request", source)
 
 
 def _add_target(
@@ -314,7 +314,7 @@ def test_a5_extends_target_image_runner_and_scope(
         ),
     )
 
-    plan = build(candidate, a5_facts, "pull_request", source)
+    plan = build_plan(candidate, a5_facts, "pull_request", source)
     job = next(
         item for item in plan.jobs
         if item.id == "integration-base-suite-qwen3-5-moe-sft-2npu"
@@ -350,7 +350,7 @@ def test_gpu_target_routes_to_the_container_matrix(
         test_areas=("pytest/core",),
     )
 
-    plan = build(candidate, facts, "pull_request", source)
+    plan = build_plan(candidate, facts, "pull_request", source)
     gpu_jobs = [job for job in plan.jobs if job.runtime.device == "gpu"]
     assert gpu_jobs
     assert all(job.runtime.target == "gpu-h100" for job in gpu_jobs)
@@ -376,7 +376,7 @@ def test_image_override_selects_the_candidate_before_scope(
         images={**config.images, candidate_image.name: candidate_image},
     )
 
-    plan = build(
+    plan = build_plan(
         candidate,
         facts,
         "pull_request",
@@ -423,7 +423,7 @@ def test_two_images_on_the_same_target_are_separate_jobs(
         scopes={**config.scopes, pr_scope.name: scope},
     )
 
-    plan = build(candidate, facts, "pull_request", source)
+    plan = build_plan(candidate, facts, "pull_request", source)
     npu_core = [
         job for job in plan.jobs
         if job.kind == "pytest" and job.runtime.target == target.name
@@ -472,7 +472,7 @@ def test_explicit_unknown_integration_case_is_rejected(
     )
     broken = replace(config, scopes={**config.scopes, "pull_request": broken_scope})
     with pytest.raises(PlanError, match="unknown integration case"):
-        build(broken, facts, "pull_request", source)
+        build_plan(broken, facts, "pull_request", source)
 
 
 def test_planner_failure_output_round_trip(
@@ -528,7 +528,7 @@ def test_missing_job_is_rejected(
         pr_plan,
         jobs=tuple(job for job in pr_plan.jobs if job.id != missing),
     ))
-    assert broken.to_dict() != build(
+    assert broken.to_dict() != build_plan(
         config, facts, "pull_request", pr_plan.git_source
     ).to_dict()
 
@@ -545,7 +545,7 @@ def test_tampered_integration_spec_is_rejected(
         pr_plan,
         jobs=tuple(bad_job if item.id == job.id else item for item in pr_plan.jobs),
     ))
-    assert broken.to_dict() != build(
+    assert broken.to_dict() != build_plan(
         config, facts, "pull_request", pr_plan.git_source
     ).to_dict()
 
@@ -554,7 +554,7 @@ def test_tampered_change_mode_is_rejected(
     config: CiConfig, facts: TestFacts, pr_plan: ExecutionPlan
 ) -> None:
     broken = _with_plan_id(replace(pr_plan, change_mode="docs_only"))
-    expected = build(
+    expected = build_plan(
         config, facts, "pull_request", pr_plan.git_source, change_mode="docs_only"
     )
     assert broken.to_dict() != expected.to_dict()

@@ -6,70 +6,51 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
 
-from .. import repository_root
-from ..tools.json_io import write_json
+from ..tools.cli import (
+    append_github_output,
+    read_lines,
+    repository_path,
+    write_json_output,
+)
 from .build_image import BuildError, get_or_build_image, promote_image
 from .image_config import ImageError
 from .select_images import ImageSelectionError, select_images
 from .registry import RegistryError
 
 
-def _root(value: str | None) -> Path:
-    return Path(value).resolve() if value else repository_root()
-
-
 def _read_paths(path: str) -> list[str]:
-    if path == "-":
-        return sys.stdin.read().splitlines()
     try:
-        return Path(path).read_text(encoding="utf-8").splitlines()
+        return read_lines(path)
     except OSError as exc:
         raise ImageSelectionError(f"cannot read changed-file list: {exc}") from exc
-
-
-def _write_json(path: str, value: object) -> None:
-    if path:
-        write_json(Path(path), value)
-    else:
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
-
-
-def _write_outputs(path: str, values: dict[str, object]) -> None:
-    if not path:
-        return
-    with Path(path).open("a", encoding="utf-8") as output:
-        for key, value in values.items():
-            output.write(f"{key}={value}\n")
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
     changed = _read_paths(args.changed_files) if args.changed_files else None
     specs = select_images(
-        _root(args.root), image_ids=args.images, changed_files=changed
+        repository_path(args.root), image_ids=args.images, changed_files=changed
     )
     matrix = {
         "include": [
             {"image_id": spec.image_id, "target": spec.target} for spec in specs
         ]
     }
-    compact = json.dumps(matrix, ensure_ascii=False, separators=(",", ":"))
-    _write_json(args.output, matrix)
-    _write_outputs(
-        args.github_output,
+    write_json_output(args.output, matrix)
+    append_github_output(
         {
-            "image_jobs": compact,
+            "image_jobs": json.dumps(matrix, ensure_ascii=False, separators=(",", ":")),
             "image_count": len(specs),
             "images": ",".join(spec.image_id for spec in specs),
         },
+        args.github_output,
     )
     return 0
 
 
 def cmd_build(args: argparse.Namespace) -> int:
     outcome = get_or_build_image(
-        _root(args.root),
+        repository_path(args.root),
         args.image,
         use_cache=not args.no_cache,
         builder=args.builder,
@@ -77,9 +58,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     )
     build = outcome.build
     image = build.image
-    _write_json(args.output, outcome.to_dict())
-    _write_outputs(
-        args.github_output,
+    write_json_output(args.output, outcome.to_dict())
+    append_github_output(
         {
             "ref": image.ref,
             "digest": image.digest,
@@ -89,22 +69,23 @@ def cmd_build(args: argparse.Namespace) -> int:
             "image_id": image.image_id,
             "content_hash": build.content_hash,
         },
+        args.github_output,
     )
     return 0
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
-    outcome = promote_image(_root(args.root), args.image)
+    outcome = promote_image(repository_path(args.root), args.image)
     image = outcome.build.image
-    _write_json(args.output, outcome.to_dict())
-    _write_outputs(
-        args.github_output,
+    write_json_output(args.output, outcome.to_dict())
+    append_github_output(
         {
             "alias": outcome.alias,
             "ref": image.ref,
             "digest": image.digest,
             "promoted": "true",
         },
+        args.github_output,
     )
     return 0
 
