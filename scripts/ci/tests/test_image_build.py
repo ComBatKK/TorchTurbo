@@ -131,11 +131,11 @@ def test_resolved_image_for_content_tag_resolves_an_immutable_ref(
     assert image.ref == f"{plan.spec.repository}@{DIGEST}"
 
 
-def test_resolve_image_uses_the_temporary_content_tag(
+def test_resolve_image_uses_the_current_content_tag(
     repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = get_image_plan(repo_root, "npu-a3-cann90")
-    registry = FakeRegistry({"cann9.0.0-a3-c18fa86defbe1": _manifest("pinned")})
+    registry = FakeRegistry({plan.content_tag: _manifest(plan.content_tag)})
     monkeypatch.setattr(image_build, "Registry", lambda repository: registry)
 
     image = resolve_image(repo_root, "npu-a3-cann90")

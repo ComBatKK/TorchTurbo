@@ -23,12 +23,6 @@ _GIT_USER_AGENT_PATCH = (
 )
 _FROM_LINE = re.compile(r"^([ \t]*FROM[^\n]*)(?:\n|\Z)", re.IGNORECASE | re.MULTILINE)
 
-# Temporary pin until the current V3 content tag is rebuilt.
-PINNED_CONTENT_TAGS = {
-    "npu-a3-cann90": "cann9.0.0-a3-c18fa86defbe1",
-}
-
-
 class BuildError(RuntimeError):
     """Raised when an image cannot be built or verified."""
 
@@ -67,11 +61,6 @@ class ImageOutcome:
             "alias": self.alias,
             "promoted": self.promoted,
         }
-
-
-def runtime_content_tag(plan: ImagePlan) -> str:
-    """Return the content tag used to resolve a runtime image."""
-    return PINNED_CONTENT_TAGS.get(plan.image_id, plan.content_tag)
 
 
 def get_content_hash(root: Path, spec: ImageSpec) -> str:
@@ -366,7 +355,7 @@ def resolve_image(
 ) -> ResolvedImage:
     """Resolve one logical image to an immutable image."""
     plan = get_image_plan(root, image_id)
-    return resolved_image_for_content_tag(plan, runtime_content_tag(plan))
+    return resolved_image_for_content_tag(plan, plan.content_tag)
 
 
 def promote_image(root: Path, image_id: str) -> ImageOutcome:
