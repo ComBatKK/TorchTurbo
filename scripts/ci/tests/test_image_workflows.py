@@ -87,6 +87,8 @@ def test_normal_pr_workflow_plans_runtime_images(repo_root: Path) -> None:
     assert "matrix-output" not in publish["run"]
     assert "--fail-code" not in publish["run"]
     assert 'echo "::error::lint failed"' in publish["run"]
+    assert "producer.cli failed-output" in publish["run"]
+    assert "--code lint-failed" in publish["run"]
     assert "ci-image-refs" not in dumped
     assert "scripts.ci.image.cli resolve" not in dumped
     assert "scripts.ci.execution.producer.cli images" not in dumped

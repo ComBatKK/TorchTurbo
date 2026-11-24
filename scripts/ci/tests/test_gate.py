@@ -9,9 +9,10 @@ from scripts.ci.contracts.executor_contract import (
     TaskEvidence,
     TaskResult,
 )
-from scripts.ci.contracts.planner_contract import PytestSpec
+from scripts.ci.contracts.planner_contract import PytestSpec, load_planner_output
 from scripts.ci.execution.finalization import gate
 from scripts.ci.execution.finalization.gate import decide_plan, decide_planner_output
+from scripts.ci.execution.producer.cli import main
 from scripts.ci.execution.producer.planner import (
     build_plan,
     build_execution_plan,
@@ -359,6 +360,23 @@ def test_planner_issue_path_is_not_a_task_id(pr_plan) -> None:
     failure = decide_planner_output(output).failures[0]
     assert failure["path"] == "scripts/ci/x.py"
     assert "task_id" not in failure
+
+
+def test_failed_output_cli_reports_lint_failure(tmp_path) -> None:
+    path = tmp_path / "plan.json"
+    assert main([
+        "failed-output",
+        "--output", str(path),
+        "--code", "lint-failed",
+        "--location", "scripts/ci",
+        "--message", "lint failed; see Lint-Plan job",
+    ]) == 0
+    output = load_planner_output(path)
+    assert output.status == "failed"
+    assert output.plan is None
+    decision = decide_planner_output(output)
+    assert decision.status == "failed"
+    assert decision.failures[0]["code"] == "planner-output-lint-failed"
 
 
 def _write_cli_inputs(tmp_path, plan, results):

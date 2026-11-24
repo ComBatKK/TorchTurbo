@@ -19,7 +19,13 @@ from ...tools.json_io import canonical_json
 from .config import CiConfigError, bind_image_refs, load_config
 from .facts import FactsError, load_facts
 from .matrix import github_outputs
-from .planner import PlanError, planner_output_for, requested_images, source_for
+from .planner import (
+    PlanError,
+    build_planner_output,
+    planner_output_for,
+    requested_images,
+    source_for,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -33,6 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--image", default="")
     plan.add_argument("--target-job", default="")
     plan.add_argument("--targets", default="")
+
+    failed = commands.add_parser("failed-output", parents=[common_parser()])
+    failed.add_argument("--code", required=True)
+    failed.add_argument("--location", default="ci")
+    failed.add_argument("--message", required=True)
 
     return parser
 
@@ -75,6 +86,17 @@ def _fail_plan(
     write_json_output(args.output, output.to_dict(), emit_stdout=False)
     _print_diagnostics(output.errors)
     return 1
+
+
+def _failed_output(args: argparse.Namespace) -> int:
+    output = build_planner_output(errors=(Diagnostic(
+        code=args.code,
+        location=args.location,
+        message=args.message,
+    ),))
+    write_json_output(args.output, output.to_dict())
+    _print_diagnostics(output.errors)
+    return 0
 
 
 def _plan(args: argparse.Namespace, source: GitSource) -> int:
@@ -129,6 +151,8 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "failed-output":
+        return _failed_output(args)
     source = _source(repository_path(args.root))
     try:
         return _plan(args, source)

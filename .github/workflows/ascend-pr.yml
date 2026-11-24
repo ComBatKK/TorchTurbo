@@ -152,6 +152,11 @@ jobs:
 
           if [ "$CHANGE_MODE" = code ] && [ "$LINT_OUTCOME" != success ]; then
             echo "::error::lint failed"
+            python3 -m scripts.ci.execution.producer.cli failed-output \
+              --output "$RUNNER_TEMP/ci-plan/plan.json" \
+              --code lint-failed \
+              --location scripts/ci \
+              --message "lint failed; see Lint-Plan job"
             exit 1
           fi
 
