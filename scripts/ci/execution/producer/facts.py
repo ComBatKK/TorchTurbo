@@ -14,7 +14,6 @@ from typing import Any, Iterable
 from .config import CiConfig
 from ...contracts.base import Diagnostic, DiagnosticError
 from ...contracts.planner_contract import DEVICES
-from ...tools.hashing import file_sha256
 
 PYTEST_ROOT = Path("tests/unit_tests")
 MANIFEST_SCHEMA_VERSION = 1
@@ -23,6 +22,7 @@ MULTI_MARKERS = {"multi_npu": "npu", "multi_gpu": "gpu"}
 REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration")
 FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
 MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
+RANK_PARAMETERS = frozenset({"world_size", "nprocs", "num_processes", "rank_size"})
 
 
 class FactsError(DiagnosticError):
@@ -48,8 +48,6 @@ class IntegrationFact:
     platform: str
     targets: tuple[str, ...]
     ranks: int
-    config_sha256: str
-    golden_sha256: str
 
 
 @dataclass(frozen=True)
@@ -115,14 +113,11 @@ def _module_markers(tree: ast.Module) -> set[str]:
     return names
 
 
-def _dotted_name(node: ast.AST) -> str:
-    parts: list[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-    return ".".join(reversed(parts))
+def _call_name(call: ast.Call) -> str:
+    func = call.func
+    return func.attr if isinstance(func, ast.Attribute) else (
+        func.id if isinstance(func, ast.Name) else ""
+    )
 
 
 def _literal_int(call: ast.Call, name: str) -> int | None:
@@ -133,34 +128,26 @@ def _literal_int(call: ast.Call, name: str) -> int | None:
     return None
 
 
-def _parametrized_ranks(tree: ast.AST) -> int:
+def _parametrized_rank(call: ast.Call) -> int:
+    try:
+        parameters = ast.literal_eval(call.args[0])
+        values = ast.literal_eval(call.args[1])
+    except (ValueError, SyntaxError):
+        return 1
+    if isinstance(parameters, str):
+        parameters = [part.strip() for part in parameters.split(",")]
+    if not isinstance(parameters, (list, tuple)) or not isinstance(values, (list, tuple)):
+        return 1
+    indexes = [
+        index for index, name in enumerate(parameters)
+        if isinstance(name, str) and name in RANK_PARAMETERS
+    ]
     required = 1
-    names = {"world_size", "nprocs", "num_processes", "rank_size"}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _dotted_name(
-            node.func
-        ).rsplit(".", 1)[-1] != "parametrize" or len(node.args) < 2:
-            continue
-        try:
-            parameters = ast.literal_eval(node.args[0])
-            values = ast.literal_eval(node.args[1])
-        except (ValueError, SyntaxError):
-            continue
-        if isinstance(parameters, str):
-            parameters = [part.strip() for part in parameters.split(",")]
-        if not isinstance(parameters, (list, tuple)):
-            continue
-        indexes = [
-            index for index, name in enumerate(parameters)
-            if isinstance(name, str) and name in names
-        ]
-        if not indexes or not isinstance(values, (list, tuple)):
-            continue
-        for row in values:
-            row = row if isinstance(row, (list, tuple)) else (row,)
-            for index in indexes:
-                if index < len(row) and isinstance(row[index], int):
-                    required = max(required, row[index])
+    for row in values:
+        row = row if isinstance(row, (list, tuple)) else (row,)
+        for index in indexes:
+            if index < len(row) and isinstance(row[index], int):
+                required = max(required, row[index])
     return required
 
 
@@ -169,9 +156,10 @@ def _ranks(tree: ast.AST) -> int:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        name = node.func.attr if isinstance(node.func, ast.Attribute) else (
-            node.func.id if isinstance(node.func, ast.Name) else ""
-        )
+        name = _call_name(node)
+        if name == "parametrize" and len(node.args) >= 2:
+            required = max(required, _parametrized_rank(node))
+            continue
         if name not in {"spawn", "init_process_group", "require_npus"}:
             continue
         if name == "require_npus":
@@ -182,7 +170,7 @@ def _ranks(tree: ast.AST) -> int:
                 node, "world_size" if name == "init_process_group" else "nprocs"
             )
         required = max(required, size if isinstance(size, int) else 2)
-    return max(required, _parametrized_ranks(tree))
+    return required
 
 
 def _imports(tree: ast.Module) -> tuple[set[str], set[str]]:
@@ -275,64 +263,46 @@ def _manifest(
     root: Path, suite_name: str, runner: str
 ) -> tuple[dict[str, Any] | None, Diagnostic | None]:
     result = subprocess.run(
-        [
-            sys.executable,
-            str(root / runner),
-            "--suite",
-            suite_name,
-            "--list-cases",
-            "--json",
-        ],
+        [sys.executable, str(root / runner), "--suite", suite_name, "--list-cases", "--json"],
         cwd=root,
         capture_output=True,
         text=True,
-        check=False,
     )
-    if result.returncode != 0:
+    if result.returncode:
         detail = (result.stderr or result.stdout).strip()
-        return None, _issue(
-            runner,
-            f"integration suite {suite_name!r} manifest failed with rc="
-            f"{result.returncode}: {detail}",
-            "integration-manifest",
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except ValueError as exc:
-        return None, _issue(
-            runner,
-            f"integration suite {suite_name!r} manifest is not JSON: {exc}",
-            "integration-manifest",
-        )
-    if not isinstance(payload, dict):
-        return None, _issue(
-            runner,
-            f"integration suite {suite_name!r} manifest must be a mapping",
-            "integration-manifest",
-        )
-    return payload, None
+        message = f"manifest failed with rc={result.returncode}: {detail}"
+    else:
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError as exc:
+            message = f"manifest is not JSON: {exc}"
+        else:
+            if isinstance(payload, dict):
+                return payload, None
+            message = "manifest must be a mapping"
+    return None, _issue(
+        runner, f"integration suite {suite_name!r} {message}", "integration-manifest"
+    )
 
 
-def _repo_file(
+def _check_repo_file(
     root: Path, value: str, where: str, issues: list[Diagnostic]
-) -> Path | None:
+) -> None:
     if not value:
         issues.append(_issue(where, "path is required"))
-        return None
+        return
     path = Path(value)
     if path.is_absolute():
         issues.append(_issue(where, "path must be repository-relative"))
-        return None
+        return
     absolute = (root / path).resolve()
     try:
         absolute.relative_to(root.resolve())
     except ValueError:
         issues.append(_issue(where, "path escapes the repository"))
-        return None
+        return
     if not absolute.is_file():
         issues.append(_issue(where, f"file is missing: {value}"))
-        return None
-    return absolute
 
 
 def _targets(
@@ -346,24 +316,21 @@ def _targets(
     multiple = item.get("targets")
     if single is not None and multiple is not None:
         issues.append(_issue(where, "declare target or targets, not both"))
-    if isinstance(single, str) and single:
-        values = (single,)
-    elif isinstance(multiple, list) and all(
+    single_valid = isinstance(single, str) and bool(single)
+    multiple_valid = isinstance(multiple, list) and bool(multiple) and all(
         isinstance(value, str) and value for value in multiple
-    ):
-        values = tuple(multiple)
-    else:
-        if multiple is not None:
-            issues.append(_issue(where, "targets must be non-empty strings"))
-        values = ()
+    )
+    if single is not None and not single_valid:
+        issues.append(_issue(where, "target must be a non-empty string"))
+    if multiple is not None and not multiple_valid:
+        issues.append(_issue(where, "targets must be non-empty strings"))
+    values = (single,) if single_valid else tuple(multiple) if multiple_valid else ()
     for name in values:
         target = config.targets.get(name)
         if target is None:
             issues.append(_issue(where, f"unknown target {name!r}"))
         elif target.device != platform:
-            issues.append(
-                _issue(where, f"target {name!r} is for {target.device}, not {platform}")
-            )
+            issues.append(_issue(where, f"target {name!r} is for {target.device}, not {platform}"))
     return values
 
 
@@ -379,19 +346,18 @@ def _integration_facts(
             issues.append(error)
             continue
         assert payload is not None
-        if payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-            issues.append(_issue(
-                suite.runner,
-                f"suite {suite_name!r} manifest schema must be "
-                f"{MANIFEST_SCHEMA_VERSION}",
-                "integration-manifest",
-            ))
-        if payload.get("suite") != suite_name:
-            issues.append(_issue(
-                suite.runner,
-                f"manifest suite is {payload.get('suite')!r}, expected {suite_name!r}",
-                "integration-manifest",
-            ))
+        expected = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "suite": suite_name,
+        }
+        for key, value in expected.items():
+            actual = payload.get(key)
+            if actual != value:
+                issues.append(_issue(
+                    suite.runner,
+                    f"manifest {key} is {actual!r}, expected {value!r}",
+                    "integration-manifest",
+                ))
         cases = payload.get("cases")
         if not isinstance(cases, list):
             issues.append(_issue(
@@ -414,41 +380,43 @@ def _integration_facts(
                 issues.append(_issue(f"{where}.case_id", f"duplicate case {case_id!r}"))
             seen.add(key)
             framework = item.get("framework")
-            if framework not in suite.framework_venvs:
+            if not isinstance(framework, str) or framework not in suite.framework_venvs:
                 issues.append(_issue(
-                    f"{where}.framework",
-                    f"framework {framework!r} has no venv mapping",
+                    f"{where}.framework", f"framework {framework!r} has no venv mapping"
                 ))
                 framework = ""
             platform = item.get("platform")
-            if platform not in DEVICES:
+            if not isinstance(platform, str) or platform not in DEVICES:
                 issues.append(_issue(f"{where}.platform", "unknown platform"))
                 platform = ""
             elif not config.device_is_configured(platform):
-                issues.append(
-                    _issue(f"{where}.platform", f"no CI target for {platform!r}")
-                )
-            targets = _targets(
-                item, platform, config, f"{where}.targets", issues
-            ) if platform else ()
+                issues.append(_issue(
+                    f"{where}.platform", f"no CI target for {platform!r}"
+                ))
+            targets = (
+                _targets(item, platform, config, f"{where}.targets", issues)
+                if platform else ()
+            )
             ranks = item.get("ranks")
             if not isinstance(ranks, int) or isinstance(ranks, bool) or ranks < 1:
                 issues.append(_issue(f"{where}.ranks", "ranks must be an integer >= 1"))
                 ranks = 1
-            if item.get("compare") is not True:
-                issues.append(
-                    _issue(f"{where}.compare", "CI integration cases must compare")
-                )
+            compare = item.get("compare")
+            if compare is not True:
+                issues.append(_issue(
+                    f"{where}.compare", "CI integration cases must compare"
+                ))
             if item.get("update_golden") is not False:
-                issues.append(
-                    _issue(f"{where}.update_golden", "CI must not update golden values")
-                )
-            config_file = _repo_file(
+                issues.append(_issue(
+                    f"{where}.update_golden", "CI must not update golden values"
+                ))
+            _check_repo_file(
                 root, str(item.get("config") or ""), f"{where}.config", issues
             )
-            golden_file = _repo_file(
-                root, str(item.get("golden") or ""), f"{where}.golden", issues
-            )
+            if compare is True:
+                _check_repo_file(
+                    root, str(item.get("golden") or ""), f"{where}.golden", issues
+                )
             facts.append(IntegrationFact(
                 suite=suite_name,
                 case_id=case_id,
@@ -456,12 +424,6 @@ def _integration_facts(
                 platform=platform,
                 targets=targets,
                 ranks=ranks,
-                config_sha256=(
-                    file_sha256(config_file) if config_file is not None else ""
-                ),
-                golden_sha256=(
-                    file_sha256(golden_file) if golden_file is not None else ""
-                ),
             ))
     return facts, issues
 

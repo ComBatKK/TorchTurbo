@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R2 后当前生产代码：6284 行
+- R3 后当前生产代码：6236 行
 - 目标生产代码：不超过 4500 行
-- R2 后剩余需要减少：约 1784 行，约 28%
+- R3 后剩余需要减少：约 1736 行，约 28%
 
 统计命令：
 
@@ -108,17 +108,17 @@ tools            lint、路径规则、JSON、CLI 小工具
 | 模块 | 当前 | 目标 | 减少 |
 |---|---:|---:|---:|
 | `execution/producer/config.py` | 619 | 560 | -59 |
-| `execution/producer/planner.py` | 635 | 430 | -205 |
+| `execution/producer/planner.py` | 633 | 430 | -203 |
 | `tools/lint.py` | 590 | 480 | -110 |
 | `execution/consumer/executor.py` | 575 | 420 | -155 |
-| `execution/producer/facts.py` | 483 | 360 | -123 |
+| `execution/producer/facts.py` | 445 | 440 | -5 |
 | `execution/consumer/runtime/model_dataset.py` | 411 | 270 | -141 |
 | `execution/finalization/gate.py` | 398 | 260 | -138 |
 | `image/build_image.py` | 383 | 270 | -113 |
 | `execution/consumer/runtime/device.py` | 262 | 230 | -32 |
 | `execution/consumer/runtime/venv_manager.py` | 249 | 210 | -39 |
 | `image/image_config.py` | 214 | 200 | -14 |
-| `contracts/planner_contract.py` | 165 | 110 | -55 |
+| `contracts/planner_contract.py` | 147 | 110 | -37 |
 | `execution/producer/cli.py` | 153 | 80 | -73 |
 | `contracts/executor_contract.py` | 149 | 100 | -49 |
 | `image/registry.py` | 135 | 110 | -25 |
@@ -135,7 +135,7 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `contracts/base.py` | 41 | 30 | -11 |
 | `tools/cli.py` | 40 | 35 | -5 |
 | `tools/repo_paths.py` | 37 | 25 | -12 |
-| `tools/hashing.py` | 19 | 15 | -4 |
+| `tools/hashing.py` | 13 | 13 | 0 |
 | 其他 `__init__.py` | 16 | 20 | +4 |
 
 分类预算：
@@ -244,17 +244,47 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### R3. Facts 扫描收敛
 
-目标：`facts.py` 从 483 行降到约 360 行。
+状态：已完成（安全收敛版）。
 
-措施：
+目标：`facts.py` 从 483 行降到约 450 行；实际 445 行。
 
-- 合并重复的路径分类逻辑，只保留一套 `test_parts()`。
-- 删除与当前路由无关的 marker、model family、process group 分支。
-- rank 检测只保留：
-  `require_npus`、`init_process_group`、`spawn`、`parametrize`。
-- integration manifest 校验拆成：
-  `load_manifest()`、`parse_case()`、`validate_case()`。
-- 删除对同一字段的重复类型检查和二次错误包装。
+原 360 行目标不可行。实测：
+
+- 删除 framework/family 分类会让 12 个文件改变 suite。
+- 删除 family 参与 `process_group` 会让 15 个文件改变分组，
+  Task 从 38 组降到 29 组。
+- integration `targets` 当前为空，但它是 A5/GPU 按 target 选择用例的
+  扩展点。
+
+实际措施：
+
+- 合并 `_dotted_name()`、`_parametrized_ranks()` 到 `_ranks()`。
+- 压缩 `_manifest()` 的错误路径，保持原有诊断语义。
+- 压缩 integration manifest 头部校验和 `_targets()` 排版。
+- 删除没有下游消费者的 `config_sha256`、`golden_sha256` 和
+  `file_sha256`。
+- 保留 config/golden 路径存在性校验，统一为 `_check_repo_file()`。
+- 修复非法 `target` 被静默忽略的问题。
+- 修复 `framework`/`platform` 非字符串时抛异常的问题。
+- `compare=false` 不再额外要求 golden 文件。
+- 保留 `frameworks`、`model_families`、`process_group`、`targets`。
+- 保留 manifest schema、case 和 artifact path 的全部 fail-closed 校验。
+
+验证：
+
+- 162 个 pytest fact 与重构前完全一致；3 个 integration fact 除删除的
+  hash 字段外完全一致。
+- PR/nightly 的 Job ID、Task ID、image、runner、ranks 快照完全一致。
+- 新增 module-level marker list、`world_size` parametrize、非法 target、
+  manifest 类型错误和 `compare=false` 测试。
+
+结果：`facts.py 483 -> 445`，净减少 38 行。少减的部分由 R4/R5 吸收。
+
+暂不修改：
+
+- 多设备文件的 module/helper rank 扫描不对称。
+- `multi_*` marker 对 CPU rank 的影响。
+- integration `targets` 保留，作为 A5/GPU 按 target 选择用例的扩展点。
 
 ### R4. Planner 数据化
 
@@ -338,7 +368,7 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### Phase 0：保护网
 
-- 固定当前 152 个测试为基线。
+- 固定当前 157 个测试为基线。
 - 每次重构只允许减少生产行数，不修改 CI 行为。
 - 每阶段执行：
 
@@ -357,9 +387,11 @@ git diff --check
 
 ### Phase 2：Config + Facts
 
-- 目标：约 6100 -> 约 5500。
-- 处理 R2、R3。
-- 完成 image 黑盒接口，删除执行域对 build/publish 的解析。
+- 状态：R2、R3 已完成。
+- 结果：6377 -> 6236。
+- R2 完成 image 黑盒接口；R3 安全收敛 38 行，保留路由和 Task
+  分组语义。
+- 原 Phase 2 目标 5500 未达到，差额由 R4-R8 吸收。
 
 ### Phase 3：Planner
 

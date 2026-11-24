@@ -399,8 +399,6 @@ def _integration_jobs(
                         case_id=case.case_id,
                         framework=case.framework,
                         runner_script=suite.runner,
-                        config_sha256=case.config_sha256,
-                        golden_sha256=case.golden_sha256,
                     ),
                 ),),
             ))

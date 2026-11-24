@@ -541,7 +541,7 @@ def test_tampered_integration_spec_is_rejected(
     job = next(job for job in pr_plan.jobs if job.kind == "integration")
     spec = job.tasks[0].spec
     assert isinstance(spec, IntegrationSpec)
-    bad_spec = replace(spec, golden_sha256="sha256:bad")
+    bad_spec = replace(spec, case_id="tampered")
     bad_job = replace(job, tasks=(replace(job.tasks[0], spec=bad_spec),))
     broken = _with_plan_id(replace(
         pr_plan,

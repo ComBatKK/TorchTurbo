@@ -50,8 +50,6 @@ class IntegrationSpec(Contract):
     case_id: str
     framework: str
     runner_script: str
-    config_sha256: str
-    golden_sha256: str
     runner_args: tuple[str, ...] = ()
 
 
