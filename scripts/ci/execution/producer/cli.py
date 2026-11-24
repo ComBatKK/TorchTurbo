@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Iterable
 
 from ...contracts.base import Diagnostic, GitSource
-from ...contracts.planner_contract import CHANGE_MODES, PlannerOutput
+from ...contracts.planner_contract import CHANGE_MODES
 from ...image.build_image import resolve_image
 from ...image.image_config import ImageError
 from ...image.registry import RegistryError
-from ...tools.cli import append_github_output, repository_path
-from ...tools.json_io import canonical_json, write_json
+from ...tools.cli import append_github_output, common_parser, repository_path, write_json_output
+from ...tools.json_io import canonical_json
 from .config import CiConfigError, bind_image_refs, load_config
 from .facts import FactsError, load_facts
 from .matrix import github_outputs
@@ -26,11 +26,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    plan = commands.add_parser("plan")
-    plan.add_argument("--root", default="")
+    plan = commands.add_parser("plan", parents=[common_parser()])
     plan.add_argument("--scope", default="pull_request")
     plan.add_argument("--change-mode", choices=CHANGE_MODES, default="code")
-    plan.add_argument("--output", default="")
     plan.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
     plan.add_argument("--image", default="")
     plan.add_argument("--target-job", default="")
@@ -63,11 +61,6 @@ def _print_diagnostics(issues: Iterable[Diagnostic]) -> None:
         print(f"{issue.location}: {issue.message}", file=sys.stderr)
 
 
-def _write_output(args: argparse.Namespace, output: PlannerOutput) -> None:
-    if args.output:
-        write_json(Path(args.output), output.to_dict())
-
-
 def _fail_plan(
     args: argparse.Namespace, source: GitSource, issues: Iterable[Diagnostic]
 ) -> int:
@@ -79,7 +72,7 @@ def _fail_plan(
         git_source=source,
         issues=issues,
     )
-    _write_output(args, output)
+    write_json_output(args.output, output.to_dict(), emit_stdout=False)
     _print_diagnostics(output.errors)
     return 1
 
@@ -123,12 +116,12 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
         targets=args.targets,
         image_override=args.image,
     )
-    _write_output(args, output)
+    write_json_output(args.output, output.to_dict(), emit_stdout=False)
     if output.status != "ready" or output.plan is None:
         _print_diagnostics(output.errors)
         return 1
-    append_github_output(github_outputs(output.plan, config))
-    if not args.output and not os.environ.get("GITHUB_OUTPUT"):
+    append_github_output(github_outputs(output.plan, config), args.github_output)
+    if not args.output and not args.github_output:
         print(canonical_json(output.plan.to_dict()))
     return 0
 

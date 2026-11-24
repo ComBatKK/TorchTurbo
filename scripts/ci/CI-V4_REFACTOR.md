@@ -447,21 +447,32 @@ R8b 待做：
 
 ### R9. CLI 统一
 
-目标：`producer/cli.py`、`image/cli.py` 共减少约 130 行。
+状态：R9a 安全收敛完成；R9b 待评估。
 
-措施：
+R9a 结果：`producer/cli.py`、`image/cli.py` 共 274 -> 264（-10）；
+`tools/cli.py` 40 -> 50，生产代码总量保持 5585。
 
-- 统一使用 `tools/cli.py`：
-  `repository_path`、`read_lines`、`write_json_output`、
-  `append_github_output`。
-- 统一参数解析和错误输出格式。
-- 删除只被单一命令使用且没有复用价值的包装函数。
+R9a 措施：
+
+- `tools/cli.py` 新增 `common_parser()`，统一 `--root`、`--output`、
+  `--github-output`。
+- `write_json_output()` 增加 `emit_stdout`，producer 复用文件输出并删除
+  `_write_output()`。
+- producer 接受显式 `--github-output`，与 image CLI 保持一致。
+- 保留 producer/image 两个入口及各自错误契约。
+
+R9b 待做：
+
+- CLI 单入口预计只能减少约 35-50 行，且需要同步修改 workflow、测试和
+  `lint.py` 的 Planner 路径匹配。
+- 原“减少约 130 行”目标不可达；它会要求删除结构化失败输出或破坏镜像域
+  入口边界，不作为 V4 验收标准。
 
 ## 6. 实施阶段
 
 ### Phase 0：保护网
 
-- 固定当前 157 个测试为基线。
+- 固定当前 164 个测试为基线。
 - 每次重构只允许减少生产行数，不修改 CI 行为。
 - 每阶段执行：
 
@@ -502,7 +513,7 @@ git diff --check
 
 ### Phase 5：Image + Tools
 
-- 状态：R7a、R8a 已完成；R7b、R8b、R9 待做。
+- 状态：R7a、R8a、R9a 已完成；R7b、R8b、R9b 待评估。
 - 目标：5585 -> 不超过 4500。
 - 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。

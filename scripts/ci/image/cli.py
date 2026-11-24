@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
 from ..tools.cli import (
     append_github_output,
+    common_parser,
     read_lines,
     repository_path,
     write_json_output,
@@ -28,11 +28,11 @@ def _read_paths(path: str) -> list[str]:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     changed = _read_paths(args.changed_files) if args.changed_files else None
-    specs = select_images(repository_path(args.root), image_ids=args.images,
-                          changed_files=changed)
+    specs = select_images(
+        repository_path(args.root), image_ids=args.images, changed_files=changed
+    )
     matrix = {"include": [
-        {"image_id": spec.image_id, "target": spec.target} for spec in specs
-    ]}
+        {"image_id": spec.image_id, "target": spec.target} for spec in specs]}
     write_json_output(args.output, matrix)
     append_github_output(
         {
@@ -82,10 +82,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--root", default=None)
-    common.add_argument("--output", default="")
-    common.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT", ""))
+    common = common_parser()
 
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
