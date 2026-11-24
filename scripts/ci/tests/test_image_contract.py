@@ -71,14 +71,15 @@ def test_resolved_image_rejects_invalid_fields(field: str, value: str) -> None:
 def test_build_result_serializes_nested_image() -> None:
     result = ImageBuildResult(
         image=_container_image(),
-        git_commit_sha="e6c7a8a44ca4",
         content_hash=DIGEST,
-        platform="linux/arm64",
         built=True,
+        elapsed_seconds=7,
+        alias="cann9.0.0-a3-base",
     )
 
     assert result.to_dict()["image"]["ref"] == REF
     assert result.to_dict()["content_hash"] == DIGEST
+    assert result.to_dict()["elapsed_seconds"] == 7
 
 
 def test_build_result_requires_container_image() -> None:
@@ -92,9 +93,7 @@ def test_build_result_requires_container_image() -> None:
     with pytest.raises(ContractError, match="container image"):
         ImageBuildResult(
             image=host,
-            git_commit_sha="e6c7a8a44ca4",
             content_hash=DIGEST,
-            platform="linux/arm64",
             built=True,
         )
 
@@ -102,18 +101,14 @@ def test_build_result_requires_container_image() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("git_commit_sha", ""),
         ("content_hash", "sha256:short"),
-        ("platform", ""),
         ("built", 1),
     ],
 )
 def test_build_result_rejects_invalid_fields(field: str, value: object) -> None:
     values: dict[str, object] = {
         "image": _container_image(),
-        "git_commit_sha": "e6c7a8a44ca4",
         "content_hash": DIGEST,
-        "platform": "linux/arm64",
         "built": True,
     }
     values[field] = value

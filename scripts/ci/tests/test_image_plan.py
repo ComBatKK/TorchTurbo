@@ -9,7 +9,9 @@ from scripts.ci.image.cli import main
 from scripts.ci.image.build_image import get_image_plan
 from scripts.ci.image.image_config import (
     ImageError,
+    RuntimeImage,
     load_image,
+    load_runtime_images,
     load_specs,
     split_reference,
 )
@@ -62,6 +64,24 @@ def _write_repo(root: Path, name: str = "npu-a3-cann90") -> Path:
         "FROM base:one\n", encoding="utf-8"
     )
     return config
+
+
+def test_runtime_images_expose_host_and_unresolved_container(tmp_path: Path) -> None:
+    _write_repo(tmp_path)
+
+    runtime = load_runtime_images(tmp_path)
+
+    assert runtime["cpu-default"] == RuntimeImage(
+        image_id="cpu-default",
+        target="cpu",
+        kind="host",
+        ref="python:3.11",
+    )
+    assert runtime["npu-a3-cann90"] == RuntimeImage(
+        image_id="npu-a3-cann90",
+        target="npu-a3",
+        kind="container",
+    )
 
 
 def test_build_hash_tracks_only_dockerfile_platform_and_revision(tmp_path: Path) -> None:

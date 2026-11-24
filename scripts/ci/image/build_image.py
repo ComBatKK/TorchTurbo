@@ -45,23 +45,6 @@ class ImagePlan:
         return f"{self.spec.repository}:{self.content_tag}"
 
 
-@dataclass(frozen=True)
-class ImageOutcome:
-    build: ImageBuildResult
-    elapsed_seconds: int = 0
-    alias: str = ""
-    promoted: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": 1,
-            **self.build.to_dict(),
-            "elapsed_seconds": self.elapsed_seconds,
-            "alias": self.alias,
-            "promoted": self.promoted,
-        }
-
-
 def get_content_hash(root: Path, spec: ImageSpec) -> str:
     """Hash the Dockerfile, platform and manual revision of one image."""
     path = root / spec.dockerfile
@@ -102,33 +85,16 @@ def _image_outcome(
     image: ResolvedImage,
     *,
     built: bool,
-    git_commit_sha: str,
-    elapsed: int = 0,
+    elapsed_seconds: int = 0,
     alias: str = "",
-    promoted: bool = False,
-) -> ImageOutcome:
-    return ImageOutcome(
-        build=ImageBuildResult(
-            image=image,
-            git_commit_sha=git_commit_sha,
-            content_hash=plan.content_hash,
-            platform=plan.spec.platform,
-            built=built,
-        ),
-        elapsed_seconds=elapsed,
+) -> ImageBuildResult:
+    return ImageBuildResult(
+        image=image,
+        content_hash=plan.content_hash,
+        built=built,
+        elapsed_seconds=elapsed_seconds,
         alias=alias,
-        promoted=promoted,
     )
-
-
-def _git_commit_sha(root: Path) -> str:
-    process = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-    )
-    value = process.stdout.strip() if process.returncode == 0 else ""
-    return value or os.environ.get("GITHUB_SHA", "") or "local"
 
 
 def resolved_image_for_content_tag(
@@ -306,19 +272,17 @@ def get_or_build_image(
     use_cache: bool = True,
     builder: str = "",
     jobs: str = "auto",
-) -> ImageOutcome:
+) -> ImageBuildResult:
     """Return an immutable content image, building it only when it is absent."""
     plan = get_image_plan(root, image_id)
     registry = Registry(plan.spec.repository)
     existing_manifest = registry.find_manifest(plan.content_tag)
-    git_commit_sha = _git_commit_sha(root)
     if existing_manifest is not None:
         resolved_image = _resolved_image_from_manifest(plan, existing_manifest)
         return _image_outcome(
             plan,
             resolved_image,
             built=False,
-            git_commit_sha=git_commit_sha,
         )
 
     # The content image is missing; build it and resolve the published digest.
@@ -338,8 +302,7 @@ def get_or_build_image(
         plan,
         image,
         built=True,
-        elapsed=elapsed,
-        git_commit_sha=git_commit_sha,
+        elapsed_seconds=elapsed,
     )
 
 
@@ -352,7 +315,7 @@ def resolve_image(
     return resolved_image_for_content_tag(plan, plan.content_tag)
 
 
-def promote_image(root: Path, image_id: str) -> ImageOutcome:
+def promote_image(root: Path, image_id: str) -> ImageBuildResult:
     """Move the stable publish alias to the tested content image."""
     plan = get_image_plan(root, image_id)
     registry = Registry(plan.spec.repository)
@@ -378,6 +341,4 @@ def promote_image(root: Path, image_id: str) -> ImageOutcome:
         alias_image,
         built=False,
         alias=plan.spec.alias,
-        promoted=True,
-        git_commit_sha=_git_commit_sha(root),
     )

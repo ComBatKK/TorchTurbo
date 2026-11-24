@@ -245,7 +245,6 @@ def _task_command(
                 venv,
                 task.spec,
                 job,
-                task,
                 root=root,
                 output_dir=output_dir,
             ),

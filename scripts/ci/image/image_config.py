@@ -1,4 +1,4 @@
-"""Load and validate container image definitions from CI configuration."""
+"""Load and validate image definitions from CI configuration."""
 
 from __future__ import annotations
 
@@ -14,12 +14,23 @@ from ..tools.repo_paths import is_dockerfile_path, normalize_repo_path
 CI_CONFIG_PATH = Path("scripts/ci/config/ci.yml")
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 _CONTAINER_IMAGE_KEYS = {"target", "kind", "ref", "build", "publish"}
+_HOST_IMAGE_KEYS = {"target", "kind", "ref"}
 _BUILD_KEYS = {"dockerfile", "platform", "revision", "ci_build_args"}
 _PUBLISH_KEYS = {"ref"}
 
 
 class ImageError(ValueError):
     """Raised when image configuration is invalid."""
+
+
+@dataclass(frozen=True)
+class RuntimeImage:
+    """Image metadata consumed by the execution domain."""
+
+    image_id: str
+    target: str
+    kind: str
+    ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,23 +95,24 @@ def _reject_unknown_keys(
         raise ImageError(f"{where} has unknown field(s): {', '.join(unknown)}")
 
 
+def _target_name(
+    image: Mapping[str, Any], where: str, targets: Mapping[str, Any]
+) -> str:
+    target = _as_text(image.get("target"), f"{where}.target")
+    if not isinstance(targets.get(target), dict):
+        raise ImageError(f"resources.targets.{target} must be a mapping")
+    return target
+
+
 def _image_spec(
     root: Path,
     image_id: str,
     image: Mapping[str, Any],
     targets: Mapping[str, Any],
-) -> ImageSpec | None:
+) -> ImageSpec:
     where = f"resources.images.{image_id}"
-    kind = image.get("kind")
-    if kind == "host":
-        return None
-    if kind != "container":
-        raise ImageError(f"{where}.kind must be host or container")
-
     _reject_unknown_keys(image, _CONTAINER_IMAGE_KEYS, where)
-    target_name = _as_text(image.get("target"), f"{where}.target")
-    if not isinstance(targets.get(target_name), dict):
-        raise ImageError(f"resources.targets.{target_name} must be a mapping")
+    target_name = _target_name(image, where, targets)
     build_where = f"{where}.build"
     build = _as_mapping(image.get("build"), build_where)
     _reject_unknown_keys(build, _BUILD_KEYS, build_where)
@@ -134,8 +146,7 @@ def _image_spec(
     )
 
 
-def load_specs(root: Path) -> list[ImageSpec]:
-    """Load all container images and reject ambiguous Dockerfile mappings."""
+def _read_resources(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         document = yaml.safe_load(
             (root / CI_CONFIG_PATH).read_text(encoding="utf-8")
@@ -146,15 +157,30 @@ def load_specs(root: Path) -> list[ImageSpec]:
     resources = _as_mapping(config.get("resources"), "resources")
     targets = _as_mapping(resources.get("targets"), "resources.targets")
     images = _as_mapping(resources.get("images"), "resources.images")
+    return targets, images
 
-    specs: list[ImageSpec] = []
+
+def _load_entries(root: Path) -> list[tuple[RuntimeImage, ImageSpec | None]]:
+    targets, images = _read_resources(root)
+    entries: list[tuple[RuntimeImage, ImageSpec | None]] = []
     by_dockerfile: dict[str, str] = {}
     for image_id, raw_image in images.items():
         where = f"resources.images.{image_id}"
         image = _as_mapping(raw_image, where)
-        spec = _image_spec(root, image_id, image, targets)
-        if spec is None:
+        kind = image.get("kind")
+        if kind == "host":
+            _reject_unknown_keys(image, _HOST_IMAGE_KEYS, where)
+            runtime = RuntimeImage(
+                image_id,
+                _target_name(image, where, targets),
+                "host",
+                _as_text(image.get("ref"), f"{where}.ref"),
+            )
+            entries.append((runtime, None))
             continue
+        if kind != "container":
+            raise ImageError(f"{where}.kind must be host or container")
+        spec = _image_spec(root, image_id, image, targets)
         previous = by_dockerfile.get(spec.dockerfile)
         if previous is not None:
             raise ImageError(
@@ -162,8 +188,21 @@ def load_specs(root: Path) -> list[ImageSpec]:
                 f"{image_id!r}"
             )
         by_dockerfile[spec.dockerfile] = image_id
-        specs.append(spec)
-    return sorted(specs, key=lambda item: item.image_id)
+        entries.append((RuntimeImage(image_id, spec.target, "container"), spec))
+    return entries
+
+
+def load_specs(root: Path) -> list[ImageSpec]:
+    """Load all container images and reject ambiguous Dockerfile mappings."""
+    return sorted(
+        (spec for _, spec in _load_entries(root) if spec is not None),
+        key=lambda item: item.image_id,
+    )
+
+
+def load_runtime_images(root: Path) -> dict[str, RuntimeImage]:
+    """Load runtime image metadata without exposing build settings."""
+    return {runtime.image_id: runtime for runtime, _ in _load_entries(root)}
 
 
 def load_image(root: Path, image_id: str) -> ImageSpec:

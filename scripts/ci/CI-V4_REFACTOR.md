@@ -11,9 +11,10 @@
 - 代码范围：`scripts/ci/**/*.py`
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
-- 当前生产代码：6377 行
+- V4 起始生产代码：6377 行
+- R2 后当前生产代码：6284 行
 - 目标生产代码：不超过 4500 行
-- 需要减少：约 1877 行，约 29%
+- R2 后剩余需要减少：约 1784 行，约 28%
 
 统计命令：
 
@@ -41,7 +42,8 @@ ci.yml
 
 当前不合理或过重的地方：
 
-1. `config.py`、`image_config.py` 分别解析 `ci.yml`，存在 schema 重复。
+1. `config.py`、`image_config.py` 仍各自读取 `ci.yml`，但执行域不再解释
+   image build schema。
 2. 契约层、Planner、Gate 对同一组不变量重复校验。
 3. plan/job/task 数据模型包含不再需要的冗余字段。
 4. `config.py`、`planner.py`、`facts.py`、`executor.py` 单文件过大。
@@ -88,15 +90,16 @@ contracts        JSON 边界和最小不变量
 producer         ci.yml + facts -> ExecutionPlan
 consumer         ExecutionPlan -> JobResult
 finalization     ExecutionPlan + JobResult -> GateDecision
-image            image config -> resolve/build/promote -> ResolvedImage
+image            image config -> RuntimeImage / build / promote
 tools            lint、路径规则、JSON、CLI 小工具
 ```
 
 明确删除的耦合：
 
 - 执行域不再解析 `resources.images.*.build` 和 `publish`。
-- 镜像域通过稳定 API 提供 image ID、target、kind 和 immutable ref。
-- 执行域只消费 `ResolvedImage`，不读取 Dockerfile 或 registry。
+- 镜像域通过 `RuntimeImage` 提供 image ID、target、kind 和 ref。
+- 执行域只消费 `RuntimeImage` 并转换为 `ResolvedImage`，不读取 Dockerfile
+  或 registry。
 
 ## 4. 代码预算
 
@@ -104,9 +107,9 @@ tools            lint、路径规则、JSON、CLI 小工具
 
 | 模块 | 当前 | 目标 | 减少 |
 |---|---:|---:|---:|
-| `execution/producer/config.py` | 662 | 400 | -262 |
+| `execution/producer/config.py` | 619 | 560 | -59 |
 | `execution/producer/planner.py` | 635 | 430 | -205 |
-| `tools/lint.py` | 594 | 480 | -114 |
+| `tools/lint.py` | 590 | 480 | -110 |
 | `execution/consumer/executor.py` | 575 | 420 | -155 |
 | `execution/producer/facts.py` | 483 | 360 | -123 |
 | `execution/consumer/runtime/model_dataset.py` | 411 | 270 | -141 |
@@ -114,7 +117,7 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `image/build_image.py` | 383 | 270 | -113 |
 | `execution/consumer/runtime/device.py` | 262 | 230 | -32 |
 | `execution/consumer/runtime/venv_manager.py` | 249 | 210 | -39 |
-| `image/image_config.py` | 175 | 130 | -45 |
+| `image/image_config.py` | 214 | 200 | -14 |
 | `contracts/planner_contract.py` | 165 | 110 | -55 |
 | `execution/producer/cli.py` | 153 | 80 | -73 |
 | `contracts/executor_contract.py` | 149 | 100 | -49 |
@@ -152,7 +155,8 @@ tools            lint、路径规则、JSON、CLI 小工具
 
 ### R1. 契约层瘦身
 
-目标：`contracts` 从 559 行降到约 350 行。
+目标：`contracts` 核心文件从 430 行降到 370-390 行；当前已到 390 行。
+原 350 行目标调整为 390 行，差额由后续 Producer/Tools 阶段吸收。
 
 措施：
 
@@ -164,6 +168,8 @@ tools            lint、路径规则、JSON、CLI 小工具
   schema、kind、status、skip、task coverage、failure 形状。
 - `gate.py` 不重复校验契约层已经保证的字段。
 - `ImageBuildResult` 与 `ImageOutcome` 合并，避免两层相同字段。
+- `ImageBuildResult` 删除没有消费方的 `platform`、`git_commit_sha` 和
+  `promoted` 字段。
 
 删除项：
 
@@ -172,27 +178,46 @@ tools            lint、路径规则、JSON、CLI 小工具
 - 重复的 `_fail` 和 `DiagnosticError` 实现。
 - 未使用的通用 JSON 类型分支。
 
+当前结果：
+
+| 文件 | R1 前 | 当前 |
+|---|---:|---:|
+| `contracts/planner_contract.py` | 165 | 149 |
+| `contracts/executor_contract.py` | 149 | 129 |
+| `contracts/image_contract.py` | 75 | 71 |
+| `contracts/base.py` | 41 | 41 |
+| 合计 | 430 | 390 |
+
 ### R2. 配置与镜像黑盒
 
-目标：`config.py` 从 662 行降到约 400 行。
+状态：已完成。
 
-措施：
+目标：执行域不再解释 `resources.images.*.build` 和 `publish`。
 
-- `execution/producer/config.py` 不再解析 `build` 和 `publish`。
-- 执行域需要的 image 信息由镜像域通过稳定接口提供。
-- `ci.yml` 中 `resources.images` 的 build 细节只由 `image/image_config.py`
-  解释。
-- `ci.yml` 基础字段仍由 `tools/lint.py` 同时验证执行域和镜像域。
-- 删除逐字段 `_row(..., allowed_keys)` 的重复模式，只保留顶层未知字段
-  失败和关键资源字段校验。
-- 删除已经由 YAML 结构和类型提示保证的防御性检查。
+原 `config.py 662 -> 400` 目标不现实，调整为 `662 -> 620`。
+一个文件里与 image 直接相关的代码只有约 80-90 行，其余代码属于
+targets、runners、venvs、test areas 和 scopes。
 
-目标接口：
+实际措施：
+
+- `image/image_config.py` 新增 `RuntimeImage` 和 `load_runtime_images()`。
+- 运行时视图只包含 `image_id`、`target`、`kind`、`ref`。
+- `ImageSpec` 仍只服务镜像构建，不暴露给执行域。
+- `execution/producer/config.py` 删除 `CiImage` 和 `_load_images()`。
+- `load_config()` 从镜像域加载运行时镜像信息，并继续校验 scopes 引用。
+- `bind_image_refs()` 只负责注入解析后的 digest。
+- `tools/lint.py` 不再重复调用 `load_specs()`，配置校验统一走
+  `load_config()`。
+
+接口：
 
 ```python
-class ImageCatalog:
-    def get(self, image_id: str) -> ImageSpec: ...
-    def ids(self) -> tuple[str, ...]: ...
+@dataclass(frozen=True)
+class RuntimeImage:
+    image_id: str
+    target: str
+    kind: str
+    ref: str = ""
 ```
 
 执行域只拿到：
@@ -203,6 +228,19 @@ target
 kind
 ref
 ```
+
+当前结果：
+
+| 文件 | R2 前 | R2 后 | 变化 |
+|---|---:|---:|---:|
+| `execution/producer/config.py` | 662 | 619 | -43 |
+| `image/image_config.py` | 175 | 214 | +39 |
+| `execution/producer/planner.py` | 629 | 635 | +6 |
+| `tools/lint.py` | 594 | 590 | -4 |
+| 合计 | 2060 | 2058 | -2 |
+
+R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增加的行数
+基本抵消执行域删除的行数，净减少 2 行；总代码预算仍需由 R3-R5 完成。
 
 ### R3. Facts 扫描收敛
 
@@ -300,7 +338,7 @@ ref
 
 ### Phase 0：保护网
 
-- 固定当前 153 个测试为基线。
+- 固定当前 152 个测试为基线。
 - 每次重构只允许减少生产行数，不修改 CI 行为。
 - 每阶段执行：
 

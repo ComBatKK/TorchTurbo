@@ -8,7 +8,6 @@ import pytest
 from scripts.ci.execution.producer.config import (
     CiConfig,
     CiConfigError,
-    CiImage,
     CiRunner,
     CiTarget,
     ScopeSelection,
@@ -16,6 +15,7 @@ from scripts.ci.execution.producer.config import (
     bind_image_refs,
 )
 from scripts.ci.execution.producer.facts import TestFacts
+from scripts.ci.image.image_config import RuntimeImage
 
 DIGEST_REF = "registry.example/team/image@sha256:" + "a" * 64
 
@@ -141,8 +141,8 @@ def test_unknown_target_fails_closed(config: CiConfig) -> None:
 
 def test_a5_extends_by_target_image_runner_and_scope(config: CiConfig) -> None:
     target = CiTarget(name="npu-a5", device="npu", hardware="a5")
-    image = CiImage(
-        name="npu-a5-cann90",
+    image = RuntimeImage(
+        image_id="npu-a5-cann90",
         target=target.name,
         kind="container",
         ref="",
@@ -159,7 +159,7 @@ def test_a5_extends_by_target_image_runner_and_scope(config: CiConfig) -> None:
         selections=(
             *pr.selections,
             ScopeSelection(
-                image=image.name,
+                image=image.image_id,
                 test_areas=(
                     "pytest/core",
                     "integration/base_suite/qwen3_5_moe/sft_2npu",
@@ -170,7 +170,7 @@ def test_a5_extends_by_target_image_runner_and_scope(config: CiConfig) -> None:
     candidate = replace(
         config,
         targets={**config.targets, target.name: target},
-        images={**config.images, image.name: image},
+        images={**config.images, image.image_id: image},
         runners=(*config.runners, runner),
         scopes={**config.scopes, pr.name: scope},
     )

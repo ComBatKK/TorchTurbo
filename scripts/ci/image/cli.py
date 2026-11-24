@@ -49,25 +49,24 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    outcome = get_or_build_image(
+    result = get_or_build_image(
         repository_path(args.root),
         args.image,
         use_cache=not args.no_cache,
         builder=args.builder,
         jobs=args.max_jobs,
     )
-    build = outcome.build
-    image = build.image
-    write_json_output(args.output, outcome.to_dict())
+    image = result.image
+    write_json_output(args.output, result.to_dict())
     append_github_output(
         {
             "ref": image.ref,
             "digest": image.digest,
-            "built": str(build.built).lower(),
-            "cache_hit": str(not build.built).lower(),
-            "elapsed_seconds": outcome.elapsed_seconds,
+            "built": str(result.built).lower(),
+            "cache_hit": str(not result.built).lower(),
+            "elapsed_seconds": result.elapsed_seconds,
             "image_id": image.image_id,
-            "content_hash": build.content_hash,
+            "content_hash": result.content_hash,
         },
         args.github_output,
     )
@@ -75,12 +74,12 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
-    outcome = promote_image(repository_path(args.root), args.image)
-    image = outcome.build.image
-    write_json_output(args.output, outcome.to_dict())
+    result = promote_image(repository_path(args.root), args.image)
+    image = result.image
+    write_json_output(args.output, result.to_dict())
     append_github_output(
         {
-            "alias": outcome.alias,
+            "alias": result.alias,
             "ref": image.ref,
             "digest": image.digest,
             "promoted": "true",

@@ -259,14 +259,13 @@ def test_integration_command_comes_from_plan(
         _fake_venv(tmp_path, job),
         spec,
         job,
-        job.tasks[0],
         root=tmp_path,
         output_dir=tmp_path / "result",
     )
     assert command[1] == str(tmp_path / spec.runner_script)
     assert command[command.index("--suite") + 1] == spec.suite
     assert command[command.index("--platform") + 1] == job.runtime.device
-    assert command[command.index("--ngpu") + 1] == str(job.tasks[0].ranks)
+    assert command[command.index("--ngpu") + 1] == str(job.runtime.ranks)
     assert command[command.index("--test_name") + 1] == spec.case_id
     assert command[command.index("--output-dir") + 1] == str(
         tmp_path / "result" / "integration"

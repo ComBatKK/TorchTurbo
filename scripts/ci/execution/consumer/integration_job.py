@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from ...contracts.planner_contract import IntegrationSpec, Job, TestTask
+from ...contracts.planner_contract import IntegrationSpec, Job
 from .runtime.venv_manager import Venv
 
 TRANSIENT_DIRS = ("training", "initial_checkpoint", "tensorboard")
@@ -15,7 +15,6 @@ def command(
     venv: Venv,
     spec: IntegrationSpec,
     job: Job,
-    task: TestTask,
     *,
     root: Path,
     output_dir: Path,
@@ -28,7 +27,7 @@ def command(
         "--platform",
         job.runtime.device,
         "--ngpu",
-        str(task.ranks),
+        str(job.runtime.ranks),
         "--test_name",
         spec.case_id,
         "--skip-install",

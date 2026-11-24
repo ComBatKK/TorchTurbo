@@ -19,7 +19,6 @@ from scripts.ci.execution.producer.cli import main
 from scripts.ci.execution.producer import cli as producer_cli
 from scripts.ci.execution.producer.config import (
     CiConfig,
-    CiImage,
     CiRunner,
     CiTarget,
     ScopeSelection,
@@ -32,6 +31,7 @@ from scripts.ci.execution.producer.planner import (
     requested_images,
 )
 from scripts.ci.execution.producer.matrix import matrix_outputs
+from scripts.ci.image.image_config import RuntimeImage
 from scripts.ci.tools.json_io import write_json
 
 DIGEST = "sha256:" + "b" * 64
@@ -89,7 +89,6 @@ def test_pull_request_scope(
         if job.kind == "integration":
             assert len(job.tasks) == 1
             assert isinstance(job.tasks[0].spec, IntegrationSpec)
-            assert job.tasks[0].ranks == job.runtime.ranks
 
 
 def test_docs_only_scope_has_no_jobs(
@@ -184,7 +183,7 @@ def test_cpu_target_slice_ignores_unbound_other_targets(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
     image = replace(config.images["npu-a3-cann90"], ref="")
-    unbound = replace(config, images={**config.images, image.name: image})
+    unbound = replace(config, images={**config.images, image.image_id: image})
 
     output = planner_output_for(
         unbound,
@@ -234,7 +233,7 @@ def test_missing_container_binding_fails(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
     image = replace(config.images["npu-a3-cann90"], ref="")
-    unbound = replace(config, images={**config.images, image.name: image})
+    unbound = replace(config, images={**config.images, image.image_id: image})
     with pytest.raises(PlanError, match="missing ResolvedImage"):
         build_plan(unbound, facts, "pull_request", source)
 
@@ -243,7 +242,7 @@ def _add_target(
     config: CiConfig,
     *,
     target: CiTarget,
-    image: CiImage,
+    image: RuntimeImage,
     runner: CiRunner,
     test_areas: tuple[str, ...],
 ) -> CiConfig:
@@ -252,13 +251,13 @@ def _add_target(
         pr,
         selections=(
             *pr.selections,
-            ScopeSelection(image=image.name, test_areas=test_areas),
+            ScopeSelection(image=image.image_id, test_areas=test_areas),
         ),
     )
     return replace(
         config,
         targets={**config.targets, target.name: target},
-        images={**config.images, image.name: image},
+        images={**config.images, image.image_id: image},
         runners=(*config.runners, runner),
         scopes={**config.scopes, pr.name: scope},
     )
@@ -268,8 +267,8 @@ def test_a5_extends_target_image_runner_and_scope(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
     target = CiTarget(name="npu-a5", device="npu", hardware="a5")
-    image = CiImage(
-        name="npu-a5-cann90",
+    image = RuntimeImage(
+        image_id="npu-a5-cann90",
         target=target.name,
         kind="container",
         ref=REF,
@@ -329,8 +328,8 @@ def test_gpu_target_routes_to_the_container_matrix(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
     target = CiTarget(name="gpu-h100", device="gpu", hardware="h100")
-    image = CiImage(
-        name="gpu-h100-default",
+    image = RuntimeImage(
+        image_id="gpu-h100-default",
         target=target.name,
         kind="container",
         ref=REF,
@@ -368,12 +367,12 @@ def test_image_override_selects_the_candidate_before_scope(
     target = config.targets["npu-a3"]
     candidate_image = replace(
         config.images["npu-a3-cann90"],
-        name="npu-a3-cann92",
+        image_id="npu-a3-cann92",
         ref=REF,
     )
     candidate = replace(
         config,
-        images={**config.images, candidate_image.name: candidate_image},
+        images={**config.images, candidate_image.image_id: candidate_image},
     )
 
     plan = build_plan(
@@ -381,7 +380,7 @@ def test_image_override_selects_the_candidate_before_scope(
         facts,
         "pull_request",
         source,
-        image_override=candidate_image.name,
+        image_override=candidate_image.image_id,
     )
     unit_jobs = [
         job for job in plan.jobs
@@ -389,13 +388,14 @@ def test_image_override_selects_the_candidate_before_scope(
     ]
     assert unit_jobs
     assert all(
-        job.runtime.image.image_id == candidate_image.name for job in unit_jobs
+        job.runtime.image.image_id == candidate_image.image_id
+        for job in unit_jobs
     )
     _assert_matches(
         plan,
         candidate,
         facts,
-        image_override=candidate_image.name,
+        image_override=candidate_image.image_id,
     )
 
 
@@ -403,8 +403,8 @@ def test_two_images_on_the_same_target_are_separate_jobs(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
     target = config.targets["npu-a3"]
-    alternative = CiImage(
-        name="npu-a3-cann92",
+    alternative = RuntimeImage(
+        image_id="npu-a3-cann92",
         target=target.name,
         kind="container",
         ref=REF,
@@ -414,12 +414,14 @@ def test_two_images_on_the_same_target_are_separate_jobs(
         pr_scope,
         selections=(
             *pr_scope.selections,
-            ScopeSelection(image=alternative.name, test_areas=("pytest/core",)),
+            ScopeSelection(
+                image=alternative.image_id, test_areas=("pytest/core",)
+            ),
         ),
     )
     candidate = replace(
         config,
-        images={**config.images, alternative.name: alternative},
+        images={**config.images, alternative.image_id: alternative},
         scopes={**config.scopes, pr_scope.name: scope},
     )
 

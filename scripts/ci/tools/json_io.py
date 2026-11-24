@@ -60,8 +60,6 @@ def _hints(cls: type) -> dict[str, Any]:
 
 
 def _decode(tp: Any, value: Any, path: str) -> Any:
-    if tp is Any:
-        return value
     if tp is str:
         if not isinstance(value, str):
             _fail(path, "must be a string")
@@ -85,15 +83,14 @@ def _decode(tp: Any, value: Any, path: str) -> Any:
             except (JsonDecodeError, TypeError, ValueError):
                 continue
         _fail(path, "has an invalid value")
-    if origin in (tuple, list):
+    if origin is tuple:
         if not isinstance(value, list):
             _fail(path, "must be a list")
         item_type = args[0] if args else Any
-        decoded = [
+        return tuple(
             _decode(item_type, item, f"{path}[{index}]")
             for index, item in enumerate(value)
-        ]
-        return tuple(decoded) if origin is tuple else decoded
+        )
     if origin is dict:
         if not isinstance(value, dict):
             _fail(path, "must be a mapping")

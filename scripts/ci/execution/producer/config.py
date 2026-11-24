@@ -10,8 +10,8 @@ from typing import Any, Iterable
 import yaml
 
 from ...contracts.base import Diagnostic, DiagnosticError
-from ...contracts.image_contract import ResolvedImage
 from ...contracts.planner_contract import DEVICES, SUITES, VenvSpec
+from ...image.image_config import ImageError, RuntimeImage, load_runtime_images
 
 CONFIG_PATH = Path("scripts/ci/config/ci.yml")
 SCOPES = ("pull_request", "nightly")
@@ -26,22 +26,6 @@ class CiTarget:
     name: str
     device: str
     hardware: str
-
-
-@dataclass(frozen=True)
-class CiImage:
-    name: str
-    target: str
-    kind: str
-    ref: str
-
-    def as_ref(self) -> ResolvedImage:
-        return ResolvedImage(
-            image_id=self.name,
-            target=self.target,
-            kind=self.kind,
-            ref=self.ref,
-        )
 
 
 @dataclass(frozen=True)
@@ -121,7 +105,7 @@ class Scope:
 class CiConfig:
     root: Path
     targets: dict[str, CiTarget]
-    images: dict[str, CiImage]
+    images: dict[str, RuntimeImage]
     venvs: dict[str, VenvSpec]
     runners: tuple[CiRunner, ...]
     pytest_areas: PytestAreas
@@ -133,12 +117,6 @@ class CiConfig:
         if target is None:
             raise CiConfigError([_issue(name, f"unknown target {name!r}")])
         return target
-
-    def image_for(self, name: str) -> CiImage:
-        image = self.images.get(name)
-        if image is None:
-            raise CiConfigError([_issue(name, f"unknown image {name!r}")])
-        return image
 
     def runner_for(self, target: str, ranks: int) -> CiRunner:
         candidates = [
@@ -286,48 +264,23 @@ def _load_targets(raw: Any, issues: list[Diagnostic]) -> dict[str, CiTarget]:
     return targets
 
 
-def _load_images(
-    raw: Any,
-    targets: dict[str, CiTarget],
-    issues: list[Diagnostic],
-) -> dict[str, CiImage]:
-    images: dict[str, CiImage] = {}
-    for name, value in _map(raw, "resources.images", issues).items():
-        path = f"resources.images.{name}"
-        row = _row(value, path, {"target", "kind", "ref", "build", "publish"}, issues)
-        target = str(row.get("target") or "")
-        kind = str(row.get("kind") or "")
-        ref = str(row.get("ref") or "")
-        if target not in targets:
-            issues.append(_issue(f"{path}.target", "unknown target"))
-        if kind not in {"host", "container"}:
-            issues.append(_issue(f"{path}.kind", "must be host or container"))
-        if kind == "container" and row.get("ref"):
-            issues.append(_issue(f"{path}.ref", "container ref belongs to the image domain"))
-        if kind == "host" and not ref:
-            issues.append(_issue(f"{path}.ref", "image ref is required"))
-        images[name] = CiImage(name, target, kind, ref)
-    return images
-
-
 def bind_image_refs(config: CiConfig, refs: dict[str, str]) -> CiConfig:
     """Return a config with runtime image refs replaced by pinned values."""
     if not refs:
         return config
-    issues: list[Diagnostic] = []
-    images: dict[str, CiImage] = {}
+    issues = [
+        _issue(f"resources.images.{name}", "no image definition")
+        for name in sorted(set(refs) - set(config.images))
+    ]
+    images: dict[str, RuntimeImage] = {}
     for name, image in config.images.items():
-        ref = str(refs.get(name) or image.ref)
-        if image.kind == "container" and ref:
-            _, separator, digest = ref.rpartition("@")
-            if not separator or not digest.startswith("sha256:"):
-                issues.append(_issue(
-                    f"resources.images.{name}.ref",
-                    "must be digest-pinned",
-                ))
+        ref = refs.get(name) or image.ref
+        digest = ref.rpartition("@")[2]
+        if image.kind == "container" and not digest.startswith("sha256:"):
+            issues.append(_issue(
+                f"resources.images.{name}.ref", "must be digest-pinned"
+            ))
         images[name] = replace(image, ref=ref)
-    for name in sorted(set(refs) - set(images)):
-        issues.append(_issue(f"resources.images.{name}", "no image definition"))
     if issues:
         raise CiConfigError(issues)
     return replace(config, images=images)
@@ -580,7 +533,7 @@ def _test_areas(
 
 def _load_scopes(
     raw: Any,
-    images: dict[str, CiImage],
+    images: dict[str, RuntimeImage],
     suites: set[str],
     issues: list[Diagnostic],
 ) -> dict[str, Scope]:
@@ -635,7 +588,11 @@ def load_config(root: Path) -> CiConfig:
         issues,
     )
     targets = _load_targets(resources.get("targets"), issues)
-    images = _load_images(resources.get("images"), targets, issues)
+    try:
+        images = load_runtime_images(root)
+    except ImageError as exc:
+        issues.append(_issue("resources.images", str(exc)))
+        images = {}
     venvs = _load_venvs(resources.get("venvs"), root, issues)
     runners = _load_runners(resources.get("runners"), targets, issues)
     test_areas = _row(

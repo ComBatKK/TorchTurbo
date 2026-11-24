@@ -157,9 +157,9 @@ def test_existing_content_image_does_not_build(
     monkeypatch.setattr(image_build, "build_image", fail_build)
     result = get_or_build_image(repo_root, "npu-a3-cann90")
 
-    assert result.build.built is False
-    assert result.build.image.digest == DIGEST
-    assert result.build.content_hash == plan.content_hash
+    assert result.built is False
+    assert result.image.digest == DIGEST
+    assert result.content_hash == plan.content_hash
 
 
 def test_missing_content_image_is_built_and_verified(
@@ -177,10 +177,9 @@ def test_missing_content_image_is_built_and_verified(
     monkeypatch.setattr(image_build, "build_image", build)
     result = get_or_build_image(repo_root, "npu-a3-cann90")
 
-    assert result.build.built is True
-    assert result.build.image.digest == BUILT_DIGEST
+    assert result.built is True
+    assert result.image.digest == BUILT_DIGEST
     assert result.elapsed_seconds == 7
-    assert result.build.git_commit_sha
 
 
 def test_promote_requires_the_tested_content_image(
@@ -195,7 +194,6 @@ def test_promote_requires_the_tested_content_image(
 
     result = image_build.promote_image(repo_root, "npu-a3-cann90")
 
-    assert result.promoted is True
     assert result.alias == plan.spec.alias
     assert registry.alias_updates == [(plan.spec.alias, BUILT_DIGEST)]
-    assert result.build.image.ref == f"{plan.spec.repository}@{BUILT_DIGEST}"
+    assert result.image.ref == f"{plan.spec.repository}@{BUILT_DIGEST}"

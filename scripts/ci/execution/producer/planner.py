@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ...contracts.base import Diagnostic, DiagnosticError, GitSource, SCHEMA_VERSION
+from ...contracts.image_contract import ResolvedImage
 from ...contracts.planner_contract import (
     CHANGE_MODES,
     SUITES,
@@ -22,10 +23,10 @@ from ...contracts.planner_contract import (
     TestTask,
     plan_digest,
 )
+from ...image.image_config import RuntimeImage
 from .config import (
     CiConfig,
     CiConfigError,
-    CiImage,
     CiRunner,
     CiTarget,
     Scope,
@@ -41,7 +42,7 @@ class PlanError(DiagnosticError):
 @dataclass(frozen=True)
 class ImageSelection:
     index: int
-    image: CiImage
+    image: RuntimeImage
     test_areas: tuple[str, ...] | None
 
 
@@ -50,7 +51,7 @@ class _PytestGroup:
     suite: str
     device: str
     target: CiTarget
-    image: CiImage
+    image: RuntimeImage
     venv_name: str
     entries: list[PytestFact] = field(default_factory=list)
     paths: set[str] = field(default_factory=set)
@@ -101,7 +102,7 @@ def _selections(
             return ()
     values: list[ImageSelection] = []
     for index, selection in enumerate(scope.selections):
-        configured = config.image_for(selection.image)
+        configured = config.images[selection.image]
         if override is not None:
             if configured.target != override.target:
                 continue
@@ -140,7 +141,7 @@ def _runtime(
     device: str,
     target: str,
     ranks: int,
-    image: CiImage,
+    image: RuntimeImage,
     venv_name: str,
     runner: CiRunner,
 ) -> Runtime:
@@ -149,7 +150,12 @@ def _runtime(
         target=target,
         ranks=ranks,
         runner=runner.name,
-        image=image.as_ref(),
+        image=ResolvedImage(
+            image_id=image.image_id,
+            target=image.target,
+            kind=image.kind,
+            ref=image.ref,
+        ),
         venv=config.venvs[venv_name],
     )
 
@@ -195,7 +201,7 @@ def _pytest_jobs(
                 fact.suite,
                 target.device,
                 target.name,
-                selection.image.name,
+                selection.image.image_id,
                 venv_name,
             )
             group = groups.setdefault(
@@ -237,7 +243,7 @@ def _pytest_jobs(
         job_id = _claim_job_id(
             slugify(
                 f"pytest-{group.suite}-{group.device}-"
-                f"{group.image.name}-{group.venv_name}"
+                f"{group.image.image_id}-{group.venv_name}"
             ),
             job_ids,
             runner.name,
@@ -255,10 +261,6 @@ def _pytest_jobs(
                     suite=group.suite,
                     test_files=tuple(sorted({entry.path for entry in entries})),
                     device_marker=marker,
-                ),
-                kind="pytest",
-                ranks=max(
-                    entry.ranks_by_device.get(group.device, 1) for entry in entries
                 ),
             )
             for (process_group, marker), entries in sorted(tasks_by_key.items())
@@ -345,7 +347,7 @@ def _integration_jobs(
             except CiConfigError as exc:
                 issues.extend(exc.issues)
                 continue
-            key = (case.suite, case.case_id, target.name, selection.image.name)
+            key = (case.suite, case.case_id, target.name, selection.image.image_id)
             if key in seen:
                 continue
             seen.add(key)
@@ -373,7 +375,7 @@ def _integration_jobs(
             job_id = _claim_job_id(
                 slugify(f"integration-{case.suite}-{case.case_id}"),
                 job_ids,
-                f"{target.name}-{selection.image.name}-{runner.name}",
+                f"{target.name}-{selection.image.image_id}-{runner.name}",
             )
             jobs.append(Job(
                 id=job_id,
@@ -400,8 +402,6 @@ def _integration_jobs(
                         config_sha256=case.config_sha256,
                         golden_sha256=case.golden_sha256,
                     ),
-                    kind="integration",
-                    ranks=case.ranks,
                 ),),
             ))
     return jobs
@@ -442,7 +442,7 @@ def build_plan(
     for selection in selections:
         if not selection.image.ref:
             issues.append(_issue(
-                f"resources.images.{selection.image.name}.ref",
+                f"resources.images.{selection.image.image_id}.ref",
                 "missing ResolvedImage for container image",
                 "missing-resolved-image",
             ))
@@ -515,7 +515,7 @@ def requested_images(
     if issues:
         raise PlanError(issues)
     return tuple(sorted({
-        selection.image.name
+        selection.image.image_id
         for selection in selections
         if selection.image.kind == "container"
     }))

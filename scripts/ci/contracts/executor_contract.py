@@ -57,52 +57,23 @@ def _fail(path: str, message: str) -> None:
     raise ContractError(f"{path} {message}")
 
 
-def _validate_evidence(evidence: TaskEvidence) -> None:
-    values = (
-        ("tests_total", evidence.tests_total),
-        ("tests_failed", evidence.tests_failed),
-        ("tests_errors", evidence.tests_errors),
-        ("tests_skipped", evidence.tests_skipped),
-    )
-    for name, value in values:
-        if value < 0:
-            _fail(f"task_result.evidence.{name}", "must be >= 0")
-
-
 def _validate_failure(failure: Failure, path: str) -> None:
-    if not failure.code.strip():
-        _fail(f"{path}.code", "must not be empty")
-    if not failure.message.strip():
-        _fail(f"{path}.message", "must not be empty")
-
-
-def _validate_artifact_paths(paths: dict[str, str]) -> None:
-    for name, path in paths.items():
-        if not name:
-            _fail("job_result.artifact_paths", "must not contain empty keys")
-        if not isinstance(path, str) or not path:
-            _fail(
-                f"job_result.artifact_paths.{name}",
-                "must be a non-empty string",
-            )
-
-
-def _validate_skip(result: JobResult) -> None:
-    if result.status == "skipped":
-        if result.skip_reason is None:
-            _fail("job_result", "status=skipped requires skip.reason")
-        if result.tasks:
-            _fail("job_result", "skipped jobs must not contain task results")
-    elif result.skip_reason is not None or result.skip_message is not None:
-        _fail("job_result", "skip fields are only valid for skipped status")
+    for name, value in (("code", failure.code), ("message", failure.message)):
+        if not value.strip():
+            _fail(f"{path}.{name}", "must not be empty")
 
 
 def _validate_task(kind: str, task: TaskResult) -> None:
     path = f"job_result.tasks.{task.id}"
     if task.status not in TASK_STATUSES:
         _fail(f"{path}.status", f"has unknown status {task.status!r}")
-    if task.evidence is not None:
-        _validate_evidence(task.evidence)
+    if task.evidence is not None and any(value < 0 for value in (
+        task.evidence.tests_total,
+        task.evidence.tests_failed,
+        task.evidence.tests_errors,
+        task.evidence.tests_skipped,
+    )):
+        _fail(f"{path}.evidence", "must be >= 0")
     if task.failure is not None:
         _validate_failure(task.failure, f"{path}.failure")
     if task.status == "passed":
@@ -121,20 +92,29 @@ def _validate_job_result(result: JobResult) -> None:
         _fail("job_result.kind", f"has unknown kind {result.kind!r}")
     if result.status not in JOB_STATUSES:
         _fail("job_result.status", f"has unknown status {result.status!r}")
-    if result.duration_seconds < 0:
-        _fail("job_result.duration_seconds", "must be >= 0")
-    _validate_skip(result)
-    _validate_artifact_paths(result.artifact_paths)
+    if result.status == "skipped":
+        if result.skip_reason is None:
+            _fail("job_result", "status=skipped requires skip.reason")
+        if result.tasks:
+            _fail("job_result", "skipped jobs must not contain task results")
+    elif result.skip_reason is not None or result.skip_message is not None:
+        _fail("job_result", "skip fields are only valid for skipped status")
+    for name, path in result.artifact_paths.items():
+        if not name or not isinstance(path, str) or not path:
+            _fail("job_result.artifact_paths", "must be a non-empty string")
+
     if result.status in {"passed", "skipped"} and result.failure is not None:
         _fail("job_result.failure", "must be empty for passed or skipped jobs")
     if result.failure is not None:
         _validate_failure(result.failure, "job_result.failure")
     for task in result.tasks:
         _validate_task(result.kind, task)
+    has_failure = result.failure is not None or any(
+        task.failure is not None for task in result.tasks
+    )
     if (
         result.status in {"failed", "cancelled", "infra_error"}
-        and result.failure is None
-        and not any(task.failure is not None for task in result.tasks)
+        and not has_failure
     ):
         _fail("job_result", "non-passed jobs require failure detail")
 

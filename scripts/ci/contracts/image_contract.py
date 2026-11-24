@@ -57,19 +57,15 @@ class ResolvedImage(Contract):
 class ImageBuildResult(Contract):
     """Facts produced by building or reusing a container image."""
 
-    image: ResolvedImage    # Immutable image produced by the build.
-    git_commit_sha: str    # Git commit used as the build source.
-    content_hash: str      # Full sha256 of Dockerfile, platform, and revision.
-    platform: str          # Build platform, for example linux/arm64.
-    built: bool            # True when the image was built; False when reused.
+    image: ResolvedImage  # Immutable image produced by the build.
+    content_hash: str  # Full sha256 of Dockerfile, platform, and revision.
+    built: bool  # True when the image was built; False when reused.
+    elapsed_seconds: int = 0  # Time spent in the actual build.
+    alias: str = ""  # Stable alias touched by promotion.
 
     def __post_init__(self) -> None:
-        if not isinstance(self.image, ResolvedImage):
-            raise ContractError("image must be a ResolvedImage")
         if self.image.kind != "container":
             raise ContractError("ImageBuildResult requires a container image")
-        _require_non_empty_text(self.git_commit_sha, "git_commit_sha")
         _require_sha256_digest(self.content_hash, "content_hash")
-        _require_non_empty_text(self.platform, "platform")
         if not isinstance(self.built, bool):
             raise ContractError("built must be a boolean")
