@@ -6,7 +6,6 @@
   #
   # Modified by the TorchTurbo contributors.
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,6 +47,7 @@ class GroupedMLP(torch.nn.Module):
     ):
         super().__init__()
         self.config = config
+        self._execution_backend = None
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
         limit_list = getattr(config, "moe_swiglu_limit", None)
@@ -189,15 +189,14 @@ class GroupedMLP(torch.nn.Module):
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
+        tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
-        *,
-        routed_forward: Callable | None = None,
-        expert_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Read expert parameters inside the module call so FSDP can unshard them."""
-        if routed_forward is not None:
-            return routed_forward(self, permuted_local_hidden_states, expert_indices, permuted_probs), None
+        """Apply routing probabilities inside each expert before its second linear."""
+        if self._execution_backend is not None:
+            return self._execution_backend.execute(
+                self, permuted_local_hidden_states, tokens_per_expert, permuted_probs,
+            ), None
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1

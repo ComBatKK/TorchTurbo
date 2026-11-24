@@ -4,7 +4,7 @@ import functools
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType, MethodType
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -53,12 +53,16 @@ from ...config import EngineConfig
 from ...distributed import assert_finite, init_process_group_if_needed
 from ..base import BaseBackend
 from .checkpoint import FSDP2CheckpointManager
+from .checkpoint_input import checkpoint_with_cpu_input, checkpoint_with_large_input_offload
 from .config import CPUOffloadMode, FSDPConfig
 from .optimizers.adamw import prepare_fsdp_adamw_optimizer
 from .optimizers.memory import OptimizerMemoryController
 from .prefetch import FSDPPrefetchManager
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from .optimizers.engram import EngramOptimizer
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import (
@@ -83,6 +87,7 @@ class _FSDPUnit:
     modules: list[nn.Module]
     mesh: Any
     reshard_after_forward: bool | None = None
+    cast_forward_inputs: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +132,8 @@ class FSDP2Backend(BaseBackend):
     """
 
     name = "fsdp2"
+    engram_optimizer: "EngramOptimizer | None" = None
+    _engram_tables: tuple = ()
 
     def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         super().__init__(config, device_runtime)
@@ -170,6 +177,8 @@ class FSDP2Backend(BaseBackend):
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
         self._resolved_parallel_plan: _ResolvedFSDPPlan | None = None
+        self.engram_optimizer = None
+        self._engram_tables = ()
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -325,10 +334,8 @@ class FSDP2Backend(BaseBackend):
         nn.Module
             The model with replaced modules.
         """
-        from torchturbo.models.modules.moe.moe_layer import MoESubmodules
-
         config = model.config
-        megakernel_cache = {}
+
         if plan.plan and isinstance(plan.plan, dict):
             for fqn, submodule in list(model.named_modules()):
                 if fqn == "":
@@ -336,10 +343,8 @@ class FSDP2Backend(BaseBackend):
 
                 spec = plan.match(fqn)
                 if isinstance(spec, FSDPPlanSpec) and spec.replace_module:
-                    kwargs = dict(spec.module_kwargs)
-                    submodules = kwargs.get("moe_submodules")
-                    if isinstance(submodules, MoESubmodules) and self.config.moe.mega_moe.enable:
-                        kwargs["moe_submodules"] = replace(submodules, megakernel_cache=megakernel_cache)
+                    kwargs = spec.module_kwargs
+
                     kwargs["hf_config"] = config
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
@@ -430,7 +435,7 @@ class FSDP2Backend(BaseBackend):
 
         world_group = dist.group.WORLD
         for param in no_shard_params:
-            if not param.requires_grad:
+            if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                 continue
 
             def _grad_hook(p):
@@ -445,9 +450,6 @@ class FSDP2Backend(BaseBackend):
         parallel_plan: Any = None,
         peft_config: Any = None,
     ) -> nn.Module:
-        if self.config.moe.mega_moe.enable and peft_config is not None:
-            raise AssertionError("MegaMoE does not support PEFT/LoRA training.")
-
         if parallel_plan is None:
             plan = FSDPParallelPlan()
         elif not isinstance(parallel_plan, FSDPParallelPlan):
@@ -464,6 +466,12 @@ class FSDP2Backend(BaseBackend):
 
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
+        from torchturbo.models.deepseek_v41.host_offload_embedding import TorchHostOffloadEmbedding
+
+        self._engram_tables = tuple(
+            module for module in model.modules()
+            if isinstance(module, TorchHostOffloadEmbedding)
+        )
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:
@@ -471,6 +479,11 @@ class FSDP2Backend(BaseBackend):
 
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
+
+        if self.config.mega_moe:
+            from ....optimizations.mega_moe.integration import install
+
+            install(model, self.config, self.get_ep_info()["ep_group"])
 
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
@@ -539,6 +552,7 @@ class FSDP2Backend(BaseBackend):
             parallel_context=self.get_parallel_context(),
             device_runtime=self.device_runtime,
             cpu_offload=offload.enabled and offload.mode is CPUOffloadMode.FULL,
+            get_engram_optimizer=lambda: self.engram_optimizer,
             # The manager is created before prepare_optimizer().
             require_optimizer_not_suspended=(
                 lambda: self._optimizer_memory.require_not_suspended()
@@ -663,6 +677,10 @@ class FSDP2Backend(BaseBackend):
             if unit.reshard_after_forward is not None:
                 target_fsdp_kwargs["reshard_after_forward"] = (
                     unit.reshard_after_forward
+                )
+            if unit.cast_forward_inputs is not None and mp_policy is not None:
+                target_fsdp_kwargs["mp_policy"] = replace(
+                    mp_policy, cast_forward_inputs=unit.cast_forward_inputs,
                 )
             if mp_policy is not None and any(
                 module in expert_modules for module in unit.modules
@@ -836,12 +854,13 @@ class FSDP2Backend(BaseBackend):
     def _apply_activation_checkpointing(
         self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> nn.Module:
-        from collections.abc import Callable
-        from contextlib import AbstractContextManager, ExitStack, contextmanager
+        from contextlib import ExitStack, contextmanager, nullcontext
 
         from torch.utils.checkpoint import checkpoint
 
-        from .activation_checkpointing import fsdp_recompute_context, parameter_version
+        from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
+
+        from .activation_checkpointing import fsdp_recompute_context, restore_moe_runtime_inputs
 
         target_modules: list[tuple[str, nn.Module]] = []
         for fqn, submodule in model.named_modules():
@@ -879,35 +898,35 @@ class FSDP2Backend(BaseBackend):
         def recompute_context(
             module: nn.Module,
             use_reentrant: bool,
+            moe_runtime_inputs: tuple[tuple[BaseMoELayer, MoERuntimeInputs], ...],
         ) -> Iterator[None]:
-            # Restore the FSDP lifecycle before entering module-owned contexts.
-            # The prefetch manager controls its policy during recomputation.
+            # The recompute context is active only in backward. Expert containers
+            # can be nested FSDP units under the checkpointed layer, and their
+            # PRE_BACKWARD hook may not have fired yet when recompute calls
+            # experts.forward(). Without this guard, expert forward-prefetch
+            # edges can leak into backward.
             with ExitStack() as stack:
+                stack.enter_context(restore_moe_runtime_inputs(moe_runtime_inputs))
                 stack.enter_context(
-                    self.prefetch_manager.recompute_context(model)
+                    self.prefetch_manager.suspend_expert_forward_prefetch(model)
                 )
                 stack.enter_context(fsdp_recompute_context(module, use_reentrant))
                 yield
 
         def make_checkpointed_forward(module: nn.Module):
             original_forward = module.forward
-            use_reentrant = self.config.activation_checkpointing.use_reentrant
-            captures = tuple(
-                prepare(module, use_reentrant, parameter_version)
-                for child in module.modules()
-                if (prepare := getattr(child, "prepare_checkpoint_context", None)) is not None
+            moe_modules = tuple(
+                child for child in module.modules() if isinstance(child, BaseMoELayer)
             )
 
-            @contextmanager
-            def execution_context(
-                contexts: tuple[Callable[[bool], AbstractContextManager[None]], ...], replay: bool,
-            ) -> Iterator[None]:
-                with ExitStack() as stack:
-                    if replay:
-                        stack.enter_context(recompute_context(module, use_reentrant))
-                    for context in contexts:
-                        stack.enter_context(context(replay))
-                    yield
+            use_reentrant = self.config.activation_checkpointing.use_reentrant
+            checkpoint_fn = (
+                checkpoint_with_large_input_offload
+                if self.config.activation_checkpointing.offload_large_inputs_to_cpu
+                else checkpoint_with_cpu_input
+                if self.config.activation_checkpointing.offload_input_to_cpu
+                else checkpoint
+            )
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -928,13 +947,18 @@ class FSDP2Backend(BaseBackend):
                     checkpoint_kwargs["use_cache"] = False
 
                 base_fn = functools.partial(original_forward, **checkpoint_kwargs)
-                contexts = tuple(capture() for capture in captures)
+                moe_runtime_inputs = tuple((moe, moe._runtime_inputs) for moe in moe_modules)
 
                 def checkpoint_context_fn():
-                    return execution_context(contexts, False), execution_context(contexts, True)
+                    # Replaying the forward must not count its router assignments again.
+                    replay_inputs = tuple(
+                        (moe, replace(inputs, accumulate_tokens_per_expert=False))
+                        for moe, inputs in moe_runtime_inputs
+                    )
+                    return nullcontext(), recompute_context(module, False, replay_inputs)
 
                 if not use_reentrant:
-                    return checkpoint(
+                    return checkpoint_fn(
                         base_fn,
                         *args,
                         use_reentrant=False,
@@ -942,8 +966,10 @@ class FSDP2Backend(BaseBackend):
                     )
 
                 def run_fn(*a, **kw):
-                    with execution_context(contexts, torch.is_grad_enabled()):
-                        return base_fn(*a, **kw)
+                    if torch.is_grad_enabled():
+                        with recompute_context(module, True, moe_runtime_inputs):
+                            return base_fn(*a, **kw)
+                    return base_fn(*a, **kw)
 
                 if torch.is_grad_enabled() and not any(
                     isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
@@ -972,12 +998,12 @@ class FSDP2Backend(BaseBackend):
                             # skips every trainable parameter (disabled LoRA).
                             return (*outputs, _grad_anchor, is_tuple)
 
-                        *outputs, _, is_tuple = checkpoint(
+                        *outputs, _, is_tuple = checkpoint_fn(
                             run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
                         )
                         return tuple(outputs) if is_tuple else outputs[0]
 
-                return checkpoint(
+                return checkpoint_fn(
                     run_fn,
                     *args,
                     use_reentrant=True,
@@ -1235,6 +1261,7 @@ class FSDP2Backend(BaseBackend):
             modules: nn.Module | list[nn.Module],
             mesh: Any,
             reshard_after_forward: bool | None = None,
+            cast_forward_inputs: bool | None = None,
         ) -> None:
             modules = modules if isinstance(modules, list) else [modules]
             unit_ids = {id(module) for module in modules}
@@ -1245,6 +1272,7 @@ class FSDP2Backend(BaseBackend):
                     modules=modules,
                     mesh=mesh,
                     reshard_after_forward=reshard_after_forward,
+                    cast_forward_inputs=cast_forward_inputs,
                 )
             )
             wrapped_modules.update(unit_ids)
@@ -1280,7 +1308,7 @@ class FSDP2Backend(BaseBackend):
             explicit_subtree_modules.update(
                 id(child) for child in submodule.modules()
             )
-            _add_unit(submodule, target_mesh)
+            _add_unit(submodule, target_mesh, cast_forward_inputs=spec.cast_forward_inputs)
 
         # Default policy: each ModuleList child is a world-mesh FSDP unit.
         # Iterate reversed: named_modules() is a pre-order DFS (ancestors before
@@ -1300,7 +1328,10 @@ class FSDP2Backend(BaseBackend):
                 # split ModuleList children inside that explicitly wrapped subtree.
                 if id(child) in explicit_subtree_modules:
                     continue
-                _add_unit(child, self._world_mesh)
+                child_spec = plan.modules.get(f"{fqn}.{idx}")
+                _add_unit(child, self._world_mesh, cast_forward_inputs=(
+                    child_spec.cast_forward_inputs if isinstance(child_spec, FSDPPlanSpec) else None
+                ))
 
         units = self._optimize_fsdp_units(model, units)
         self._apply_fsdp(model=model, units=units, fsdp_kwargs=fsdp_kwargs)
@@ -1400,6 +1431,14 @@ class FSDP2Backend(BaseBackend):
         if not isinstance(plan, OptimizerPlan):
             raise TypeError("plan must be an OptimizerPlan")
 
+        self._engram_tables = tuple(table for table in self._engram_tables if table.weight.requires_grad)
+        if self._engram_tables:
+            if not isinstance(plan, OptimizerClassPlan) or plan.optimizer_cls is not torch.optim.AdamW:
+                raise ValueError("Engram training requires dense AdamW.")
+            offload = self.fsdp_config.cpu_offload
+            if offload.enabled and offload.mode is CPUOffloadMode.FULL:
+                raise ValueError("Engram training does not support full CPU offload.")
+
         if isinstance(plan, OptimizerClassPlan):
             groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
             expected_names = (plan.optimizer_name,)
@@ -1475,6 +1514,16 @@ class FSDP2Backend(BaseBackend):
             self.device_runtime,
             qk_clip_controller,
         )
+        if self._engram_tables:
+            from .optimizers.engram import EngramOptimizer
+
+            self.engram_optimizer = EngramOptimizer(
+                self._engram_tables, self._mesh["edp"].get_group(), self.device_runtime.device,
+            )
+            optimizer.register_step_pre_hook(
+                lambda _optimizer, _args, _kwargs: self.engram_optimizer.prepare_gradients()
+            )
+            optimizer.register_step_post_hook(self.engram_optimizer.after_step)
         return optimizer
 
     def offload_optimizer(self) -> None:
@@ -1504,7 +1553,7 @@ class FSDP2Backend(BaseBackend):
                 "ignored": [],
             }
             for param in param_group["params"]:
-                if not param.requires_grad:
+                if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                     continue
                 if isinstance(param, DTensor):
                     if param.device_mesh == edp:
@@ -1630,6 +1679,11 @@ class FSDP2Backend(BaseBackend):
 
     @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        engram = self.engram_optimizer
+        if engram is not None:
+            if norm_type != 2.0:
+                raise ValueError("Engram training supports global L2 gradient clipping.")
+            engram.prepare_gradients()
         offload = self.fsdp_config.cpu_offload
         params = []
         grads = []
@@ -1672,6 +1726,8 @@ class FSDP2Backend(BaseBackend):
             edp_total_norm_list.append(edp_total_norm)
 
         all_norms = edp_total_norm_list
+        if engram is not None:
+            all_norms.append(engram.norm().to(self.device).unsqueeze(0))
         if grads:
             dp_total_norm = get_total_norm(grads, norm_type=norm_type)
             dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
@@ -1706,6 +1762,9 @@ class FSDP2Backend(BaseBackend):
             clip_grads_with_norm_(params, max_norm, total_norm)
         if ignored_params:
             clip_grads_with_norm_(ignored_params, max_norm, total_norm)
+
+        if engram is not None:
+            engram.scale(float((max_norm / (total_norm + 1e-6)).clamp(max=1)))
 
         return total_norm
 
