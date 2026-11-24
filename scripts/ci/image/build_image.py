@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from ..contracts.image_contract import ImageBuildResult, ResolvedImage
-from ..tools.hashing import content_digest
+from ..tools.json_io import content_digest
 from .image_config import ImageError, ImageSpec, load_image
 from .registry import Manifest, Registry, RegistryError, verify_manifest
 

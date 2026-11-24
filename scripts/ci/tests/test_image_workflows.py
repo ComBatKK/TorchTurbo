@@ -69,7 +69,7 @@ def test_normal_pr_workflow_plans_runtime_images(repo_root: Path) -> None:
     assert "resolve runtime images" not in step_names
 
     classify = _step(jobs["plan"], "changes")
-    assert "scripts.ci.tools.change_kind" in classify["run"]
+    assert "scripts.ci.tools.changed_files" in classify["run"]
     assert "--diff-filter=AM" in classify["run"]
     assert "change_mode=$kind" in classify["run"]
     assert "delegated" not in classify["run"]
@@ -101,7 +101,7 @@ def test_image_pr_separates_change_kind_image_selection_and_cpu_preflight(
     select = _step(jobs["plan"], "images")
     cpu = _step(jobs["plan"], "cpu")
     assert "--diff-filter=AM" in classify["run"]
-    assert "scripts.ci.tools.change_kind" in classify["run"]
+    assert "scripts.ci.tools.changed_files" in classify["run"]
     assert "scripts.ci.image.cli plan" in select["run"]
     assert "effective_kind=no_image" in select["run"]
     assert "case \"$KIND\" in" in select["run"]

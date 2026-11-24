@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R7a 后当前生产代码：5626 行
+- R8a 后当前生产代码：5585 行
 - 目标生产代码：不超过 4500 行
-- R7a 后剩余需要减少：约 1126 行，约 20%
+- R8a 后剩余需要减少：约 1085 行，约 19%
 
 统计命令：
 
@@ -109,7 +109,7 @@ tools            lint、路径规则、JSON、CLI 小工具
 |---|---:|---:|---:|
 | `execution/producer/config.py` | 619 | 560 | -59 |
 | `execution/producer/planner.py` | 592 | 580 | -12 |
-| `tools/lint.py` | 590 | 480 | -110 |
+| `tools/lint.py` | 568 | 568 | 0 |
 | `execution/consumer/executor.py` | 495 | 495 | 0 |
 | `execution/producer/facts.py` | 445 | 440 | -5 |
 | `execution/consumer/runtime/model_dataset.py` | 328 | 320 | -8 |
@@ -123,19 +123,17 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `contracts/executor_contract.py` | 149 | 100 | -49 |
 | `image/registry.py` | 111 | 111 | 0 |
 | `image/cli.py` | 121 | 121 | 0 |
-| `tools/json_io.py` | 129 | 60 | -69 |
+| `tools/json_io.py` | 134 | 134 | 0 |
 | `execution/consumer/process.py` | 159 | 159 | 0 |
 | `contracts/image_contract.py` | 69 | 69 | 0 |
 | `image/select_images.py` | 54 | 54 | 0 |
 | `execution/producer/matrix.py` | 67 | 30 | -37 |
 | `execution/finalization/timing.py` | 65 | 40 | -25 |
 | `execution/consumer/pytest_job.py` | 65 | 55 | -10 |
-| `tools/change_kind.py` | 62 | 45 | -17 |
+| `tools/changed_files.py` | 86 | 86 | 0 |
 | `execution/consumer/integration_job.py` | 52 | 45 | -7 |
 | `contracts/base.py` | 41 | 30 | -11 |
-| `tools/cli.py` | 40 | 35 | -5 |
-| `tools/repo_paths.py` | 37 | 25 | -12 |
-| `tools/hashing.py` | 13 | 13 | 0 |
+| `tools/cli.py` | 40 | 40 | 0 |
 | 其他 `__init__.py` | 16 | 20 | +4 |
 
 分类预算：
@@ -431,15 +429,21 @@ R7b 待做：
 
 ### R8. Tools 与 lint 收敛
 
-目标：`tools` 从 752 行降到约 600 行。
+状态：R8a 安全收敛完成；R8b 待做。
 
-措施：
+R8a 结果：`tools` 868 -> 828（-40），文件数 6 -> 4。
 
-- `lint.py` 合并：
-  `check_contract()`、`check_config()`、`check_markers()` 的公共错误收集。
-- 工具安装逻辑只保留 CI 必需工具。
-- 删除重复的 YAML 读取和 workflow run 文本扫描。
-- `change_kind` 只保留 docs/code/image/mixed 四类判断。
+R8a 措施：
+
+- `hashing.py` 合并到 `json_io.py`。
+- `repo_paths.py` 合并到 `changed_files.py`。
+- workflow 命令改为 `scripts.ci.tools.changed_files`。
+- `lint.py` 合并三个工具安装器，压缩 helper、marker 和报告逻辑；
+  7 个检查全部保留。
+
+R8b 待做：
+
+- 600 行目标需要外部化工具安装或删除 lint 检查，不属于安全收敛。
 
 ### R9. CLI 统一
 
@@ -498,8 +502,8 @@ git diff --check
 
 ### Phase 5：Image + Tools
 
-- 状态：R7a 已完成；R7b、R8、R9 待做。
-- 目标：5626 -> 不超过 4500。
+- 状态：R7a、R8a 已完成；R7b、R8b、R9 待做。
+- 目标：5585 -> 不超过 4500。
 - 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。
 

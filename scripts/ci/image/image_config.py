@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from ..tools.repo_paths import is_dockerfile_path, normalize_repo_path
+from ..tools.changed_files import is_dockerfile_path, normalize_repo_path
 
 CI_CONFIG_PATH = Path("scripts/ci/config/ci.yml")
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")

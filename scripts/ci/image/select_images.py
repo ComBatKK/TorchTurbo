@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from ..tools.repo_paths import is_dockerfile_path, normalize_repo_path
+from ..tools.changed_files import is_dockerfile_path, normalize_repo_path
 from .image_config import ImageError, ImageSpec, load_specs
 
 

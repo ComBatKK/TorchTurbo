@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.ci.tools.repo_paths import (
+from scripts.ci.tools.changed_files import (
     is_dockerfile_path,
     is_docs_path,
     normalize_repo_path,

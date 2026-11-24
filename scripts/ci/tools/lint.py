@@ -75,41 +75,37 @@ def run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
 
 def _arch() -> str:
     machine = platform.machine().lower()
-    if machine in ("aarch64", "arm64"):
-        return "arm64"
-    if machine in ("x86_64", "amd64"):
-        return "amd64"
-    raise RuntimeError(f"unsupported architecture: {machine}")
+    arch = ARCHES.get(machine)
+    if arch is None:
+        raise RuntimeError(f"unsupported architecture: {machine}")
+    return arch
 
 
 
 PROBE = {"actionlint": "-version", "hadolint": "--version", "shellcheck": "--version"}
+ARCHES = {"aarch64": "arm64", "arm64": "arm64",
+          "x86_64": "amd64", "amd64": "amd64"}
 SOURCE_ENTRYPOINTS = {"push", "pull_request", "pull_request_target", "merge_group", "schedule"}
 
 
 def _tool_path(name: str, version: str | None = None) -> Path | None:
-    candidates = [
-        os.environ.get(f"{name.upper()}_BIN"),
-        TOOL_DIR / name,
-        Path("/tmp") / name,
-        shutil.which(name),
-    ]
+    candidates = [os.environ.get(f"{name.upper()}_BIN"), TOOL_DIR / name,
+                  Path("/tmp") / name, shutil.which(name)]
     for index, candidate in enumerate(candidates):
-        if not candidate or not Path(candidate).is_file():
-            continue
-        if not os.access(candidate, os.X_OK):
+        path = Path(candidate) if candidate else None
+        if path is None or not path.is_file() or not os.access(path, os.X_OK):
             continue
         # An explicit *_BIN override is honoured as-is; everything else must
         # report the pinned version or the download below supplies it instead.
         if index == 0 or version is None:
-            return Path(candidate)
+            return path
         try:
-            probe = run([str(candidate), PROBE[name]], timeout=30)
+            probe = run([str(path), PROBE[name]], timeout=30)
             reported = probe.stdout + probe.stderr
         except (OSError, subprocess.SubprocessError):
             reported = ""
         if version in reported:
-            return Path(candidate)
+            return path
     return None
 
 
@@ -118,9 +114,9 @@ def _download(url: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": "torchturbo-ci-lint"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            with open(temporary, "wb") as output:
-                shutil.copyfileobj(response, output)
+        with urllib.request.urlopen(request, timeout=120) as response, \
+                open(temporary, "wb") as output:
+            shutil.copyfileobj(response, output)
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -146,42 +142,41 @@ def _extract_binary(archive: Path, target: Path, member_name: str) -> Path:
     return target
 
 
-def _ensure_actionlint() -> Path:
-    found = _tool_path("actionlint", ACTIONLINT_VERSION)
+def _ensure_tool(name: str, version: str, url: str, *, arch: str = "",
+                 suffix: str = "", member: str = "") -> Path:
+    found = _tool_path(name, version)
     if found:
         return found
+    target = TOOL_DIR / name
+    if not suffix:
+        _download(url, target)
+        return target
+    archive = TOOL_DIR / f"{name}-{version}-{arch}{suffix}"
+    _download(url, archive)
+    return _extract_binary(archive, target, member or name)
+
+
+def _ensure_actionlint() -> Path:
     arch = _arch()
     version = ACTIONLINT_VERSION
     url = (f"https://github.com/rhysd/actionlint/releases/download/v{version}/"
            f"actionlint_{version}_linux_{arch}.tar.gz")
-    archive = TOOL_DIR / f"actionlint-{version}-{arch}.tar.gz"
-    _download(url, archive)
-    return _extract_binary(archive, TOOL_DIR / "actionlint", "actionlint")
+    return _ensure_tool("actionlint", version, url, arch=arch, suffix=".tar.gz")
 
 
 def _ensure_hadolint() -> Path:
-    found = _tool_path("hadolint", HADOLINT_VERSION)
-    if found:
-        return found
     arch = "arm64" if _arch() == "arm64" else "x86_64"
     url = (f"https://github.com/hadolint/hadolint/releases/download/"
            f"v{HADOLINT_VERSION}/hadolint-linux-{arch}")
-    target = TOOL_DIR / "hadolint"
-    _download(url, target)
-    return target
+    return _ensure_tool("hadolint", HADOLINT_VERSION, url)
 
 
 def _ensure_shellcheck() -> Path:
-    found = _tool_path("shellcheck", SHELLCHECK_VERSION)
-    if found:
-        return found
     arch = "aarch64" if _arch() == "arm64" else "x86_64"
     version = SHELLCHECK_VERSION
     url = (f"https://github.com/koalaman/shellcheck/releases/download/v{version}/"
            f"shellcheck-v{version}.linux.{arch}.tar.xz")
-    archive = TOOL_DIR / f"shellcheck-{version}-{arch}.tar.xz"
-    _download(url, archive)
-    return _extract_binary(archive, TOOL_DIR / "shellcheck", "shellcheck")
+    return _ensure_tool("shellcheck", version, url, arch=arch, suffix=".tar.xz")
 
 
 def _ensure_ruff() -> Path:
@@ -259,10 +254,9 @@ def check_hadolint() -> list[Problem]:
         return [Problem("docker", f"cannot obtain hadolint: {exc}")]
     problems = []
     for dockerfile in sorted((ROOT / "docker").rglob("Dockerfile*")):
-        cmd = [str(tool), "--format", "gnu", "--failure-threshold", "warning"]
-        for rule in HADOLINT_IGNORES:
-            cmd += ["--ignore", rule]
-        cmd.append(str(dockerfile))
+        cmd = ([str(tool), "--format", "gnu", "--failure-threshold", "warning"]
+               + [arg for rule in HADOLINT_IGNORES for arg in ("--ignore", rule)]
+               + [str(dockerfile)])
         problems += _diagnostics(cmd, relative(dockerfile))
     return problems
 
@@ -277,8 +271,7 @@ BUILTIN_MARKERS = frozenset({
 
 def _yaml_document(path: Path) -> dict:
     if yaml is None:
-        raise RuntimeError("PyYAML is not installed "
-                           "(pip install -r requirements-lint.txt)")
+        raise RuntimeError("PyYAML is not installed (pip install -r requirements-lint.txt)")
 
     class UniqueKeyLoader(yaml.SafeLoader):
         pass
@@ -303,26 +296,21 @@ def _yaml_document(path: Path) -> dict:
 
 def _job_needs(job: dict) -> list[str]:
     needs = (job or {}).get("needs") or []
-    if isinstance(needs, str):
-        return [needs]
-    return list(needs)
+    return [needs] if isinstance(needs, str) else list(needs)
 
 
 def _job_run_text(job: dict) -> str:
-    chunks = []
-    for step in (job or {}).get("steps") or []:
-        if isinstance(step, dict) and step.get("run"):
-            chunks.append(str(step["run"]))
-    return "\n".join(chunks)
+    return "\n".join(
+        str(step["run"]) for step in (job or {}).get("steps") or []
+        if isinstance(step, dict) and step.get("run")
+    )
 
 
 def _trigger_names(document: dict) -> set[str]:
     value = document.get(True, document.get("on")) or {}
     if isinstance(value, str):
         return {value}
-    if isinstance(value, list):
-        return {str(item) for item in value}
-    if isinstance(value, dict):
+    if isinstance(value, (list, dict)):
         return {str(item) for item in value}
     return set()
 
@@ -358,9 +346,8 @@ def check_contract() -> list[Problem]:
     for path, doc in docs.items():
         rel = relative(path)
         jobs = {str(name): job for name, job in (doc.get("jobs") or {}).items()}
-        plan_jobs = [name for name, job in jobs.items()
-                     if "scripts.ci.execution.producer.cli" in _job_run_text(job)]
-        if plan_jobs:
+        if any("scripts.ci.execution.producer.cli" in _job_run_text(job)
+               for job in jobs.values()):
             problems.extend(_check_planner_v2(
                 rel,
                 jobs,
@@ -386,47 +373,40 @@ def _check_planner_v2(
         return [Problem(rel, f"expected one Planner job; found {sorted(planners)}")]
     planner_name = planners[0]
     planner = jobs[planner_name]
-    planner_body = _job_run_text(planner)
     if requires_lint and not any(
-        marker in planner_body
+        marker in _job_run_text(planner)
         for marker in ("scripts/ci/tools/lint.py", "scripts.ci.tools.lint")
     ):
         problems.append(Problem(rel, "Planner job must also run scripts/ci/tools/lint.py"))
     declared = set((planner.get("outputs") or {}).keys())
     output_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.([A-Za-z0-9_-]+)"
     used = set(re.findall(output_pattern, dumped))
-    for name in sorted(used - declared):
-        problems.append(Problem(
-            rel,
-            f"reads needs.{planner_name}.outputs.{name} but the Planner does not declare it",
-        ))
-    for name in sorted(declared - used):
-        problems.append(Problem(rel, f"Planner output {name!r} has no consumer"))
+    problems.extend(Problem(
+        rel, f"reads needs.{planner_name}.outputs.{name} "
+             "but the Planner does not declare it")
+        for name in sorted(used - declared))
+    problems.extend(Problem(rel, f"Planner output {name!r} has no consumer")
+                    for name in sorted(declared - used))
 
     needed = {dependency for job in jobs.values() for dependency in _job_needs(job)}
     terminals = sorted(set(jobs) - needed)
-    direct_children = sorted({
-        name for name, job in jobs.items()
-        if planner_name in _job_needs(job)
-    } - set(terminals))
-    lanes = sorted(
-        name for name in direct_children
-        if "scripts.ci.execution.consumer.executor" in _job_run_text(jobs[name])
-    )
+    direct_children = sorted({name for name, job in jobs.items()
+                              if planner_name in _job_needs(job)} - set(terminals))
+    lanes = sorted(name for name in direct_children
+                   if "scripts.ci.execution.consumer.executor" in _job_run_text(jobs[name]))
     if not lanes:
         problems.append(Problem(rel, "Planner must feed at least one Executor lane"))
-    for name in sorted(set(direct_children) - set(lanes)):
-        consumed = yaml.safe_dump(jobs[name], allow_unicode=True)
-        if re.search(rf"needs\.{re.escape(planner_name)}\.outputs\.(?:cpu|npu|gpu)_jobs", consumed):
-            problems.append(Problem(rel, f"lane {name!r} does not invoke the executor"))
+    lane_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.(?:cpu|npu|gpu)_jobs"
+    problems.extend(Problem(rel, f"lane {name!r} does not invoke the executor")
+                    for name in sorted(set(direct_children) - set(lanes))
+                    if re.search(lane_pattern, yaml.safe_dump(jobs[name], allow_unicode=True)))
     if len(terminals) != 1:
         problems.append(Problem(
             rel, f"Planner workflow must have exactly one terminal job; found {terminals}"
         ))
         return problems
     terminal = terminals[0]
-    terminal_body = _job_run_text(jobs[terminal])
-    if "scripts.ci.execution.finalization.gate" not in terminal_body:
+    if "scripts.ci.execution.finalization.gate" not in _job_run_text(jobs[terminal]):
         problems.append(Problem(rel, f"terminal job {terminal!r} does not invoke the gate"))
     if "download-artifact" not in yaml.safe_dump(jobs[terminal], allow_unicode=True):
         problems.append(Problem(rel, f"terminal job {terminal!r} does not download results"))
@@ -483,21 +463,20 @@ def check_markers() -> list[Problem]:
     parser.read(ini, encoding="utf-8")
     if parser.get("pytest", "testpaths", fallback="") != "tests/unit_tests":
         problems.append(Problem(
-            "pytest.ini",
-            "testpaths must be tests/unit_tests; integration runs through its runner",
-        ))
-    configured = set()
-    for line in (parser.get("pytest", "markers", fallback="") or "").splitlines():
-        if ":" in line:
-            configured.add(line.split(":", 1)[0].strip())
+            "pytest.ini", "testpaths must be tests/unit_tests; integration runs through its runner"))
+    configured = {
+        line.split(":", 1)[0].strip()
+        for line in (parser.get("pytest", "markers", fallback="") or "").splitlines()
+        if ":" in line
+    }
 
     from ..execution.producer.facts import REQUIRED_MARKERS
 
     markers = _test_marker_names()
-    for name in sorted(markers - configured):
-        problems.append(Problem("pytest.ini", f"marker {name!r} is used but not registered"))
-    for name in sorted(configured - set(REQUIRED_MARKERS)):
-        problems.append(Problem("pytest.ini", f"obsolete marker {name!r}"))
+    problems.extend(Problem("pytest.ini", f"marker {name!r} is used but not registered")
+                    for name in sorted(markers - configured))
+    problems.extend(Problem("pytest.ini", f"obsolete marker {name!r}")
+                    for name in sorted(configured - set(REQUIRED_MARKERS)))
     return problems
 
 CHECKS = (
@@ -547,11 +526,11 @@ def run_checks(checks: Iterable[Check], summary_path: str | None) -> int:
         for problem in problems:
             print(f"  {problem.render()}")
             if os.environ.get("GITHUB_ACTIONS") == "true":
-                fields = [f"title={check.name}", f"file={problem.path}"]
+                fields = f"title={check.name},file={problem.path}"
                 if problem.line:
-                    fields.append(f"line={problem.line}")
+                    fields += f",line={problem.line}"
                 message = problem.message.replace("\n", " ")
-                print(f"::error {','.join(fields)}::{message}")
+                print(f"::error {fields}::{message}")
 
     elapsed = time.monotonic() - started
     destination = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
@@ -571,8 +550,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--only", action="append", default=[], metavar="NAME",
                         help="run one check (repeatable)")
     parser.add_argument("--list", action="store_true", help="list check names and exit")
-    parser.add_argument("--summary", default=None,
-                        help="write a Markdown summary to this file")
+    parser.add_argument("--summary", default=None, help="write a Markdown summary")
     args = parser.parse_args(argv)
 
     if args.list:

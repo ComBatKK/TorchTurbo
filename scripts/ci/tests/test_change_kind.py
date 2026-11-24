@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.ci.tools.change_kind import (
+from scripts.ci.tools.changed_files import (
     ChangeKind,
     classify_changes,
     main,

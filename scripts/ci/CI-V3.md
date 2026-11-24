@@ -99,8 +99,8 @@ execution/producer/matrix.py
 execution/producer/cli.py
   command line entry point
 
-tools/hashing.py
-  content_digest / file_sha256
+tools/json_io.py
+  canonical_json / content_digest
 ```
 
 结果层级：

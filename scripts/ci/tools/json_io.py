@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -19,6 +20,12 @@ class JsonDecodeError(ValueError):
 def canonical_json(value: object) -> str:
     """Return deterministic JSON for hashing and artifact comparison."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def content_digest(value: object) -> str:
+    """Return a sha256 digest over deterministic JSON content."""
+    payload = canonical_json(value).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def read_json(path: Path) -> object:
@@ -103,9 +110,10 @@ def _decode(tp: Any, value: Any, path: str) -> Any:
 def _decode_dataclass(cls: type, value: Any, path: str) -> Any:
     if not isinstance(value, dict):
         _fail(path, "must be a mapping")
-    allowed = {item.name for item in fields(cls)}
+    cls_fields = fields(cls)
+    allowed = {item.name for item in cls_fields}
     defaults = {
-        item.name for item in fields(cls)
+        item.name for item in cls_fields
         if item.default is not MISSING or item.default_factory is not MISSING
     }
     missing = sorted(allowed - set(value) - defaults)
@@ -119,7 +127,7 @@ def _decode_dataclass(cls: type, value: Any, path: str) -> Any:
     try:
         return cls(**{
             item.name: _decode(hints[item.name], value[item.name], f"{path}.{item.name}")
-            for item in fields(cls)
+            for item in cls_fields
             if item.name in value
         })
     except (KeyError, TypeError) as exc:

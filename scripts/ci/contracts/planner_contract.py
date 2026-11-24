@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..tools.hashing import content_digest
-from ..tools.json_io import JsonDecodeError, decode, read_json
+from ..tools.json_io import JsonDecodeError, content_digest, decode, read_json
 from .base import Contract, ContractError, Diagnostic, GitSource, SCHEMA_VERSION
 from .image_contract import ResolvedImage
 

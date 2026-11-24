@@ -79,7 +79,7 @@ jobs:
           changed="$RUNNER_TEMP/ci-changed-files.txt"
           git diff --name-only --diff-filter=AM --no-renames \
             "$BASE_SHA...HEAD" > "$changed"
-          kind=$(python3 -m scripts.ci.tools.change_kind --changed-files "$changed")
+          kind=$(python3 -m scripts.ci.tools.changed_files --changed-files "$changed")
           printf 'kind=%s\n' "$kind" >> "$GITHUB_OUTPUT"
 
       - name: select changed images
