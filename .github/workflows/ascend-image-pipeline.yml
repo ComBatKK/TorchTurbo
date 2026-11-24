@@ -1,5 +1,5 @@
-name: Ascend Candidate
-run-name: Candidate ${{ inputs.image_id }}
+name: Ascend-Image-Pipeline
+run-name: Image pipeline ${{ inputs.image_id }}
 
 # One logical image's candidate pipeline. The parent workflow expands this as a
 # matrix so different images run independently without global barriers.
