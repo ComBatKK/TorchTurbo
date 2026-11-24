@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from transformers import PretrainedConfig
 
@@ -66,6 +67,7 @@ class BaseCheckpointManager(ABC):
         *,
         source_path: str,
         weight_converter: BaseWeightConverter,
+        lora_export_mode: str = "merged",
     ) -> None:
         """Export HF weights under ``output_dir``."""
 
@@ -139,6 +141,7 @@ class BaseBackend(ABC):
         model: nn.Module,
         parallel_plan: Any = None,
         peft_config: Any = None,
+        on_parallelized: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         """Wrap / shard the model according to this backend's strategy.
 
@@ -154,6 +157,11 @@ class BaseBackend(ABC):
             When provided, LoRA adapters are applied **after** module
             replacement but **before** sharding.  Backends that don't
             support PEFT should raise an error if this is non-None.
+        on_parallelized:
+            Optional hook run after module replacement and SP setup but before
+            activation checkpointing and sharding. Backends that install
+            sequence-parallel forward patches must run this hook first so any
+            checkpoint wrapper captures the patched forward.
         """
 
     @abstractmethod

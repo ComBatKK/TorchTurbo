@@ -2,7 +2,8 @@
 
 import importlib
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -23,6 +24,7 @@ from torchturbo.engine import (
     MuonPlan,
     OptimizerClassPlan,
     OptimizerConfig,
+    OpsConfig,
     TorchTurboEngine,
     build_model_fqn_map,
     register_backend,
@@ -143,6 +145,7 @@ class RecordingCheckpointManager(RecordingLayout, BaseCheckpointManager):
         *,
         source_path,
         weight_converter,
+        lora_export_mode="merged",
     ):
         self.calls.append(("save_hf", output_dir, source_path, weight_converter))
 
@@ -170,8 +173,12 @@ class DummyBackend(BaseBackend):
         super().__init__(config, device_runtime)
         self._checkpoint = RecordingCheckpointManager()
 
-    def prepare_model(self, model, parallel_plan=None, peft_config=None):
+    def prepare_model(
+        self, model, parallel_plan=None, peft_config=None, on_parallelized=None
+    ):
         model._dummy_sharded = True
+        if on_parallelized is not None:
+            on_parallelized(model)
         return model
 
     def materialize(self, model):
@@ -251,6 +258,27 @@ def dummy_engine():
     # EngineConfig selects a supported backend; the registry supplies its class.
     register_backend("fsdp2", DummyBackend)
     return TorchTurboEngine()
+
+
+def test_engine_enables_configured_operator_plugin(monkeypatch):
+    from torchturbo.ops import OpBinding, OpPlugin
+    from torchturbo.runtime import TurboDevice
+
+    module = ModuleType("engine_ops_plugin")
+    module.square = lambda x: x.square()
+    module.plugin = OpPlugin(name="engine_test", bindings=(OpBinding(
+        op_name="plugin_square", impl_name="engine_test::square",
+        target="engine_ops_plugin:square", devices=(TurboDevice.CPU,),
+    ),))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    register_backend("fsdp2", DummyBackend)
+    engine = TorchTurboEngine(config=EngineConfig(ops=OpsConfig(
+        plugins=("engine_ops_plugin:plugin",),
+        overrides={"plugin_square": "engine_test::square"},
+    )))
+    x = torch.tensor([2.0], requires_grad=True)
+    engine.ops.plugin_square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x)
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +406,15 @@ class TestEngineSetup:
                 assert torch.empty(0).device.type == "cpu"
                 return converter
 
-        def backend_prepare(model, parallel_plan, peft_config):
+        def backend_prepare(model, parallel_plan, peft_config, on_parallelized=None):
             order.append("backend_prepare")
             assert isinstance(model, LifecycleModel)
             assert model.projection.weight.is_meta
             assert flash_integration._flash_attention_forward is original_binding
             assert parallel_plan is engine.parallel_plan
             assert peft_config is None
+            if on_parallelized is not None:
+                on_parallelized(model)
             return model
 
         def backend_context():
@@ -411,6 +441,7 @@ class TestEngineSetup:
         engine.parallel_plan = None
         engine._checkpoint = None
         engine.backend = Mock(spec=BaseBackend)
+        engine.plugin_manager = Mock()
         checkpoint_manager = Mock(spec=BaseCheckpointManager)
         checkpoint_manager.load_hf.side_effect = checkpoint_load
         engine.backend.prepare_model.side_effect = backend_prepare

@@ -4,6 +4,7 @@ import os
 import sys
 import types
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
@@ -24,6 +25,7 @@ from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParamete
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
     VisionBalanceMode,
     VisionBalanceSpec,
 )
@@ -65,6 +67,7 @@ def make_backend(*, mtp_enabled=False):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=mtp_enabled),
+        moe=types.SimpleNamespace(mega_moe=types.SimpleNamespace(enable=False)),
         loss_chunk=types.SimpleNamespace(enabled=False),
     )
     return backend
@@ -110,7 +113,7 @@ def test_model_fqn_map_is_unavailable_before_prepare_model():
         backend.get_model_fqn_map()
 
 
-def test_compile_parallel_plan_warns_for_unmatched_patterns(monkeypatch):
+def test_compile_parallel_plan_does_not_warn_for_unmatched_default_patterns(monkeypatch):
     from torchturbo.engine.backends.fsdp2 import backend as backend_module
 
     warnings = []
@@ -130,8 +133,111 @@ def test_compile_parallel_plan_warns_for_unmatched_patterns(monkeypatch):
 
     assert dict(resolved.modules) == {}
     assert dict(resolved.parameters) == {}
+    assert warnings == []
+
+
+def test_compile_parallel_plan_warns_for_unmatched_user_patterns(monkeypatch):
+    from torchturbo.engine.backends.fsdp2 import backend as backend_module
+
+    warnings = []
+    monkeypatch.setattr(
+        backend_module,
+        "logger",
+        types.SimpleNamespace(
+            warning_rank0=lambda message, *args: warnings.append(message % args),
+            info_rank0=lambda *args, **kwargs: None,
+        ),
+    )
+    model = nn.Linear(2, 2)
+    plan = FSDPParallelPlan()
+    setattr(
+        plan,
+        USER_PLAN_PATTERNS_ATTR,
+        {
+            "missing.*": FSDPPlanSpec(no_shard=True),
+            "weight": FSDPPlanSpec(no_shard=True),
+        },
+    )
+
+    resolved = resolve_plan(model, plan)
+
+    assert dict(resolved.modules) == {}
+    assert dict(resolved.parameters)["weight"].no_shard is True
     assert warnings == [
-        "FSDPParallelPlan patterns matched no model FQNs: ['missing.*']"
+        "User parallel plan patterns matched no model FQNs: ['missing.*']"
+    ]
+
+
+def test_activation_checkpointing_rejects_nested_targets():
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=types.SimpleNamespace(enabled=True)
+    )
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = nn.Linear(2, 2)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+
+    resolved = types.SimpleNamespace(
+        modules={
+            "layers.0": FSDPPlanSpec(activation_checkpoint=True),
+            "layers.0.attention": FSDPPlanSpec(activation_checkpoint=True),
+        }
+    )
+
+    with pytest.raises(ValueError, match="Nested activation checkpoint"):
+        FSDP2Backend._apply_activation_checkpointing(backend, Model(), resolved)
+
+
+def test_compress_fqn_runs_groups_specs_across_dfs_order():
+    from torchturbo.engine.backends.fsdp2.backend import _compress_fqn_runs
+
+    summary_ac = {"activation_checkpoint": True}
+    summary_mlp = {"activation_checkpoint": False}
+    entries = [
+        ("model.layers.0", summary_ac),
+        ("model.layers.0.mlp", summary_mlp),
+        ("model.layers.1", summary_ac),
+        ("model.layers.1.mlp", summary_mlp),
+        ("model.layers.10", summary_ac),
+        ("model.layers.10.mlp", summary_mlp),
+    ]
+
+    lines = _compress_fqn_runs(entries)
+
+    assert lines == [
+        f"model.layers.[0~1], model.layers.10 -> {summary_ac}",
+        f"model.layers.[0~1].mlp, model.layers.10.mlp -> {summary_mlp}",
+    ]
+
+
+def test_prepare_model_runs_on_parallelized_before_activation_checkpointing():
+    order = []
+    backend = make_preparing_backend(
+        order, {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+    )
+    model = TaggedModule("root")
+    model.config = types.SimpleNamespace()
+
+    backend.prepare_model(
+        model,
+        FSDPParallelPlan(),
+        on_parallelized=lambda prepared: order.append("on_parallelized"),
+    )
+
+    assert order == [
+        "init_mesh",
+        "replace",
+        "on_parallelized",
+        "activation_checkpointing",
+        "shard",
+        "prefetch",
     ]
 
 
@@ -1075,7 +1181,7 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     suspended_models = []
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: (
+        recompute_context=lambda model: (
             suspended_models.append(model) or nullcontext()
         )
     )
@@ -1129,7 +1235,7 @@ def test_reentrant_checkpointing_suspends_prefetch_for_its_model(monkeypatch):
     )
     suspended_models = []
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: (
+        recompute_context=lambda model: (
             suspended_models.append(model) or nullcontext()
         )
     )
@@ -1169,7 +1275,7 @@ def test_reentrant_checkpointing_recomputes_with_frozen_inputs(keyword_input, ou
     )
     suspended_models = []
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: (
+        recompute_context=lambda model: (
             suspended_models.append(model) or nullcontext()
         )
     )
@@ -1234,7 +1340,7 @@ def test_reentrant_checkpointing_preserves_input_gradients(freeze_parameters):
         )
     )
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: nullcontext()
+        recompute_context=lambda model: nullcontext()
     )
     plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
     backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
@@ -1262,7 +1368,7 @@ def test_reentrant_checkpointing_keeps_frozen_execution_without_gradients(mode):
         )
     )
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: nullcontext()
+        recompute_context=lambda model: nullcontext()
     )
     plan = FSDPParallelPlan(plan={"": FSDPPlanSpec(activation_checkpoint=True)})
     backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
@@ -1282,7 +1388,7 @@ def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: nullcontext()
+        recompute_context=lambda model: nullcontext()
     )
 
     model = TaggedModule("root")
@@ -1324,6 +1430,7 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
         "logger",
         types.SimpleNamespace(
             warning_rank0=lambda *args, **kwargs: warnings.append(args),
+            info_rank0=lambda *args, **kwargs: None,
         ),
     )
 
@@ -1340,3 +1447,80 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
     assert len(warnings) == 1
     assert "skipping activation checkpointing" in warnings[0][0]
     assert not hasattr(model.layers[0], "_tt_original_forward")
+
+
+def test_megakernel_with_peft_fails_before_mesh_setup():
+    backend = make_backend()
+    backend.config.moe.mega_moe.enable = True
+    backend._init_mesh = lambda plan: pytest.fail("mesh setup should not run")
+    with pytest.raises(AssertionError, match="does not support PEFT/LoRA"):
+        backend.prepare_model(TaggedModule("root"), FSDPParallelPlan(), peft_config=object())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("share_router", [False, True])
+def test_qwen_layers_select_megakernel_from_config(monkeypatch, enabled, share_router):
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
+    from torchturbo.models.qwen3_5_moe.parallel_plan import get_parallel_plan
+    from torchturbo.ops.providers.npu.mega_moe import HmcMegaMoe, HmcRoutedExperts
+
+    group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    backend = make_preparing_backend([], {"sp_group": None, "sp_size": 1, "sp_rank": 0})
+    del backend._replace_modules
+    backend.config = EngineConfig()
+    backend.get_ep_info = lambda: {"ep_group": group, "ep_size": 2}
+    model = nn.Module()
+    model.config = types.SimpleNamespace(hidden_size=8, moe_intermediate_size=4,
+                                         num_experts=4, num_experts_per_tok=2)
+    model.mlp = nn.Module()
+    model.mlp.gate = model.mlp.experts = nn.Identity()
+    model.dense = nn.Identity()
+    spec = get_parallel_plan().plan["model.language_model.layers.*.mlp"]
+    model.second_mlp = nn.Module()
+    model.second_mlp.gate = model.second_mlp.experts = nn.Identity()
+    plan = FSDPParallelPlan(plan={"mlp": spec, "second_mlp": spec, "dense": spec})
+    model.prebuilt = spec.replace_module(
+        model.mlp, hf_config=model.config, ep_info=backend.get_ep_info(), sp_info=backend.get_sp_info(),
+        engine_config=backend.config, **spec.module_kwargs,
+    )
+    if share_router:
+        def replace_with_shared_router(module, **kwargs):
+            layer = spec.replace_module(module, **kwargs)
+            layer.router = model.mlp.router
+            return layer
+
+        plan.plan["second_mlp"] = FSDPPlanSpec(
+            replace_module=replace_with_shared_router, module_kwargs=spec.module_kwargs,
+        )
+    build = Mock(side_effect=HmcMegaMoe())
+    monkeypatch.setattr("torchturbo.models.modules.moe.moe_layer.ops", types.SimpleNamespace(mega_moe=build))
+    backend.config.moe.mega_moe.enable = enabled
+    backend.prepare_model(model, plan)
+    assert build.call_count == (2 if enabled else 0)
+    assert (model.mlp.token_dispatcher is None) == enabled
+    assert isinstance(model.mlp, MoELayer)
+    if enabled:
+        assert isinstance(model.mlp.megakernel, HmcRoutedExperts)
+        assert isinstance(model.second_mlp.megakernel, HmcRoutedExperts)
+        assert model.mlp.megakernel is not model.second_mlp.megakernel
+        assert model.mlp.megakernel._run is model.second_mlp.megakernel._run
+        other = nn.Module()
+        other.config = model.config
+        other.mlp = nn.Module()
+        other.mlp.gate = other.mlp.experts = nn.Identity()
+        backend.prepare_model(other, plan)
+        assert other.mlp.megakernel._run is not model.mlp.megakernel._run
+    else:
+        assert model.mlp.megakernel is model.second_mlp.megakernel is None
+    assert not hasattr(model.dense, "megakernel")
+    assert model.prebuilt.megakernel is None
+    hidden = torch.randn(3, 1, 8)
+    assert model.prebuilt.router(hidden)[0].shape == (3, 4)
+    if share_router:
+        assert model.mlp.router is model.second_mlp.router
+        torch.nn.init.normal_(model.mlp.router.weight)
+        dense, mask, ids, _ = model.mlp.router(hidden)
+        assert dense.shape == mask.shape == (3, 4)

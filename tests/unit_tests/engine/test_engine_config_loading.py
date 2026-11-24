@@ -42,8 +42,10 @@ from torchturbo.ops.base import OpPolicy
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
     VisionBalanceMode,
     VisionBalanceSpec,
+    resolve_plan_spec,
 )
 
 
@@ -61,6 +63,46 @@ def _isolate_env(monkeypatch):
     monkeypatch.delenv("TT_OUTPUT_DIR", raising=False)
 
 
+def test_checkpoint_input_offload_yaml_and_cli(tmp_path):
+    path = tmp_path / "offload.yaml"
+    path.write_text(
+        "engine_config:\n  activation_checkpointing:\n"
+        "    offload_input_to_cpu: true\n"
+    )
+    args, _ = parse_torchturbo_args(["--tt_config", str(path)])
+    assert build_from_args(args).activation_checkpointing.offload_input_to_cpu
+    args, remaining = parse_torchturbo_args([
+        "--tt_config", str(path), "--tt_ac_offload_input_to_cpu", "false",
+    ])
+    assert remaining == []
+    assert not build_from_args(args).activation_checkpointing.offload_input_to_cpu
+
+
+def test_internal_runtime_training_flags():
+    args, remaining = parse_torchturbo_args([
+        "--tt_train_engram", "true", "--tt_indexer_kl_loss_coeff", "0.1",
+        "--tt_npu_memory_fraction", "0.9",
+    ])
+    assert not remaining
+    assert args.train_engram and args.indexer_kl_loss_coeff == 0.1
+    assert args.npu_memory_fraction == 0.9
+    assert "tt_train_engram" not in args.config_overrides
+
+
+def test_internal_megamoe_yaml(tmp_path):
+    config_path = tmp_path / "mega.yaml"
+    config_path.write_text(
+        "engine_config:\n  mega_moe: true\n"
+    )
+    args, remaining = parse_torchturbo_args([
+        "--tt_config", str(config_path),
+    ])
+    config = build_from_args(args)
+    assert remaining == []
+    assert config.mega_moe
+    assert EngineConfig.from_dict(config.to_dict()).mega_moe
+
+
 def _write(tmp_path, name: str, content: str) -> str:
     path = tmp_path / name
     path.write_text(content, encoding="utf-8")
@@ -74,6 +116,43 @@ def _engine_config(content: str) -> str:
 def _build_from_argv(argv: list[str]) -> EngineConfig:
     tt, _ = parse_torchturbo_args(argv)
     return build_from_args(tt)
+
+
+def test_ops_plugins_load_from_yaml(tmp_path):
+    path = _write(tmp_path, "plugins.yaml", _engine_config(
+        "ops:\n  plugins:\n    - my_project.tt_ops_plugin:plugin\n"
+    ))
+    cfg = _build_from_argv(["--tt_config", path])
+    assert cfg.ops.plugins == ("my_project.tt_ops_plugin:plugin",)
+    assert EngineConfig.from_dict(cfg.to_dict()).ops.plugins == cfg.ops.plugins
+
+
+def test_inline_ops_plugin_from_training_config(tmp_path):
+    import torch
+
+    from torchturbo.ops import OpDispatcher, OpRegistry
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    path = _write(tmp_path, "inline_plugins.yaml", _engine_config(
+        "ops:\n"
+        "  plugins:\n"
+        "    - name: external\n"
+        "      bindings:\n"
+        "        - op_name: square\n"
+        "          impl_name: external::square\n"
+        "          target: torch:square\n"
+        "          devices: [cpu]\n"
+        "          kind: custom\n"
+        "          priority: 200\n"
+    ))
+    cfg = _build_from_argv(["--tt_config", path])
+    restored = EngineConfig.from_dict(cfg.to_dict())
+    assert restored.ops.plugins == cfg.ops.plugins
+    ops = OpDispatcher(device_runtime=CpuRuntime(), registry=OpRegistry(),
+                       plugins=restored.ops.plugins)
+    x = torch.tensor([2.0], requires_grad=True)
+    ops.square(x).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x)
 
 
 class _FakeQwen35Moe(TurboModel):
@@ -751,6 +830,39 @@ def test_hf_export_can_be_seeded_on_torchturbo_args():
     assert checkpoint.hf_export == "every"
 
 
+def test_lora_export_mode_comes_from_file_and_cli(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("checkpoint:\n  lora_export_mode: adapter\n"),
+    )
+
+    assert _build_from_argv(["--tt_config", path]).checkpoint.lora_export_mode == "adapter"
+    assert (
+        _build_from_argv(
+            ["--tt_config", path, "--tt_lora_export_mode", "merged"]
+        ).checkpoint.lora_export_mode
+        == "merged"
+    )
+
+
+def test_lora_export_mode_default_is_merged():
+    checkpoint = build_from_args(TorchTurboArgs()).checkpoint
+
+    assert checkpoint.lora_export_mode == "merged"
+
+
+def test_lora_export_mode_rejects_the_legacy_value(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("checkpoint:\n  lora_export_mode: merge\n"),
+    )
+
+    with pytest.raises(ValueError, match="lora_export_mode must be 'merged'"):
+        _build_from_argv(["--tt_config", path])
+
+
 def test_default_save_format_is_not_supported(tmp_path):
     path = _write(
         tmp_path,
@@ -1054,7 +1166,12 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.language_model.layers.*"].activation_checkpoint is False
+    # User patterns stay separate from model defaults and override per FQN.
+    assert plan.plan["model.language_model.layers.*"].activation_checkpoint is True
+    assert (
+        resolve_plan_spec(plan, "model.language_model.layers.7").activation_checkpoint
+        is False
+    )
     # Untouched FQNs must keep their model defaults (MoE replacement, kwargs).
     mlp = plan.plan["model.language_model.layers.*.mlp"]
     assert mlp.replace_module is not None
@@ -1077,7 +1194,8 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.visual"].standalone_world_shard is False
+    assert plan.plan["model.visual"].standalone_world_shard is True
+    assert resolve_plan_spec(plan, "model.visual").standalone_world_shard is False
 
 
 @pytest.mark.parametrize("source", ["yaml", "python", "dict"])
@@ -1119,10 +1237,11 @@ def test_parallel_plan_vision_balance_keeps_bailing_sharding(
 
     plan = _resolve_engine_plan(cfg, _FakeBailingVL)
 
-    vision_spec = plan.plan["model.visual"].vision_balance
+    resolved = resolve_plan_spec(plan, "model.visual")
+    vision_spec = resolved.vision_balance
     assert vision_spec.mode is VisionBalanceMode(mode)
     assert isinstance(vision_spec.io, BailingVisionBalanceIO)
-    assert plan.plan["model.visual"].standalone_world_shard is True
+    assert resolved.standalone_world_shard is True
     assert plan.plan["model.visual.blocks.*"].activation_checkpoint is True
 
 
@@ -1158,7 +1277,7 @@ def test_parallel_plan_merges_vision_spec_without_mutating_default(
     )
 
     plan = _resolve_engine_plan(cfg, ModelWithVisionDefault)
-    vision_spec = plan.plan["visual"].vision_balance
+    vision_spec = resolve_plan_spec(plan, "visual").vision_balance
 
     assert vision_spec is not default_vision
     assert vision_spec.mode is (override_mode or VisionBalanceMode.PATCH_SQ)
@@ -1183,7 +1302,9 @@ parallel_plan:
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
 
-    assert plan.plan["model.new_module"].activation_checkpoint is True
+    assert "model.new_module" not in plan.plan
+    assert "model.new_module" in getattr(plan, USER_PLAN_PATTERNS_ATTR)
+    assert resolve_plan_spec(plan, "model.new_module").activation_checkpoint is True
 
 
 def test_config_no_shard_conflicts_with_model_placement(tmp_path):
@@ -1202,8 +1323,14 @@ parallel_plan:
         ),
     )
 
+    plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
+
+    # The conflict surfaces when the per-FQN override inherits the model's
+    # expert placement while adding no_shard.
     with pytest.raises(ValueError, match="mutually exclusive"):
-        _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
+        resolve_plan_spec(
+            plan, "model.language_model.layers.0.mlp.experts"
+        )
 
 
 def test_sample_style_config_patches_model_default_without_losing_defaults(
@@ -1433,3 +1560,23 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+@pytest.mark.parametrize(("setting", "balance"), [
+    ("{enable: true}", None),
+    ("{enable: true, expert_balance: null}", None),
+    ("{enable: true, expert_balance: hot_replica}", "hot_replica"),
+])
+def test_mega_moe_yaml_config(tmp_path, setting, balance):
+    path = _write(tmp_path, "mega.yaml", _engine_config(f"moe:\n  mega_moe: {setting}\n"))
+    config = _build_from_argv(["--tt_config", path]).moe.mega_moe
+    assert config.enable and config.expert_balance == balance
+    assert not _build_from_argv([]).moe.mega_moe.enable
+
+
+@pytest.mark.parametrize("value", ["None", "none", "adaptive", "true", "[]"])
+def test_invalid_expert_balance(tmp_path, value):
+    path = _write(tmp_path, "mega.yaml", _engine_config(
+        f"moe:\n  mega_moe: {{enable: true, expert_balance: {value}}}\n"))
+    with pytest.raises(ValueError, match="expert_balance"):
+        _build_from_argv(["--tt_config", path])

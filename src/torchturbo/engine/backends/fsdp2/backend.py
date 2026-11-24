@@ -1,10 +1,11 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
 import functools
-from collections.abc import Iterator, Mapping, Sequence
+import re
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType, MethodType
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -43,6 +44,8 @@ from torchturbo.models.modules.vision import register_vision_balance
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    USER_PLAN_PATTERNS_ATTR,
+    resolve_plan_spec,
 )
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.utils.torch_utils import torch_version
@@ -53,12 +56,16 @@ from ...config import EngineConfig
 from ...distributed import assert_finite, init_process_group_if_needed
 from ..base import BaseBackend
 from .checkpoint import FSDP2CheckpointManager
+from .checkpoint_input import checkpoint_with_cpu_input, checkpoint_with_large_input_offload
 from .config import CPUOffloadMode, FSDPConfig
 from .optimizers.adamw import prepare_fsdp_adamw_optimizer
 from .optimizers.memory import OptimizerMemoryController
 from .prefetch import FSDPPrefetchManager
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from .optimizers.engram import EngramOptimizer
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import (
@@ -83,12 +90,114 @@ class _FSDPUnit:
     modules: list[nn.Module]
     mesh: Any
     reshard_after_forward: bool | None = None
+    cast_forward_inputs: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedFSDPPlan:
     modules: Mapping[str, FSDPPlanSpec]
     parameters: Mapping[str, FSDPPlanSpec]
+
+
+def _plan_spec_summary(spec: FSDPPlanSpec) -> dict[str, Any]:
+    """Return a JSON/log-friendly summary of the fields users configure."""
+    placement = spec.placement
+    replace_module = spec.replace_module
+    vision = spec.vision_balance
+    return {
+        "activation_checkpoint": spec.activation_checkpoint,
+        "no_shard": spec.no_shard,
+        "standalone_world_shard": spec.standalone_world_shard,
+        "mesh": None if placement is None else (placement.mesh_dim or "world"),
+        "replace_module": (
+            None
+            if replace_module is None
+            else getattr(replace_module, "__name__", repr(replace_module))
+        ),
+        "vision_balance": None if vision is None else vision.mode,
+    }
+
+
+def _fqn_trie(fqns: list[str]) -> dict[str, Any]:
+    """Build a segment trie, normalizing numeric segments for ordering."""
+    root: dict[str, Any] = {"children": {}}
+    for fqn in fqns:
+        children = root["children"]
+        for segment in fqn.split(".") if fqn else ():
+            children = children.setdefault(segment, {"children": {}})["children"]
+    return root
+
+
+def _serialize_fqn_trie(node: dict[str, Any]) -> list[str]:
+    """Serialize a trie, collapsing consecutive numeric runs at any depth."""
+    cached = node.get("serialized")
+    if cached is not None:
+        return cached
+    children = node["children"]
+    if not children:
+        node["serialized"] = [""]
+        return [""]
+    non_numeric = sorted(k for k in children if not k.isdigit())
+    numeric = sorted((k for k in children if k.isdigit()), key=int)
+
+    output: list[str] = []
+    for key in non_numeric:
+        for suffix in _serialize_fqn_trie(children[key]):
+            output.append(key if suffix == "" else f"{key}.{suffix}")
+
+    # Consecutive indices with identical subtrees collapse into one segment,
+    # e.g. layers/{0,1,2}.mlp -> layers.[0~2].mlp.
+    idx = 0
+    while idx < len(numeric):
+        suffixes = tuple(_serialize_fqn_trie(children[numeric[idx]]))
+        end = idx
+        while (
+            end + 1 < len(numeric)
+            and int(numeric[end + 1]) == int(numeric[end]) + 1
+            and tuple(_serialize_fqn_trie(children[numeric[end + 1]])) == suffixes
+        ):
+            end += 1
+        if end == idx:
+            label = numeric[idx]
+        else:
+            label = f"[{numeric[idx]}~{numeric[end]}]"
+        for suffix in suffixes:
+            output.append(label if suffix == "" else f"{label}.{suffix}")
+        idx = end + 1
+    node["serialized"] = output
+    return output
+
+
+def _compressed_fqn_sort_key(fqn: str) -> tuple[tuple[int, Any], ...]:
+    """Numeric-aware ordering for compressed labels (``[0~9]`` sorts by start)."""
+    first_index = re.sub(r"\[(\d+)~\d+\]", r"\1", fqn)
+    return tuple(
+        (1, int(segment)) if segment.isdigit() else (0, segment)
+        for segment in re.findall(r"\d+|\D+", first_index)
+    )
+
+
+def _compress_fqn_runs(entries: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """Group effective specs, then merge numeric FQN runs inside each group.
+
+    Model FQNs arrive in pre-order DFS (``layers.0``, ``layers.0.mlp``,
+    ``layers.1``...), so adjacent-only compression would never merge repeated
+    layer specs. Grouping by identical summaries first and compressing each
+    group as a segment trie collapses runs at any depth, including
+    ``model.layers.[0~23].mlp.experts``. Cost is linear in trie size after
+    grouping, negligible next to plan wrapping.
+    """
+    groups: dict[tuple[tuple[str, Any], ...], list[str]] = {}
+    for fqn, summary in entries:
+        groups.setdefault(tuple(summary.items()), []).append(fqn)
+
+    lines: list[str] = []
+    for summary_items, fqns in groups.items():
+        compressed = _serialize_fqn_trie(_fqn_trie(fqns))
+        compressed = ["<root>" if fqn == "" else fqn for fqn in compressed]
+        compressed.sort(key=_compressed_fqn_sort_key)
+        lines.append(f"{', '.join(compressed)} -> {dict(summary_items)}")
+    return lines
 
 
 def _confidence_entropy_sum(logits: torch.Tensor, labels: torch.Tensor,
@@ -127,6 +236,8 @@ class FSDP2Backend(BaseBackend):
     """
 
     name = "fsdp2"
+    engram_optimizer: "EngramOptimizer | None" = None
+    _engram_tables: tuple = ()
 
     def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         super().__init__(config, device_runtime)
@@ -170,6 +281,8 @@ class FSDP2Backend(BaseBackend):
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
         self._resolved_parallel_plan: _ResolvedFSDPPlan | None = None
+        self.engram_optimizer = None
+        self._engram_tables = ()
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -332,7 +445,7 @@ class FSDP2Backend(BaseBackend):
                 if fqn == "":
                     continue
 
-                spec = plan.match(fqn)
+                spec = resolve_plan_spec(plan, fqn)
                 if isinstance(spec, FSDPPlanSpec) and spec.replace_module:
                     kwargs = spec.module_kwargs
 
@@ -364,16 +477,48 @@ class FSDP2Backend(BaseBackend):
         plan: FSDPParallelPlan,
         model_fqn_map: ModelFQNMap,
     ) -> _ResolvedFSDPPlan:
-        """Resolve model-authored patterns to exact prepared-tree FQNs."""
-        for pattern, spec in plan.plan.items():
+        """Resolve model defaults plus user overrides to prepared-tree FQNs.
+
+        Model defaults and user patterns stay separate (see
+        ``parallel.fsdp.resolve_plan_spec``). Each side keeps declared-order
+        first-match semantics; a user match overrides only explicitly set
+        fields.
+        """
+        user_patterns: Mapping[str, FSDPPlanSpec] = (
+            getattr(plan, USER_PLAN_PATTERNS_ATTR, None) or {}
+        )
+        matched_user_patterns: set[str] = set()
+
+        def validate_vision_pattern(
+            patterns: Mapping[str, FSDPPlanSpec], pattern: str, spec: FSDPPlanSpec
+        ) -> None:
+            """Validate a vision-balance pattern on one pattern side.
+
+            A vision spec that loses its side's first-match competition (or only
+            matches parameters) would silently never register, so require it to
+            be the winning pattern for at least one module FQN and to carry the
+            model-provided IO adapter. ``patterns`` is either the model default
+            plan or the user override list; each side is validated in isolation.
+            """
             vision_spec = spec.vision_balance
             if vision_spec is None or vision_spec.mode is None:
-                continue
-            matches_module = any(
-                match_fqn(pattern, fqn) and plan.match(fqn) is spec
-                for fqn in model_fqn_map.modules
-            )
-            if not matches_module:
+                return
+            winning = None
+            for candidate_fqn in model_fqn_map.modules:
+                winning_pattern = next(
+                    (
+                        candidate
+                    for candidate in patterns
+                    if match_fqn(candidate, candidate_fqn)
+                    ),
+                    None,
+                )
+                if winning_pattern is None:
+                    continue
+                if winning_pattern == pattern:
+                    winning = candidate_fqn
+                    break
+            if winning is None:
                 raise ValueError(
                     f"Vision balance pattern {pattern!r} does not resolve "
                     "to a module in the active parallel plan."
@@ -383,30 +528,59 @@ class FSDP2Backend(BaseBackend):
                     f"Vision balance pattern {pattern!r} requires a model-provided "
                     "input/output adapter."
                 )
-        model_fqns = tuple(model_fqn_map.modules) + tuple(model_fqn_map.parameters)
-        unmatched_patterns = [
-            pattern
-            for pattern in plan.plan
-            if not any(match_fqn(pattern, fqn) for fqn in model_fqns)
-        ]
-        if unmatched_patterns:
-            # TODO: Raise ValueError when unmatched plan patterns become errors.
-            logger.warning_rank0(
-                "FSDPParallelPlan patterns matched no model FQNs: %s",
-                unmatched_patterns,
-            )
+
+        for pattern, spec in plan.plan.items():
+            validate_vision_pattern(plan.plan, pattern, spec)
+        for pattern, spec in user_patterns.items():
+            validate_vision_pattern(user_patterns, pattern, spec)
+
+        def resolve(fqn: str) -> FSDPPlanSpec | None:
+            for pattern in user_patterns:
+                if match_fqn(pattern, fqn):
+                    matched_user_patterns.add(pattern)
+                    break
+            return resolve_plan_spec(plan, fqn)
 
         modules: dict[str, FSDPPlanSpec] = {}
         for model_fqn, prepared_fqn in model_fqn_map.modules.items():
-            spec = plan.match(model_fqn)
+            spec = resolve(model_fqn)
             if isinstance(spec, FSDPPlanSpec):
                 modules[prepared_fqn] = spec
 
         parameters: dict[str, FSDPPlanSpec] = {}
         for model_fqn, prepared_fqn in model_fqn_map.parameters.items():
-            spec = plan.match(model_fqn)
+            spec = resolve(model_fqn)
             if isinstance(spec, FSDPPlanSpec):
+                # A vision pattern naturally matches both a module and its
+                # parameters (e.g. "model.visual"). Pattern-level validation
+                # above only requires a winning module; the vision spec is
+                # simply inert on parameter entries, matching upstream behavior.
                 parameters[prepared_fqn] = spec
+
+        unmatched_user_patterns = [
+            pattern for pattern in user_patterns if pattern not in matched_user_patterns
+        ]
+        if unmatched_user_patterns:
+            logger.warning_rank0(
+                "User parallel plan patterns matched no model FQNs: %s",
+                unmatched_user_patterns,
+            )
+
+        summary_entries = [
+            (prepared_fqn, _plan_spec_summary(spec))
+            for prepared_fqn, spec in modules.items()
+        ]
+        compressed = _compress_fqn_runs(summary_entries)
+        if compressed:
+            # Keep lines bounded for very large models while still showing every
+            # distinct effective spec group.
+            chunk_size = 20
+            for start in range(0, len(compressed), chunk_size):
+                logger.info_rank0(
+                    "Effective parallel plan: %s",
+                    "; ".join(compressed[start : start + chunk_size]),
+                )
+
         return _ResolvedFSDPPlan(
             modules=MappingProxyType(modules),
             parameters=MappingProxyType(parameters),
@@ -426,7 +600,7 @@ class FSDP2Backend(BaseBackend):
 
         world_group = dist.group.WORLD
         for param in no_shard_params:
-            if not param.requires_grad:
+            if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                 continue
 
             def _grad_hook(p):
@@ -440,6 +614,7 @@ class FSDP2Backend(BaseBackend):
         model: nn.Module,
         parallel_plan: Any = None,
         peft_config: Any = None,
+        on_parallelized: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         if parallel_plan is None:
             plan = FSDPParallelPlan()
@@ -457,6 +632,12 @@ class FSDP2Backend(BaseBackend):
 
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
+        from torchturbo.models.deepseek_v41.host_offload_embedding import TorchHostOffloadEmbedding
+
+        self._engram_tables = tuple(
+            module for module in model.modules()
+            if isinstance(module, TorchHostOffloadEmbedding)
+        )
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:
@@ -464,6 +645,11 @@ class FSDP2Backend(BaseBackend):
 
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
+
+        if self.config.mega_moe:
+            from ....optimizations.mega_moe.integration import install
+
+            install(model, self.config, self.get_ep_info()["ep_group"])
 
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
@@ -475,6 +661,12 @@ class FSDP2Backend(BaseBackend):
                 sp_info["sp_size"],
                 sp_info["sp_rank"],
             )
+
+        # Sequence-parallel forward patches are class-level replacements. Run
+        # the model hook before activation checkpointing so a checkpointed
+        # module captures the patched forward instead of the pre-SP one.
+        if on_parallelized is not None:
+            on_parallelized(model)
 
         # Freeze model-authored patterns into exact targets before later
         # transformations can add wrappers or replace parameter objects.
@@ -532,6 +724,7 @@ class FSDP2Backend(BaseBackend):
             parallel_context=self.get_parallel_context(),
             device_runtime=self.device_runtime,
             cpu_offload=offload.enabled and offload.mode is CPUOffloadMode.FULL,
+            get_engram_optimizer=lambda: self.engram_optimizer,
             # The manager is created before prepare_optimizer().
             require_optimizer_not_suspended=(
                 lambda: self._optimizer_memory.require_not_suspended()
@@ -656,6 +849,10 @@ class FSDP2Backend(BaseBackend):
             if unit.reshard_after_forward is not None:
                 target_fsdp_kwargs["reshard_after_forward"] = (
                     unit.reshard_after_forward
+                )
+            if unit.cast_forward_inputs is not None and mp_policy is not None:
+                target_fsdp_kwargs["mp_policy"] = replace(
+                    mp_policy, cast_forward_inputs=unit.cast_forward_inputs,
                 )
             if mp_policy is not None and any(
                 module in expert_modules for module in unit.modules
@@ -856,6 +1053,22 @@ class FSDP2Backend(BaseBackend):
             )
             return model
 
+        # Nested checkpoint regions double-recompute and are almost always an
+        # accidental container/submodule override conflict. Reject them early
+        # instead of silently wrapping both regions.
+        target_fqn_set = {fqn for fqn, _ in target_modules}
+        for fqn, _ in target_modules:
+            prefix = fqn
+            while "." in prefix:
+                prefix = prefix.rsplit(".", 1)[0]
+                if prefix in target_fqn_set:
+                    raise ValueError(
+                        "Nested activation checkpoint targets: "
+                        f"{prefix!r} and {fqn!r} are both enabled. Keep the "
+                        "outer module and remove the inner rule, or set the "
+                        "outer module's activation_checkpoint to false."
+                    )
+
         # TorchTurbo owns activation checkpointing here. Make sure HF's own
         # GradientCheckpointingLayer base class does not ALSO checkpoint its
         # __call__: that would double-checkpoint and, worse, re-enter the FSDP
@@ -895,6 +1108,13 @@ class FSDP2Backend(BaseBackend):
             )
 
             use_reentrant = self.config.activation_checkpointing.use_reentrant
+            checkpoint_fn = (
+                checkpoint_with_large_input_offload
+                if self.config.activation_checkpointing.offload_large_inputs_to_cpu
+                else checkpoint_with_cpu_input
+                if self.config.activation_checkpointing.offload_input_to_cpu
+                else checkpoint
+            )
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -926,7 +1146,7 @@ class FSDP2Backend(BaseBackend):
                     return nullcontext(), recompute_context(module, False, replay_inputs)
 
                 if not use_reentrant:
-                    return checkpoint(
+                    return checkpoint_fn(
                         base_fn,
                         *args,
                         use_reentrant=False,
@@ -966,12 +1186,12 @@ class FSDP2Backend(BaseBackend):
                             # skips every trainable parameter (disabled LoRA).
                             return (*outputs, _grad_anchor, is_tuple)
 
-                        *outputs, _, is_tuple = checkpoint(
+                        *outputs, _, is_tuple = checkpoint_fn(
                             run_with_grad_anchor, grad_anchor, *args, use_reentrant=True
                         )
                         return tuple(outputs) if is_tuple else outputs[0]
 
-                return checkpoint(
+                return checkpoint_fn(
                     run_fn,
                     *args,
                     use_reentrant=True,
@@ -1229,6 +1449,7 @@ class FSDP2Backend(BaseBackend):
             modules: nn.Module | list[nn.Module],
             mesh: Any,
             reshard_after_forward: bool | None = None,
+            cast_forward_inputs: bool | None = None,
         ) -> None:
             modules = modules if isinstance(modules, list) else [modules]
             unit_ids = {id(module) for module in modules}
@@ -1239,6 +1460,7 @@ class FSDP2Backend(BaseBackend):
                     modules=modules,
                     mesh=mesh,
                     reshard_after_forward=reshard_after_forward,
+                    cast_forward_inputs=cast_forward_inputs,
                 )
             )
             wrapped_modules.update(unit_ids)
@@ -1274,7 +1496,7 @@ class FSDP2Backend(BaseBackend):
             explicit_subtree_modules.update(
                 id(child) for child in submodule.modules()
             )
-            _add_unit(submodule, target_mesh)
+            _add_unit(submodule, target_mesh, cast_forward_inputs=spec.cast_forward_inputs)
 
         # Default policy: each ModuleList child is a world-mesh FSDP unit.
         # Iterate reversed: named_modules() is a pre-order DFS (ancestors before
@@ -1294,7 +1516,10 @@ class FSDP2Backend(BaseBackend):
                 # split ModuleList children inside that explicitly wrapped subtree.
                 if id(child) in explicit_subtree_modules:
                     continue
-                _add_unit(child, self._world_mesh)
+                child_spec = plan.modules.get(f"{fqn}.{idx}")
+                _add_unit(child, self._world_mesh, cast_forward_inputs=(
+                    child_spec.cast_forward_inputs if isinstance(child_spec, FSDPPlanSpec) else None
+                ))
 
         units = self._optimize_fsdp_units(model, units)
         self._apply_fsdp(model=model, units=units, fsdp_kwargs=fsdp_kwargs)
@@ -1394,6 +1619,14 @@ class FSDP2Backend(BaseBackend):
         if not isinstance(plan, OptimizerPlan):
             raise TypeError("plan must be an OptimizerPlan")
 
+        self._engram_tables = tuple(table for table in self._engram_tables if table.weight.requires_grad)
+        if self._engram_tables:
+            if not isinstance(plan, OptimizerClassPlan) or plan.optimizer_cls is not torch.optim.AdamW:
+                raise ValueError("Engram training requires dense AdamW.")
+            offload = self.fsdp_config.cpu_offload
+            if offload.enabled and offload.mode is CPUOffloadMode.FULL:
+                raise ValueError("Engram training does not support full CPU offload.")
+
         if isinstance(plan, OptimizerClassPlan):
             groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
             expected_names = (plan.optimizer_name,)
@@ -1469,6 +1702,16 @@ class FSDP2Backend(BaseBackend):
             self.device_runtime,
             qk_clip_controller,
         )
+        if self._engram_tables:
+            from .optimizers.engram import EngramOptimizer
+
+            self.engram_optimizer = EngramOptimizer(
+                self._engram_tables, self._mesh["edp"].get_group(), self.device_runtime.device,
+            )
+            optimizer.register_step_pre_hook(
+                lambda _optimizer, _args, _kwargs: self.engram_optimizer.prepare_gradients()
+            )
+            optimizer.register_step_post_hook(self.engram_optimizer.after_step)
         return optimizer
 
     def offload_optimizer(self) -> None:
@@ -1498,7 +1741,7 @@ class FSDP2Backend(BaseBackend):
                 "ignored": [],
             }
             for param in param_group["params"]:
-                if not param.requires_grad:
+                if not param.requires_grad or getattr(param, "_engram_host_offload", False):
                     continue
                 if isinstance(param, DTensor):
                     if param.device_mesh == edp:
@@ -1624,6 +1867,11 @@ class FSDP2Backend(BaseBackend):
 
     @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        engram = self.engram_optimizer
+        if engram is not None:
+            if norm_type != 2.0:
+                raise ValueError("Engram training supports global L2 gradient clipping.")
+            engram.prepare_gradients()
         offload = self.fsdp_config.cpu_offload
         params = []
         grads = []
@@ -1666,6 +1914,8 @@ class FSDP2Backend(BaseBackend):
             edp_total_norm_list.append(edp_total_norm)
 
         all_norms = edp_total_norm_list
+        if engram is not None:
+            all_norms.append(engram.norm().to(self.device).unsqueeze(0))
         if grads:
             dp_total_norm = get_total_norm(grads, norm_type=norm_type)
             dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
@@ -1700,6 +1950,9 @@ class FSDP2Backend(BaseBackend):
             clip_grads_with_norm_(params, max_norm, total_norm)
         if ignored_params:
             clip_grads_with_norm_(ignored_params, max_norm, total_norm)
+
+        if engram is not None:
+            engram.scale(float((max_norm / (total_norm + 1e-6)).clamp(max=1)))
 
         return total_norm
 

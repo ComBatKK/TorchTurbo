@@ -17,6 +17,7 @@ from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 from . import packing_utils as pu
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+from torchturbo.engine.peft.weights import get_effective_weight
 from torchturbo.runtime import is_npu_available
 
 from ..base import TurboModel
@@ -130,6 +131,11 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
     @wraps(DeepseekV4ForCausalLM.forward)
     def forward(self, *args, **kwargs):
+        logits_to_keep = kwargs.pop("logits_to_keep", 0)
+        assert isinstance(logits_to_keep, int) and logits_to_keep == 0, (
+            "DeepSeek V4 logits_to_keep is disabled: NPU RMSNorm backward "
+            "does not support empty selections. Set use_logits_to_keep=False."
+        )
         lm_head = self._modules["head"]
         noop_lm_head = self.head
         if noop_lm_head is lm_head:
@@ -564,7 +570,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             o = torch.cat([o_nope, o_rope], dim=-1)
 
             o = o.view(bsz, seqlen, n_local_groups, -1)
-            wo_a_weight = wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
+            wo_a_weight = get_effective_weight(wo_a).view(n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("bsgd,grd->bsgr", o, wo_a_weight)
             return wo_b(o.reshape(bsz, seqlen, -1))
 
