@@ -12,28 +12,20 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol
+
+from ....contracts.planner_contract import VenvSpec
 
 CPU_TORCH_VERSION = os.environ.get("CI_CPU_TORCH_VERSION", "2.10.0")
 READY_FILE = ".tt-ready.json"
-INSTALL_SCHEMA = "2"
+INSTALL_SCHEMA = "3"
 RUNTIME_DIR = Path("scripts/ci/execution/consumer/runtime")
-
-
-class VenvDefinition(Protocol):
-    name: str
-    python: str
-    requirements: tuple[str, ...]
-    overrides: tuple[str, ...]
-    extends: str | None
-    constraints: str
 
 
 @dataclass(frozen=True)
 class Venv:
     path: Path
     python: Path
-    spec: VenvDefinition
+    spec: VenvSpec
 
     def environment(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -47,56 +39,33 @@ class Venv:
 
 
 class VenvManager:
-    """Build or reuse one venv per (env definition, device) pair."""
+    """Build or reuse the venv selected by one Job."""
 
     def __init__(self, root: Path, cache_root: Path, device: str,
-                 log_path: Path, specs: Mapping[str, VenvDefinition]) -> None:
+                 log_path: Path, spec: VenvSpec) -> None:
         self.root = root
         self.cache_root = cache_root
         self.device = device
         self.log_path = log_path
-        self.specs = dict(specs)
-        self._memory: dict[str, Venv] = {}
+        self.spec = spec
 
-    def ensure(self, env_name: str) -> Venv:
-        if env_name in self._memory:
-            return self._memory[env_name]
-        spec = self.specs.get(env_name)
-        if spec is None:
-            raise ValueError(f"unknown environment: {env_name}")
-        chain = self._environment_chain(spec)
-        digest = self._profile_digest(spec, chain)
-        target = self.cache_root / f"{env_name}-{digest}"
-        ready = self._read_ready(target)
-        if ready is not None and not (target / "bin" / "python").is_file():
-            ready = None
-        if ready is None:
+    def ensure(self) -> Venv:
+        digest = self._profile_digest()
+        target = self.cache_root / f"{self.spec.name}-{digest}"
+        if not self._is_ready(target):
             if target.exists():
                 # A cancelled install leaves no marker. Start a fresh directory
                 # instead of deleting a shared cache entry.
-                target = self.cache_root / f"{env_name}-{digest}-retry-{time.time_ns()}"
-            self._install(target, spec, chain)
-        venv = Venv(path=target, python=target / "bin" / "python", spec=spec)
-        self._memory[env_name] = venv
-        return venv
+                target = self.cache_root / f"{self.spec.name}-{digest}-retry-{time.time_ns()}"
+            self._install(target)
+        return Venv(path=target, python=target / "bin" / "python", spec=self.spec)
 
-    def _environment_chain(self, spec: VenvDefinition) -> list[VenvDefinition]:
-        chain: list[VenvDefinition] = []
-        seen: set[str] = set()
-        current: VenvDefinition | None = spec
-        while current is not None:
-            if current.name in seen:
-                raise ValueError(f"environment cycle at {current.name}")
-            seen.add(current.name)
-            chain.append(current)
-            current = self.specs.get(current.extends) if current.extends else None
-        return list(reversed(chain))
-
-    def _profile_digest(self, spec: VenvDefinition,
-                        chain: list[VenvDefinition]) -> str:
+    def _profile_digest(self) -> str:
+        spec = self.spec
         digest = hashlib.sha256()
         digest.update(f"schema={INSTALL_SCHEMA}\n".encode())
         digest.update(f"device={self.device}\n".encode())
+        digest.update(f"env={spec.name}\n".encode())
         digest.update(f"python={spec.python}\n".encode())
         if self.device == "cpu":
             digest.update(f"torch={CPU_TORCH_VERSION}\n".encode())
@@ -105,32 +74,26 @@ class VenvManager:
         for relative in (
             Path("pyproject.toml"),
             RUNTIME_DIR / "venv_manager.py",
-            RUNTIME_DIR / "device.py",
         ):
             path = self.root / relative
             digest.update(f"file={relative.as_posix()}\n".encode())
             digest.update(path.read_bytes())
-        for item in chain:
-            digest.update(f"env={item.name}\n".encode())
-            digest.update(f"env-python={item.python}\n".encode())
-            for requirements in _requirement_paths(item):
-                for path in _requirement_files(self.root / requirements):
-                    name = path.relative_to(self.root).as_posix()
-                    digest.update(f"file={name}\n".encode())
-                    digest.update(path.read_bytes())
+        for requirements in (*spec.requirements, *spec.overrides):
+            for path in _requirement_files(self.root / requirements):
+                name = path.relative_to(self.root).as_posix()
+                digest.update(f"file={name}\n".encode())
+                digest.update(path.read_bytes())
         return digest.hexdigest()[:16]
 
-    def _read_ready(self, path: Path) -> dict | None:
-        marker = path / READY_FILE
-        if not marker.is_file():
-            return None
+    def _is_ready(self, path: Path) -> bool:
         try:
-            return json.loads(marker.read_text(encoding="utf-8"))
+            json.loads((path / READY_FILE).read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None
+            return False
+        return (path / "bin" / "python").is_file()
 
-    def _install(self, target: Path, spec: VenvDefinition,
-                 chain: list[VenvDefinition]) -> None:
+    def _install(self, target: Path) -> None:
+        spec = self.spec
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         base_python = _base_python(spec.python)
@@ -145,30 +108,17 @@ class VenvManager:
         environment = venv.environment()
         if self.device == "cpu":
             self._pip(venv, ["install", f"torch=={CPU_TORCH_VERSION}"])
-        self._run(
-            [str(venv.python), str(self.root / RUNTIME_DIR / "device.py"),
-             "probe", "--device", self.device,
-             "--file", str(target / "torch-before.json")],
-            cwd=self.root, environment=environment,
-        )
 
         constraints = target / "ci-constraints.txt"
         constraints.write_text(self._constraints(venv, environment), encoding="utf-8")
-        for item in chain:
-            for requirements in _requirement_paths(item):
-                self._pip(venv, [
-                    "install", "-r", str(self.root / requirements),
-                    "-c", str(constraints),
-                ])
+        for requirements in (*spec.requirements, *spec.overrides):
+            self._pip(venv, [
+                "install", "-r", str(self.root / requirements),
+                "-c", str(constraints),
+            ])
 
         self._pip(venv, ["install", "--no-build-isolation", "--no-deps",
                          "-e", str(self.root)])
-        self._run(
-            [str(venv.python), str(self.root / RUNTIME_DIR / "device.py"),
-             "check", "--device", self.device,
-             "--file", str(target / "torch-before.json")],
-            cwd=self.root, environment=environment,
-        )
         ready = {
             "env": spec.name,
             "device": self.device,
@@ -243,7 +193,3 @@ def _requirement_files(path: Path) -> list[Path]:
             if value.startswith("-r "):
                 pending.append(current.parent / value[3:].strip())
     return files
-
-
-def _requirement_paths(spec: VenvDefinition) -> tuple[str, ...]:
-    return (*spec.requirements, *spec.overrides)

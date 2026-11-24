@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R5 后当前生产代码：6101 行
+- R6 后当前生产代码：5758 行
 - 目标生产代码：不超过 4500 行
-- R5 后剩余需要减少：约 1600 行，约 26%
+- R6 后剩余需要减少：约 1258 行，约 22%
 
 统计命令：
 
@@ -110,21 +110,21 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `execution/producer/config.py` | 619 | 560 | -59 |
 | `execution/producer/planner.py` | 592 | 580 | -12 |
 | `tools/lint.py` | 590 | 480 | -110 |
-| `execution/consumer/executor.py` | 539 | 520 | -19 |
+| `execution/consumer/executor.py` | 495 | 495 | 0 |
 | `execution/producer/facts.py` | 445 | 440 | -5 |
-| `execution/consumer/runtime/model_dataset.py` | 411 | 270 | -141 |
+| `execution/consumer/runtime/model_dataset.py` | 328 | 320 | -8 |
 | `execution/finalization/gate.py` | 339 | 300 | -39 |
 | `image/build_image.py` | 383 | 270 | -113 |
-| `execution/consumer/runtime/device.py` | 262 | 230 | -32 |
-| `execution/consumer/runtime/venv_manager.py` | 249 | 210 | -39 |
+| `execution/consumer/runtime/device_probe.py` | 21 | 21 | 0 |
+| `execution/consumer/runtime/venv_manager.py` | 195 | 195 | 0 |
 | `image/image_config.py` | 214 | 200 | -14 |
-| `contracts/planner_contract.py` | 147 | 110 | -37 |
+| `contracts/planner_contract.py` | 146 | 110 | -36 |
 | `execution/producer/cli.py` | 153 | 80 | -73 |
 | `contracts/executor_contract.py` | 149 | 100 | -49 |
 | `image/registry.py` | 135 | 110 | -25 |
 | `image/cli.py` | 130 | 70 | -60 |
 | `tools/json_io.py` | 129 | 60 | -69 |
-| `execution/consumer/process.py` | 78 | 70 | -8 |
+| `execution/consumer/process.py` | 159 | 159 | 0 |
 | `contracts/image_contract.py` | 75 | 50 | -25 |
 | `image/select_images.py` | 72 | 50 | -22 |
 | `execution/producer/matrix.py` | 67 | 30 | -37 |
@@ -364,15 +364,44 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### R6. Runtime 轻量化
 
-目标：`model_dataset.py` 从 411 行降到约 270 行，其他 runtime 小幅收敛。
+状态：已完成。
+
+原目标：`model_dataset.py` 从 411 行降到约 270 行，其他 runtime 小幅收敛。
+实际：6101 -> 5758，净减少 343 行。
 
 措施：
 
 - Hugging Face 和 ModelScope 共用：
   `_remote_args()`、`_remote_file()`、`_remote_error()`。
 - 删除重复的 `snapshot_download` 调用分支。
-- device probe/check/cleanup 只保留当前 NPU/CPU/GPU 实际路径。
-- venv manager 删除重复的 ready 文件读取和错误包装。
+- `model_dataset` 用字段表统一 model/tokenizer/dataset 解析。
+- 删除原 install guard（torch 前后快照/check）。venv constraints 已固定
+  torch/numpy，`versions.txt` 记录最终版本。
+- `runtime/device_probe.py` 只保留 CPU/NPU/GPU 可用性断言，Executor 只负责
+  执行 probe command。
+- cleanup 从 venv 子进程移到 `process.cleanup_environment()`，只清理
+  `/tmp/tblf-sft` 训练输出，不触碰 CI 结果目录。
+- venv manager 删除 `extends` chain、多 spec 查找和重复 ready 读取，
+  直接消费已解析的 `VenvSpec`。
+- 删除无消费者的 `resources.venvs.*.constraints`。
+
+结果：
+
+| 文件 | R6 前 | R6 后 | 变化 |
+|---|---:|---:|---:|
+| `execution/consumer/runtime/model_dataset.py` | 411 | 328 | -83 |
+| `execution/consumer/runtime/venv_manager.py` | 249 | 195 | -54 |
+| `execution/consumer/runtime/device_probe.py` | 262 | 21 | -241 |
+| `execution/consumer/process.py` | 78 | 159 | +81 |
+| `execution/consumer/executor.py` | 539 | 495 | -44 |
+| consumer + finalization | 2060 | 1719 | -341 |
+| total | 6101 | 5758 | -343 |
+
+验证：
+
+- CPU 侧 `import torch` 冒烟通过。
+- cleanup 完整输出保留、部分输出清理、CI 结果目录不被删除三条行为已验证。
+- 164 个测试通过。
 
 ### R7. 镜像域收敛
 
@@ -449,15 +478,15 @@ git diff --check
 
 ### Phase 4：Executor + Gate + Runtime
 
-- 状态：R5 安全版已完成；R6 待做。
+- 状态：R5、R6 已完成。
 - R5 结果：6195 -> 6101。
-- R6 目标：6101 -> 约 5850。
+- R6 结果：6101 -> 5758。
 - 验证失败结果、skip、timeout、artifact、pytest evidence。
 
 ### Phase 5：Image + Tools
 
-- 目标：约 5850 -> 不超过 4500。
-- 处理 R7、R8。
+- 目标：5758 -> 不超过 4500。
+- 处理 R7、R8、R9。
 - 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。
 

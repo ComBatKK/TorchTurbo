@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -76,3 +78,82 @@ def timeout_budget(deadline: float, requested_seconds: int) -> tuple[int, bool]:
     """Return the timeout allowed by both the task and remaining job budget."""
     remaining = max(0, int(deadline - time.monotonic()))
     return min(requested_seconds, remaining), remaining < requested_seconds
+
+
+CLEANUP_TIMEOUT_SECONDS = 20
+TRAINING_OUTPUT_DIR = Path("/tmp/tblf-sft")
+TRAIN_PROCS = "run_lf\\.py|run_swift\\.py|torchrun|deepspeed"
+TMP_PATTERNS = (
+    "tt_*.yaml",
+    "tt_pytest_files.txt",
+    "train.log",
+    "after.txt",
+    "pytest.log",
+    "pytest.xml",
+    "turbo.log",
+)
+
+
+def _cleanup_run(command: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=CLEANUP_TIMEOUT_SECONDS,
+    )
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def cleanup_environment(log_path: Path) -> None:
+    """Best-effort cleanup after an NPU job, including failed or timed out runs."""
+    lines = ["=== env cleanup ==="]
+    try:
+        left = _cleanup_run(["pgrep", "-af", TRAIN_PROCS])
+        if left.returncode == 0 and left.stdout.strip():
+            lines += ["--- leftover processes ---", left.stdout.strip()]
+            _cleanup_run(["pkill", "-9", "-f", TRAIN_PROCS])
+        else:
+            lines.append("no leftover training process")
+
+        if shutil.which("npu-smi"):
+            mem = _cleanup_run(["npu-smi", "info", "-t", "memory"])
+            if mem.stdout:
+                lines += [
+                    "--- npu-smi memory ---",
+                    *mem.stdout.splitlines()[:20],
+                ]
+
+        for pattern in TMP_PATTERNS:
+            for path in Path("/tmp").glob(pattern):
+                _remove(path)
+
+        if TRAINING_OUTPUT_DIR.is_dir():
+            if (TRAINING_OUTPUT_DIR / ".tt-complete").is_file():
+                lines.append(
+                    f"checkpoint complete marker found, keeping {TRAINING_OUTPUT_DIR}"
+                )
+            else:
+                lines.append(
+                    f"no completeness marker, clearing partial output "
+                    f"in {TRAINING_OUTPUT_DIR}"
+                )
+                for child in TRAINING_OUTPUT_DIR.iterdir():
+                    _remove(child)
+        lines.append("=== env cleanup done ===")
+    except (OSError, subprocess.SubprocessError) as exc:
+        lines.append(f"::warning::environment cleanup failed: {exc}")
+
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(text)
+    except OSError as exc:
+        print(f"::warning::could not write cleanup log: {exc}", file=sys.stderr)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from scripts.ci.execution.consumer import executor
 from scripts.ci.execution.consumer import process
 from scripts.ci.execution.consumer import integration_job
 from scripts.ci.execution.consumer import pytest_job
+from scripts.ci.execution.consumer.runtime import device_probe
 from scripts.ci.contracts.executor_contract import (
     load_job_result,
 )
@@ -31,7 +33,7 @@ def _patch_execution(monkeypatch, tmp_path: Path, job) -> list[tuple]:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def ensure(self, env_name: str) -> Venv:
+        def ensure(self) -> Venv:
             return _fake_venv(tmp_path, job)
 
     monkeypatch.setattr(executor, "VenvManager", FakeManager)
@@ -40,7 +42,7 @@ def _patch_execution(monkeypatch, tmp_path: Path, job) -> list[tuple]:
     cleanup_calls: list[tuple] = []
     monkeypatch.setattr(
         executor,
-        "_cleanup_environment",
+        "cleanup_environment",
         lambda *args: cleanup_calls.append(args),
     )
     return cleanup_calls
@@ -52,6 +54,12 @@ def _write_junit(path: Path) -> None:
         '<testsuite tests="2" failures="0" errors="0" skipped="1"></testsuite>\n',
         encoding="utf-8",
     )
+
+
+def test_probe_command_selects_device_code(tmp_path: Path) -> None:
+    command = device_probe.probe_command(tmp_path / "python", "npu")
+    assert command[:2] == [str(tmp_path / "python"), "-c"]
+    assert "torch.npu.is_available()" in command[2]
 
 
 def _plan_with_allowed_skip(plan, job_id: str, reason: str):
@@ -210,7 +218,7 @@ def test_environment_failure_still_writes_result(tmp_path: Path, monkeypatch, pr
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def ensure(self, env_name: str) -> Venv:
+        def ensure(self) -> Venv:
             raise RuntimeError("venv install failed")
 
     monkeypatch.setattr(executor, "VenvManager", FakeManager)
@@ -291,6 +299,49 @@ def test_npu_job_cleans_up_environment(tmp_path: Path, monkeypatch, pr_plan) -> 
 
     assert result.status == "passed"
     assert len(cleanup_calls) == 1
+
+
+def _patch_cleanup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        process,
+        "_cleanup_run",
+        lambda command: subprocess.CompletedProcess(command, 1, "", ""),
+    )
+    monkeypatch.setattr(process.shutil, "which", lambda name: None)
+    monkeypatch.setattr(process, "TMP_PATTERNS", ())
+
+
+def test_cleanup_environment_clears_partial_output(tmp_path, monkeypatch) -> None:
+    _patch_cleanup(monkeypatch)
+    training_dir = tmp_path / "training"
+    training_dir.mkdir()
+    (training_dir / "partial").write_text("partial", encoding="utf-8")
+    result_dir = tmp_path / "result"
+    result_dir.mkdir()
+    (result_dir / "job-result.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(process, "TRAINING_OUTPUT_DIR", training_dir)
+    log_path = tmp_path / "job.log"
+
+    process.cleanup_environment(log_path)
+
+    assert not (training_dir / "partial").exists()
+    assert (result_dir / "job-result.json").is_file()
+    assert "clearing partial output" in log_path.read_text(encoding="utf-8")
+
+
+def test_cleanup_environment_keeps_complete_output(tmp_path, monkeypatch) -> None:
+    _patch_cleanup(monkeypatch)
+    training_dir = tmp_path / "training"
+    training_dir.mkdir()
+    (training_dir / ".tt-complete").write_text("", encoding="utf-8")
+    (training_dir / "keep").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(process, "TRAINING_OUTPUT_DIR", training_dir)
+    log_path = tmp_path / "job.log"
+
+    process.cleanup_environment(log_path)
+
+    assert (training_dir / "keep").is_file()
+    assert "keeping" in log_path.read_text(encoding="utf-8")
 
 
 def test_timeout_budget_caps_at_job_deadline(monkeypatch) -> None:

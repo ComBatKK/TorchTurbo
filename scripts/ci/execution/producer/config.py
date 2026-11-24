@@ -295,7 +295,7 @@ def _load_venvs(
         row = _row(
             value,
             path,
-            {"python", "requirements", "overrides", "extends", "constraints"},
+            {"python", "requirements", "overrides", "extends"},
             issues,
         )
         requirements = _strings(row.get("requirements"), f"{path}.requirements", issues)
@@ -309,7 +309,6 @@ def _load_venvs(
             requirements=requirements,
             overrides=overrides,
             extends=str(row.get("extends") or "") or None,
-            constraints=str(row.get("constraints") or "auto"),
         )
         if not local[name].python:
             issues.append(_issue(f"{path}.python", "python version is required"))

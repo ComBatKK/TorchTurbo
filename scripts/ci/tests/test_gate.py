@@ -369,7 +369,7 @@ def _write_cli_inputs(tmp_path, plan, results):
     ).to_dict())
     for result in results:
         write_json(results_dir / result.job_id / "job-result.json", result.to_dict())
-    write_json(results_dir / "diagnostics" / "torch-before.json", {"torch_ok": True})
+    write_json(results_dir / "diagnostics" / "environment.json", {"torch_ok": True})
     return plan_path, results_dir
 
 

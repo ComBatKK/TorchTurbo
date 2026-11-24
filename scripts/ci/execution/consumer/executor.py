@@ -29,7 +29,8 @@ from ...contracts.planner_contract import (
 )
 from ...tools.json_io import canonical_json, write_json
 from . import integration_job, pytest_job
-from .process import run_stream, timeout_budget
+from .process import cleanup_environment, run_stream, timeout_budget
+from .runtime.device_probe import probe_command
 from .runtime.venv_manager import Venv, VenvManager
 
 
@@ -38,8 +39,6 @@ class ExecutorError(ValueError):
 
 
 PROBE_TIMEOUT_SECONDS = 300
-CLEANUP_TIMEOUT_SECONDS = 60
-DEVICE_SCRIPT = Path("scripts/ci/execution/consumer/runtime/device.py")
 
 
 def _task_result(
@@ -133,20 +132,11 @@ def _probe_environment(
     job: Job,
     *,
     root: Path,
-    output_dir: Path,
     log_path: Path,
     timeout_seconds: int,
 ) -> tuple[int, bool]:
     return run_stream(
-        [
-            str(venv.python),
-            str(root / DEVICE_SCRIPT),
-            "probe",
-            "--device",
-            job.runtime.device,
-            "--file",
-            str(output_dir / "torch-before.json"),
-        ],
+        probe_command(venv.python, job.runtime.device),
         cwd=root,
         environment=venv.environment(),
         log_path=log_path,
@@ -154,49 +144,20 @@ def _probe_environment(
     )
 
 
-def _cleanup_environment(venv: Venv, root: Path, log_path: Path) -> None:
-    """Best-effort cleanup after an NPU job, including failed or timed out runs."""
-    try:
-        result = subprocess.run(
-            [
-                str(venv.python),
-                str(root / DEVICE_SCRIPT),
-                "cleanup",
-            ],
-            cwd=root,
-            env=venv.environment(),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=CLEANUP_TIMEOUT_SECONDS,
-        )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as log:
-            log.write(result.stdout)
-            log.write(result.stderr)
-        if result.returncode != 0:
-            print(
-                f"::warning::environment cleanup exited with {result.returncode}",
-                file=sys.stderr,
-            )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"::warning::environment cleanup failed: {exc}", file=sys.stderr)
-
-
 def _prepare_environment(
     job: Job,
     *,
     root: Path,
-    output_dir: Path,
     venv_root: Path,
     log_path: Path,
     deadline: float,
 ) -> tuple[Venv | None, str, Failure | None]:
     """Install the planned venv and probe the planned runtime."""
     try:
-        specs = {job.runtime.venv.name: job.runtime.venv}
-        manager = VenvManager(root, venv_root, job.runtime.device, log_path, specs)
-        venv = manager.ensure(job.runtime.venv.name)
+        manager = VenvManager(
+            root, venv_root, job.runtime.device, log_path, job.runtime.venv
+        )
+        venv = manager.ensure()
         probe_limit, probe_limited = timeout_budget(deadline, PROBE_TIMEOUT_SECONDS)
         if probe_limit == 0:
             return venv, "failed", _job_timeout_failure(job)
@@ -204,7 +165,6 @@ def _prepare_environment(
             venv,
             job,
             root=root,
-            output_dir=output_dir,
             log_path=log_path,
             timeout_seconds=probe_limit,
         )
@@ -392,7 +352,6 @@ def execute_job(
     venv, status, failure = _prepare_environment(
         job,
         root=root,
-        output_dir=output_dir,
         venv_root=venv_root,
         log_path=log_path,
         deadline=deadline,
@@ -407,7 +366,7 @@ def execute_job(
             deadline=deadline,
         )
     if venv is not None and job.runtime.device == "npu":
-        _cleanup_environment(venv, root, log_path)
+        cleanup_environment(log_path)
 
     integration_job.prune_artifacts(output_dir)
     pytest_job.merge_reports(junit_paths, merged_junit)
@@ -422,9 +381,6 @@ def execute_job(
         artifact_paths["junit"] = merged_junit.name
     if job.kind == "integration" and (output_dir / "integration").is_dir():
         artifact_paths["integration"] = "integration"
-    torch_before = output_dir / "torch-before.json"
-    if torch_before.is_file():
-        artifact_paths["torch-before"] = torch_before.name
     if versions_path.is_file():
         artifact_paths["versions"] = versions_path.name
     result = _job_result(

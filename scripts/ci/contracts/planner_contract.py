@@ -24,7 +24,6 @@ class VenvSpec(Contract):
     requirements: tuple[str, ...]
     overrides: tuple[str, ...]
     extends: str | None
-    constraints: str
 
 
 @dataclass(frozen=True)
