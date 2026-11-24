@@ -28,14 +28,11 @@ def _read_paths(path: str) -> list[str]:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     changed = _read_paths(args.changed_files) if args.changed_files else None
-    specs = select_images(
-        repository_path(args.root), image_ids=args.images, changed_files=changed
-    )
-    matrix = {
-        "include": [
-            {"image_id": spec.image_id, "target": spec.target} for spec in specs
-        ]
-    }
+    specs = select_images(repository_path(args.root), image_ids=args.images,
+                          changed_files=changed)
+    matrix = {"include": [
+        {"image_id": spec.image_id, "target": spec.target} for spec in specs
+    ]}
     write_json_output(args.output, matrix)
     append_github_output(
         {
@@ -49,13 +46,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    result = get_or_build_image(
-        repository_path(args.root),
-        args.image,
-        use_cache=not args.no_cache,
-        builder=args.builder,
-        jobs=args.max_jobs,
-    )
+    result = get_or_build_image(repository_path(args.root), args.image,
+                                use_cache=not args.no_cache,
+                                builder=args.builder, jobs=args.max_jobs)
     image = result.image
     write_json_output(args.output, result.to_dict())
     append_github_output(
@@ -75,13 +68,12 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 def cmd_promote(args: argparse.Namespace) -> int:
     result = promote_image(repository_path(args.root), args.image)
-    image = result.image
     write_json_output(args.output, result.to_dict())
     append_github_output(
         {
             "alias": result.alias,
-            "ref": image.ref,
-            "digest": image.digest,
+            "ref": result.image.ref,
+            "digest": result.image.digest,
             "promoted": "true",
         },
         args.github_output,

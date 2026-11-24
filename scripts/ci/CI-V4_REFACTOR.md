@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R6 后当前生产代码：5758 行
+- R7a 后当前生产代码：5626 行
 - 目标生产代码：不超过 4500 行
-- R6 后剩余需要减少：约 1258 行，约 22%
+- R7a 后剩余需要减少：约 1126 行，约 20%
 
 统计命令：
 
@@ -114,19 +114,19 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `execution/producer/facts.py` | 445 | 440 | -5 |
 | `execution/consumer/runtime/model_dataset.py` | 328 | 320 | -8 |
 | `execution/finalization/gate.py` | 339 | 300 | -39 |
-| `image/build_image.py` | 383 | 270 | -113 |
+| `image/build_image.py` | 279 | 270 | -9 |
 | `execution/consumer/runtime/device_probe.py` | 21 | 21 | 0 |
 | `execution/consumer/runtime/venv_manager.py` | 195 | 195 | 0 |
-| `image/image_config.py` | 214 | 200 | -14 |
+| `image/image_config.py` | 199 | 199 | 0 |
 | `contracts/planner_contract.py` | 146 | 110 | -36 |
 | `execution/producer/cli.py` | 153 | 80 | -73 |
 | `contracts/executor_contract.py` | 149 | 100 | -49 |
-| `image/registry.py` | 135 | 110 | -25 |
-| `image/cli.py` | 130 | 70 | -60 |
+| `image/registry.py` | 111 | 111 | 0 |
+| `image/cli.py` | 121 | 121 | 0 |
 | `tools/json_io.py` | 129 | 60 | -69 |
 | `execution/consumer/process.py` | 159 | 159 | 0 |
-| `contracts/image_contract.py` | 75 | 50 | -25 |
-| `image/select_images.py` | 72 | 50 | -22 |
+| `contracts/image_contract.py` | 69 | 69 | 0 |
+| `image/select_images.py` | 54 | 54 | 0 |
 | `execution/producer/matrix.py` | 67 | 30 | -37 |
 | `execution/finalization/timing.py` | 65 | 40 | -25 |
 | `execution/consumer/pytest_job.py` | 65 | 55 | -10 |
@@ -139,6 +139,8 @@ tools            lint、路径规则、JSON、CLI 小工具
 | 其他 `__init__.py` | 16 | 20 | +4 |
 
 分类预算：
+
+下表为 V4 初始预算；各阶段实际结果见第 5 节。
 
 | 分类 | 当前 | 目标 | 减少 |
 |---|---:|---:|---:|
@@ -405,16 +407,27 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### R7. 镜像域收敛
 
-目标：`image` 从 895 行降到约 630 行。
+状态：R7a 安全收敛完成；R7b 待做。
 
-措施：
+R7a 目标：不改 content identity、registry 查询、build、promote 语义，
+只压缩重复样板和未使用字段。
 
-- `build_image.py` 只保留 content identity、resolve、build、promote。
-- `ImageOutcome` 与 `ImageBuildResult` 合并。
-- `image_config.py` 删除重复的通用类型校验。
-- `registry.py` 只保留 SWR token、manifest 查询和 alias promote。
-- `image/cli.py` 复用 `tools/cli.py`，只保留命令编排。
-- 删除未使用的 manifest 字段和调试输出。
+R7a 结果：`image` 目录 894 -> 764（-130），
+`contracts/image_contract.py` 71 -> 69（-2）。
+
+R7a 措施：
+
+- 删除 `Manifest.reference` 和 `Manifest.raw` 两个未使用字段。
+- 压缩 `build_command()`、`max_jobs()`、`_run_build()`、outcome 和
+  promote 的重复样板。
+- 保留 `GIT_HTTP_USER_AGENT` 的 Dockerfile patch 形式，不改 content hash。
+- 压缩 `image_config` 的校验分支和错误文案。
+- `select_images` 与 `image/cli` 做轻量压缩；完整 CLI 统一归 R9。
+
+R7b 待做：
+
+- CLI 合并、ci.yml 解析共享、Dockerfile patch 前移等结构改造。
+- 原 630 行目标不作为 R7a 验收标准；在当前边界内需要跨模块改造。
 
 ### R8. Tools 与 lint 收敛
 
@@ -485,8 +498,8 @@ git diff --check
 
 ### Phase 5：Image + Tools
 
-- 目标：5758 -> 不超过 4500。
-- 处理 R7、R8、R9。
+- 状态：R7a 已完成；R7b、R8、R9 待做。
+- 目标：5626 -> 不超过 4500。
 - 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。
 

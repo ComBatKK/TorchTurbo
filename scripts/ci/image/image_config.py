@@ -87,17 +87,13 @@ def _as_dockerfile(value: Any, where: str) -> str:
     return path
 
 
-def _reject_unknown_keys(
-    value: Mapping[str, Any], allowed: set[str], where: str
-) -> None:
+def _reject_unknown_keys(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ImageError(f"{where} has unknown field(s): {', '.join(unknown)}")
 
 
-def _target_name(
-    image: Mapping[str, Any], where: str, targets: Mapping[str, Any]
-) -> str:
+def _target_name(image: Mapping[str, Any], where: str, targets: Mapping[str, Any]) -> str:
     target = _as_text(image.get("target"), f"{where}.target")
     if not isinstance(targets.get(target), dict):
         raise ImageError(f"resources.targets.{target} must be a mapping")
@@ -122,9 +118,7 @@ def _image_spec(
     if image.get("ref"):
         raise ImageError(f"{where}.ref is only valid for host images")
 
-    repository, alias = split_reference(
-        _as_text(publish.get("ref"), f"{publish_where}.ref")
-    )
+    repository, alias = split_reference(_as_text(publish.get("ref"), f"{publish_where}.ref"))
     dockerfile = _as_dockerfile(build.get("dockerfile"), f"{build_where}.dockerfile")
     if not (root / dockerfile).is_file():
         raise ImageError(f"{build_where}.dockerfile is missing: {dockerfile}")
@@ -148,9 +142,7 @@ def _image_spec(
 
 def _read_resources(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        document = yaml.safe_load(
-            (root / CI_CONFIG_PATH).read_text(encoding="utf-8")
-        )
+        document = yaml.safe_load((root / CI_CONFIG_PATH).read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ImageError(f"cannot read {CI_CONFIG_PATH}: {exc}") from exc
     config = _as_mapping(document, "ci")
@@ -167,26 +159,19 @@ def _load_entries(root: Path) -> list[tuple[RuntimeImage, ImageSpec | None]]:
     for image_id, raw_image in images.items():
         where = f"resources.images.{image_id}"
         image = _as_mapping(raw_image, where)
-        kind = image.get("kind")
-        if kind == "host":
+        if image.get("kind") == "host":
             _reject_unknown_keys(image, _HOST_IMAGE_KEYS, where)
-            runtime = RuntimeImage(
-                image_id,
-                _target_name(image, where, targets),
-                "host",
+            entries.append((RuntimeImage(
+                image_id, _target_name(image, where, targets), "host",
                 _as_text(image.get("ref"), f"{where}.ref"),
-            )
-            entries.append((runtime, None))
+            ), None))
             continue
-        if kind != "container":
+        if image.get("kind") != "container":
             raise ImageError(f"{where}.kind must be host or container")
         spec = _image_spec(root, image_id, image, targets)
         previous = by_dockerfile.get(spec.dockerfile)
         if previous is not None:
-            raise ImageError(
-                f"dockerfile {spec.dockerfile!r} maps to both {previous!r} and "
-                f"{image_id!r}"
-            )
+            raise ImageError(f"dockerfile {spec.dockerfile!r} maps to both {previous!r} and {image_id!r}")
         by_dockerfile[spec.dockerfile] = image_id
         entries.append((RuntimeImage(image_id, spec.target, "container"), spec))
     return entries

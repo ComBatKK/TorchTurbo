@@ -48,9 +48,7 @@ class ResolvedImage(Contract):
     @property
     def digest(self) -> str:
         """Return the OCI digest encoded in ref; host images have none."""
-        if self.kind == "host":
-            return ""
-        return self.ref.rpartition("@")[2]
+        return "" if self.kind == "host" else self.ref.rpartition("@")[2]
 
 
 @dataclass(frozen=True)

@@ -51,7 +51,7 @@ def _manifest(
     digest: str = DIGEST,
     media_type: str = DOCKER_V2,
 ) -> Manifest:
-    return Manifest(reference=reference, digest=digest, media_type=media_type, raw={})
+    return Manifest(digest=digest, media_type=media_type)
 
 
 def test_build_command_uses_content_tag_and_ci_build_args(repo_root: Path) -> None:
