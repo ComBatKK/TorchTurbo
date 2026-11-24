@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R3 后当前生产代码：6236 行
+- R4 后当前生产代码：6195 行
 - 目标生产代码：不超过 4500 行
-- R3 后剩余需要减少：约 1736 行，约 28%
+- R4 后剩余需要减少：约 1695 行，约 27%
 
 统计命令：
 
@@ -108,7 +108,7 @@ tools            lint、路径规则、JSON、CLI 小工具
 | 模块 | 当前 | 目标 | 减少 |
 |---|---:|---:|---:|
 | `execution/producer/config.py` | 619 | 560 | -59 |
-| `execution/producer/planner.py` | 633 | 430 | -203 |
+| `execution/producer/planner.py` | 592 | 580 | -12 |
 | `tools/lint.py` | 590 | 480 | -110 |
 | `execution/consumer/executor.py` | 575 | 420 | -155 |
 | `execution/producer/facts.py` | 445 | 440 | -5 |
@@ -288,17 +288,41 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### R4. Planner 数据化
 
-目标：`planner.py` 从 635 行降到约 430 行。
+状态：已完成（安全收敛版）。
 
-措施：
+目标：`planner.py` 从 633 行降到约 580 行；实际 592 行。
 
-- 用统一 selection 结构代替 `ScopeSelection` 与 `ImageSelection` 双模型。
-- pytest job 和 integration job 都通过同一组：
-  `select -> group -> materialize -> validate` 函数生成。
-- 删除重复的 `image_override` 校验和 unused area 检查。
-- 删除重复的 job ID 去重逻辑，生成时保证唯一。
-- 将 `build_execution_plan()` 和 `build_planner_output()` 收敛为一个小工厂。
-- 只保留当前 Scope 需要的 target filter 和 manual target-job 能力。
+原 430 行目标不现实：
+
+- `_pytest_jobs` 和 `_integration_jobs` 是实际的分组、runner 选择和
+  Job 生成逻辑，不是可删除的样板代码。
+- 删除 `image_override` 会破坏镜像 PR candidate tests。
+- 删除 target filter / `target-job` 会破坏 image pipeline preflight 和
+  手动调试。
+- 删除 used area / used selection 检查会让 Scope 配置错误静默少跑用例。
+
+实际措施：
+
+- 提取 `_active_selections()`，复用 `build_plan` 和 `requested_images`
+  的 selection + target 过滤。
+- 将 integration case 选择从 per-selection dict 压平为
+  `(selection, case)` 列表。
+- 收敛 `_selected_plan` 的 unknown 检查，预计算 wanted set。
+- 删除冗余的最终 Job ID 唯一性检查，保留 `_claim_job_id` 生成唯一 ID。
+- 压缩 pytest/integration Job 生成中的重复排版。
+- 保留 `image_override`、`targets`、`target-job`、used area 检查和
+  空 suite 检查。
+
+结果：`planner.py 633 -> 592`，净减少 41 行。
+
+验证：
+
+- PR 7 Job、nightly 12 Job。
+- target slice、`target-job`、image override、同 target 双镜像的 Plan
+  JSON 快照完全一致。
+- 157 个测试通过。
+
+剩余约 12 行留给 R4b；不通过删除行为继续压缩。
 
 ### R5. Executor 与 Gate 收敛
 
@@ -395,20 +419,22 @@ git diff --check
 
 ### Phase 3：Planner
 
-- 目标：约 5500 -> 约 5100。
-- 处理 R4。
+- 状态：R4 已完成。
+- 结果：6236 -> 6195。
+- 保留 image override、target filter、`target-job` 和覆盖校验。
 - 验证普通 PR 7 Job、docs-only 0 Job、nightly 12 Job。
 
 ### Phase 4：Executor + Gate + Runtime
 
-- 目标：约 5100 -> 约 4750。
+- 目标：约 6195 -> 约 5450。
 - 处理 R5、R6。
 - 验证失败结果、skip、timeout、artifact、pytest evidence。
 
 ### Phase 5：Image + Tools
 
-- 目标：约 4750 -> 不超过 4500。
+- 目标：约 5450 -> 不超过 4500。
 - 处理 R7、R8。
+- 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。
 
 ## 7. 验收标准
