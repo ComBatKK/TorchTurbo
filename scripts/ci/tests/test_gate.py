@@ -97,7 +97,7 @@ def test_docs_only_plan_passes_without_results(config, facts, source) -> None:
         "missing": 0,
         "unexpected": 0,
     }
-    assert all(check["status"] == "passed" for check in decision.checks)
+    assert decision.failures == ()
 
 
 def test_missing_result_fails(pr_plan) -> None:
@@ -166,6 +166,29 @@ def test_skip_reason_must_be_allowed(pr_plan) -> None:
     assert "skip-reason" in {failure["code"] for failure in decision.failures}
 
 
+def test_skipped_result_with_tasks_fails(pr_plan) -> None:
+    job = next(item for item in pr_plan.jobs if item.runtime.device == "npu")
+    allowed = _plan_with_allowed_skip(pr_plan, job.id, "maintenance")
+    results = _results(allowed)
+    index = next(i for i, result in enumerate(results) if result.job_id == job.id)
+    results[index] = replace(
+        results[index],
+        status="skipped",
+        failure=None,
+        skip_reason="maintenance",
+        skip_message="window",
+    )
+    decision = decide_plan(allowed, results)
+    assert "skip-tasks" in {failure["code"] for failure in decision.failures}
+
+
+def test_failed_result_without_detail_fails(pr_plan) -> None:
+    results = _results(pr_plan)
+    results[0] = replace(results[0], status="failed", tasks=(), failure=None)
+    decision = decide_plan(pr_plan, results)
+    assert "failed-detail" in {failure["code"] for failure in decision.failures}
+
+
 def test_pytest_without_tests_fails(pr_plan) -> None:
     results = _results(pr_plan)
     index = next(i for i, result in enumerate(results) if result.kind == "pytest")
@@ -215,6 +238,24 @@ def test_integration_without_artifact_fails(pr_plan) -> None:
     assert "integration-artifact" in {failure["code"] for failure in decision.failures}
 
 
+def _plan_with_jobs(pr_plan, jobs):
+    return build_execution_plan(
+        ci_type=pr_plan.ci_type,
+        change_mode=pr_plan.change_mode,
+        git_source=pr_plan.git_source,
+        jobs=jobs,
+    )
+
+
+def _route_job(source_job, source_task, runtime, suffix: str):
+    return replace(
+        source_job,
+        id=f"{source_job.id}-{suffix}",
+        runtime=runtime,
+        tasks=(replace(source_task, id=f"{source_job.id}-{suffix}/run"),),
+    )
+
+
 def test_same_pytest_file_on_distinct_targets_is_allowed(pr_plan) -> None:
     source_job = next(
         job for job in pr_plan.jobs
@@ -233,33 +274,77 @@ def test_same_pytest_file_on_distinct_targets_is_allowed(pr_plan) -> None:
                 target=target,
             ),
         )
-        return replace(
-            source_job,
-            id=f"{source_job.id}-{suffix}",
-            runtime=runtime,
-            tasks=(replace(source_task, id=f"{source_job.id}-{suffix}/run"),),
-        )
+        return _route_job(source_job, source_task, runtime, suffix)
 
-    jobs = (
-        target_job("npu-a3", "a3"),
-        target_job("npu-a5", "a5"),
+    plan = _plan_with_jobs(
+        pr_plan,
+        (
+            target_job("npu-a3", "a3"),
+            target_job("npu-a5", "a5"),
+        ),
     )
-    plan = build_execution_plan(
-        ci_type=pr_plan.ci_type,
-        change_mode=pr_plan.change_mode,
-        git_source=pr_plan.git_source,
-        jobs=jobs,
+    assert decide_plan(plan, _results(plan)).status == "passed"
+
+
+def test_same_pytest_file_on_distinct_images_is_allowed(pr_plan) -> None:
+    source_job = next(
+        job for job in pr_plan.jobs
+        if job.id == "pytest-core-npu-npu-a3-cann90-default"
+    )
+    source_task = source_job.tasks[0]
+    assert isinstance(source_task.spec, PytestSpec)
+
+    def image_job(image_id: str, suffix: str):
+        runtime = replace(
+            source_job.runtime,
+            image=replace(source_job.runtime.image, image_id=image_id),
+        )
+        return _route_job(source_job, source_task, runtime, suffix)
+
+    plan = _plan_with_jobs(
+        pr_plan,
+        (
+            image_job("npu-a3-cann90-image", "cann90"),
+            image_job("npu-a3-cann92-image", "cann92"),
+        ),
+    )
+    assert decide_plan(plan, _results(plan)).status == "passed"
+
+
+def test_same_pytest_file_on_same_image_route_fails(pr_plan) -> None:
+    source_job = next(
+        job for job in pr_plan.jobs
+        if job.id == "pytest-core-npu-npu-a3-cann90-default"
+    )
+    source_task = source_job.tasks[0]
+    assert isinstance(source_task.spec, PytestSpec)
+
+    def image_job(suffix: str):
+        runtime = replace(
+            source_job.runtime,
+            image=replace(
+                source_job.runtime.image,
+                image_id="npu-a3-cann90-image",
+            ),
+        )
+        return _route_job(source_job, source_task, runtime, suffix)
+
+    plan = _plan_with_jobs(
+        pr_plan,
+        (
+            image_job("first"),
+            image_job("second"),
+        ),
     )
     decision = decide_plan(plan, _results(plan))
-    assert decision.status == "passed"
-    assert "duplicate-route" not in {failure["code"] for failure in decision.failures}
+    assert decision.status == "failed"
+    assert "duplicate-route" in {failure["code"] for failure in decision.failures}
 
 
 def test_failed_planner_output_fails(pr_plan) -> None:
     output = build_planner_output(errors=())
     decision = decide_planner_output(output)
     assert decision.status == "failed"
-    assert decision.checks[0]["id"] == "planner.output"
     assert decision.failures[0]["code"] == "planner-output-missing-plan"
 
 

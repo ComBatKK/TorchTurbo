@@ -265,10 +265,8 @@ def _task_failure(
     if timed_out and time.monotonic() >= deadline:
         return _job_timeout_failure(job)
     code = "task-timeout" if timed_out else "task-failed"
-    message = (
-        f"task timed out after {task.timeout_minutes} minutes"
-        if timed_out else f"task exited with code {exit_code}"
-    )
+    message = (f"task timed out after {task.timeout_minutes} minutes"
+               if timed_out else f"task exited with code {exit_code}")
     return Failure(code=code, message=message)
 
 
@@ -288,10 +286,7 @@ def _execute_tasks(
         limit, _ = timeout_budget(deadline, task.timeout_minutes * 60)
         if limit == 0:
             results.append(_task_result(
-                task,
-                "failed",
-                124,
-                failure=_job_timeout_failure(job),
+                task, "failed", 124, failure=_job_timeout_failure(job)
             ))
             return "failed", results, junit_paths
         task_started = time.monotonic()
@@ -329,25 +324,15 @@ def _execute_tasks(
                 code="task-setup",
                 message=f"{type(exc).__name__}: {exc}",
             )
-        evidence = (
-            pytest_job.evidence(junit)
-            if junit is not None and junit.is_file()
-            else None
-        )
+        evidence = pytest_job.evidence(junit) if junit is not None and junit.is_file() else None
         results.append(_task_result(
-            task,
-            task_status,
-            exit_code,
-            evidence=evidence,
-            failure=task_failure,
+            task, task_status, exit_code, evidence=evidence, failure=task_failure
         ))
         if task_status != "passed":
             status = task_status
             elapsed = int(time.monotonic() - task_started)
-            print(
-                f"task {task.id} finished in {elapsed}s with status={task_status}",
-                flush=True,
-            )
+            print(f"task {task.id} finished in {elapsed}s with status={task_status}",
+                  flush=True)
             break
     return status, results, junit_paths
 
@@ -398,10 +383,8 @@ def execute_job(
     ))
     log_path.write_text("", encoding="utf-8")
     started = time.monotonic()
-    _write_result(
-        _provisional_result(plan, job, log_path=log_path),
-        output_dir,
-    )
+    provisional = _provisional_result(plan, job, log_path=log_path)
+    _write_result(provisional, output_dir)
     deadline = started + job.timeout_minutes * 60
     task_results: list[TaskResult] = []
     junit_paths: list[Path] = []
@@ -491,11 +474,7 @@ def render_summary(result: JobResult) -> str:
         f"- duration: {result.duration_seconds}s",
     ]
     if result.kind == "pytest":
-        evidence = [
-            task.evidence
-            for task in result.tasks
-            if task.evidence is not None
-        ]
+        evidence = [task.evidence for task in result.tasks if task.evidence is not None]
         lines.append(
             f"- pytest: {sum(item.tests_total for item in evidence)} tests, "
             f"{sum(item.tests_failed for item in evidence)} failed, "
@@ -507,10 +486,7 @@ def render_summary(result: JobResult) -> str:
     failure = result.failure
     task_id = ""
     if failure is None:
-        failed_task = next(
-            (task for task in result.tasks if task.failure is not None),
-            None,
-        )
+        failed_task = next((task for task in result.tasks if task.failure is not None), None)
         if failed_task is not None:
             failure = failed_task.failure
             task_id = failed_task.id
@@ -522,31 +498,20 @@ def render_summary(result: JobResult) -> str:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--plan",
-        required=True,
-        help="ExecutionPlan or ready PlannerOutput JSON",
-    )
+    parser.add_argument("--plan", required=True, help="ExecutionPlan or ready PlannerOutput JSON")
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--output", default="", help="JobResult JSON path")
     parser.add_argument("--root", default=None)
     parser.add_argument("--summary", default="")
-    parser.add_argument(
-        "--record-skip",
-        default="",
-        metavar="REASON",
-        help="write a skipped JobResult instead of executing",
-    )
+    parser.add_argument("--record-skip", default="", metavar="REASON",
+                        help="write a skipped JobResult instead of executing")
     parser.add_argument("--skip-message", default="")
     args = parser.parse_args(argv)
     root = Path(args.root).resolve() if args.root else repository_root()
     try:
         plan = _load_ready_plan(Path(args.plan))
-        output_dir = (
-            Path(args.output).resolve().parent
-            if args.output
-            else Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "ci-job"
-        )
+        output_dir = (Path(args.output).resolve().parent if args.output
+                      else Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "ci-job")
         if args.record_skip:
             result = record_skip(
                 plan,

@@ -12,9 +12,9 @@
 - 不包含：`scripts/ci/tests/**`
 - 不包含：`.github/workflows/**`
 - V4 起始生产代码：6377 行
-- R4 后当前生产代码：6195 行
+- R5 后当前生产代码：6101 行
 - 目标生产代码：不超过 4500 行
-- R4 后剩余需要减少：约 1695 行，约 27%
+- R5 后剩余需要减少：约 1600 行，约 26%
 
 统计命令：
 
@@ -110,10 +110,10 @@ tools            lint、路径规则、JSON、CLI 小工具
 | `execution/producer/config.py` | 619 | 560 | -59 |
 | `execution/producer/planner.py` | 592 | 580 | -12 |
 | `tools/lint.py` | 590 | 480 | -110 |
-| `execution/consumer/executor.py` | 575 | 420 | -155 |
+| `execution/consumer/executor.py` | 539 | 520 | -19 |
 | `execution/producer/facts.py` | 445 | 440 | -5 |
 | `execution/consumer/runtime/model_dataset.py` | 411 | 270 | -141 |
-| `execution/finalization/gate.py` | 398 | 260 | -138 |
+| `execution/finalization/gate.py` | 339 | 300 | -39 |
 | `image/build_image.py` | 383 | 270 | -113 |
 | `execution/consumer/runtime/device.py` | 262 | 230 | -32 |
 | `execution/consumer/runtime/venv_manager.py` | 249 | 210 | -39 |
@@ -326,18 +326,41 @@ R2 的收益是删除跨域 schema 泄漏，不是压缩总行数。镜像域增
 
 ### R5. Executor 与 Gate 收敛
 
-目标：`consumer` 加 `finalization` 从 2155 行降到约 1600 行。
+状态：已完成（安全收敛版）。
 
-措施：
+原目标：`consumer + finalization` 2155 -> 1600。
+本阶段实际：2154 -> 2060，净减少 94 行。
 
-- Executor 只保留：
-  `prepare -> run tasks -> write result -> summary` 四条主路径。
-- 删除重复的 provisional result 构造和版本文件写入，由结果构造函数统一。
-- `gate.py` 只检查：
-  Plan/Result 的 job 覆盖、runtime 一致性、task coverage、pytest evidence、
-  integration artifact、allowed skip。
-- 删除已经由 `load_planner_output()` 和 `load_job_result()` 保证的校验。
-- `timing.py` 合并到 gate summary，或收敛为 40 行以内的小模块。
+1600 目标需要删除 timing、versions 或更多 fail-closed 检查，本阶段不做。
+
+实际措施：
+
+- `gate.py` 增加 `_decision()` 和 `_empty_summary()`，统一
+  `GateDecision` 构造。
+- 删除 `GateDecision.checks`，只保留 `summary` 和 `failures`。
+- duplicate pytest route 检查改为 image-aware key
+  `(image_id, path, target, device)`；同一 target 的不同 image 允许，
+  同一 image 的重复路由拒绝。
+- 保留 skipped-tasks 和 failed-detail 校验。`decide_plan()` 仍可直接
+  接收 JobResult 列表，不能假定调用方已完成契约校验。
+- `_passed_failures()` 使用局部 `add()` 去掉重复 `_failure()` 样板。
+- 压缩 Executor 的 `main()`、`render_summary()` 和 task result 排版。
+- 保留 `timing.py`、`versions.txt`、provisional result、pytest evidence、
+  integration artifact 和 allowed skip 校验。
+
+结果：
+
+| 文件 | R5 前 | R5 后 | 变化 |
+|---|---:|---:|---:|
+| `execution/consumer/executor.py` | 574 | 539 | -35 |
+| `execution/finalization/gate.py` | 398 | 339 | -59 |
+| consumer + finalization | 2154 | 2060 | -94 |
+
+验证：
+
+- passed / missing / duplicate / extra / skip / pytest evidence /
+  integration artifact / planner failure 的 GateDecision 行为一致。
+- 161 个测试通过。
 
 ### R6. Runtime 轻量化
 
@@ -426,13 +449,14 @@ git diff --check
 
 ### Phase 4：Executor + Gate + Runtime
 
-- 目标：约 6195 -> 约 5450。
-- 处理 R5、R6。
+- 状态：R5 安全版已完成；R6 待做。
+- R5 结果：6195 -> 6101。
+- R6 目标：6101 -> 约 5850。
 - 验证失败结果、skip、timeout、artifact、pytest evidence。
 
 ### Phase 5：Image + Tools
 
-- 目标：约 5450 -> 不超过 4500。
+- 目标：约 5850 -> 不超过 4500。
 - 处理 R7、R8。
 - 如仍有差额，继续压缩 consumer/image，不回到 Planner 删除行为。
 - 验证 image plan/build/promote 和所有 lint 检查。

@@ -33,16 +33,11 @@ class GateDecision(Contract):
     plan_id: str
     status: str
     summary: dict[str, int]
-    checks: tuple[dict[str, Any], ...]
     failures: tuple[dict[str, Any], ...]
 
 
 def _failure(
-    code: str,
-    detail: str,
-    *,
-    job_id: str = "",
-    task_id: str = "",
+    code: str, detail: str, *, job_id: str = "", task_id: str = "",
     path: str = "",
 ) -> dict[str, Any]:
     value: dict[str, Any] = {"code": code, "detail": detail}
@@ -57,20 +52,26 @@ def _failure(
 
 def _plan_failures(plan: ExecutionPlan) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    test_routes: set[tuple[str, str, str]] = set()
+    routes: set[tuple[str, str, str, str]] = set()
     for job in plan.jobs:
         for task in job.tasks:
             if not isinstance(task.spec, PytestSpec):
                 continue
             for path in task.spec.test_files:
-                route = (path, job.runtime.target, job.runtime.device)
-                if route in test_routes:
+                route = (
+                    job.runtime.image.image_id,
+                    path,
+                    job.runtime.target,
+                    job.runtime.device,
+                )
+                if route in routes:
                     failures.append(_failure(
                         "duplicate-route",
                         f"duplicate route {route}",
+                        job_id=job.id,
                         task_id=task.id,
                     ))
-                test_routes.add(route)
+                routes.add(route)
     return failures
 
 
@@ -106,49 +107,26 @@ def _passed_failures(
     expected: set[str],
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
+
+    def add(code: str, detail: str, task_id: str = "") -> None:
+        failures.append(_failure(code, detail, job_id=job.id, task_id=task_id))
+
     if set(actual) != expected:
-        failures.append(_failure(
-            "result-tasks",
-            "passed result does not cover all planned tasks",
-            job_id=job.id,
-        ))
+        add("result-tasks", "passed result does not cover all planned tasks")
     if any(task.status != "passed" or task.exit_code != 0 for task in actual.values()):
-        failures.append(_failure(
-            "result-task-status",
-            "passed job has a non-passing task",
-            job_id=job.id,
-        ))
+        add("result-task-status", "passed job has a non-passing task")
     if job.kind == "pytest":
         for task in actual.values():
             evidence = task.evidence
             if evidence is None:
-                failures.append(_failure(
-                    "pytest-no-evidence",
-                    "pytest task has no execution evidence",
-                    job_id=job.id,
-                    task_id=task.id,
-                ))
+                add("pytest-no-evidence", "pytest task has no execution evidence", task.id)
                 continue
             if evidence.tests_total == 0:
-                failures.append(_failure(
-                    "pytest-no-tests",
-                    "pytest collected no tests",
-                    job_id=job.id,
-                    task_id=task.id,
-                ))
+                add("pytest-no-tests", "pytest collected no tests", task.id)
             if evidence.tests_failed or evidence.tests_errors:
-                failures.append(_failure(
-                    "pytest-failures",
-                    "pytest evidence contains failures or errors",
-                    job_id=job.id,
-                    task_id=task.id,
-                ))
+                add("pytest-failures", "pytest evidence contains failures or errors", task.id)
     elif job.kind == "integration" and not result.artifact_paths.get("integration"):
-        failures.append(_failure(
-            "integration-artifact",
-            "integration result has no artifact directory",
-            job_id=job.id,
-        ))
+        add("integration-artifact", "integration result has no artifact directory")
     return failures
 
 
@@ -180,19 +158,31 @@ def _result_failures(
             task.status == "failed" and task.failure is not None
             for task in result.tasks
         ):
-            failures.append(_failure("failed-detail", "failed result has no failure evidence", job_id=job.id))
+            failures.append(_failure(
+                "failed-detail",
+                "failed result has no failure evidence",
+                job_id=job.id,
+            ))
     return failures
 
 
-def _check(identifier: str, failures: Iterable[dict[str, Any]], detail: str = "") -> dict[str, Any]:
-    values = list(failures)
-    value: dict[str, Any] = {
-        "id": identifier,
-        "status": "failed" if values else "passed",
-    }
-    if values:
-        value["detail"] = detail or "; ".join(item["detail"] for item in values[:3])
-    return value
+def _decision(
+    plan_id: str,
+    failures: Iterable[dict[str, Any]],
+    summary: dict[str, int],
+) -> GateDecision:
+    values = tuple(failures)
+    return GateDecision(
+        schema_version=SCHEMA_VERSION, plan_id=plan_id,
+        status="passed" if not values else "failed",
+        summary=summary, failures=values,
+    )
+
+
+def _empty_summary() -> dict[str, int]:
+    keys = ("expected_jobs", "reported_jobs", "passed", "failed",
+            "skipped", "missing", "unexpected")
+    return dict.fromkeys(keys, 0)
 
 
 def decide_plan(
@@ -200,8 +190,7 @@ def decide_plan(
 ) -> GateDecision:
     """Judge one ExecutionPlan and its JobResults."""
     failures: list[dict[str, Any]] = []
-    plan_failures = _plan_failures(plan)
-    failures.extend(plan_failures)
+    failures.extend(_plan_failures(plan))
 
     by_id: dict[str, list[JobResult]] = {}
     for result in results:
@@ -217,32 +206,22 @@ def decide_plan(
     for job_id in missing:
         failures.append(_failure("missing-result", "planned job has no result", job_id=job_id))
 
-    job_contract_failures: list[dict[str, Any]] = []
-    status_failures: list[dict[str, Any]] = []
+    job_failures: list[dict[str, Any]] = []
     for job_id in sorted(set(expected) & set(by_id)):
         values = by_id[job_id]
         if len(values) != 1:
             continue
         job = expected[job_id]
         result = values[0]
-        current = _result_failures(plan, job, result)
-        job_contract_failures.extend(
-            item for item in current
-            if item["code"] not in {"pytest-no-tests", "pytest-failures"}
-        )
-        status_failures.extend(
-            item for item in current
-            if item["code"] in {"pytest-no-tests", "pytest-failures"}
-        )
+        job_failures.extend(_result_failures(plan, job, result))
         if result.status in {"failed", "infra_error", "cancelled"}:
-            status_failures.append(_failure(
+            job_failures.append(_failure(
                 f"job-{result.status}",
                 f"job finished with status {result.status}",
                 job_id=job_id,
             ))
 
-    failures.extend(job_contract_failures)
-    failures.extend(status_failures)
+    failures.extend(job_failures)
     status_counts = Counter(
         values[0].status for job_id, values in by_id.items()
         if job_id in expected and len(values) == 1
@@ -256,30 +235,7 @@ def decide_plan(
         "missing": len(missing),
         "unexpected": sum(1 for job_id in by_id if job_id not in expected),
     }
-    checks = (
-        _check("plan.contract", plan_failures, "Plan structure is invalid"),
-        _check(
-            "results.complete",
-            [
-                item for item in failures
-                if item["code"] in {
-                    "missing-result", "unexpected-result", "duplicate-result",
-                    "result-plan-id",
-                }
-            ],
-            "Result set is incomplete or inconsistent",
-        ),
-        _check("jobs.contract", job_contract_failures, "Job results do not match Plan"),
-        _check("jobs.status", status_failures, "One or more jobs did not pass"),
-    )
-    return GateDecision(
-        schema_version=SCHEMA_VERSION,
-        plan_id=plan.plan_id,
-        status="passed" if not failures else "failed",
-        summary=summary,
-        checks=checks,
-        failures=tuple(failures),
-    )
+    return _decision(plan.plan_id, failures, summary)
 
 
 def decide_planner_output(output: PlannerOutput) -> GateDecision:
@@ -301,25 +257,10 @@ def decide_planner_output(output: PlannerOutput) -> GateDecision:
                 f"planner output status is {output.status!r}, not 'ready'",
             ),
         )
-    return GateDecision(
-        schema_version=SCHEMA_VERSION,
-        plan_id=output.plan.plan_id if output.plan is not None else "",
-        status="failed",
-        summary={
-            "expected_jobs": 0,
-            "reported_jobs": 0,
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "missing": 0,
-            "unexpected": 0,
-        },
-        checks=({
-            "id": "planner.output",
-            "status": "failed",
-            "detail": "Planner did not produce a ready ExecutionPlan",
-        },),
-        failures=failures,
+    return _decision(
+        output.plan.plan_id if output.plan is not None else "",
+        failures,
+        _empty_summary(),
     )
 
 
